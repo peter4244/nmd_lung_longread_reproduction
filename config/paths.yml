@@ -1,0 +1,82 @@
+# Input roots for the NMD long-read analysis.
+#
+# Resolution order (first match wins):
+#   1. environment variable NMD_<KEY>
+#   2. the value below
+#   3. interpreted relative to the repository root
+#
+# Reproduction from the Zenodo record needs only DEPOSIT. The remaining roots point at
+# intermediates that shipped code regenerates; they exist so the pipeline can be run
+# stage-by-stage against retained references during verification.
+#
+# No tracked code may contain an absolute path — see tools/lint_paths.sh.
+
+DEPOSIT:   data_deposit/source_data        # Zenodo source data (Tier 1 inputs)
+
+# --- legacy layout, phase-1 only: where these inputs live on the authoring machine ---
+LEGACY:    ../nmd                          # pre-migration project tree
+SQANTI:    data_deposit/source_data/sqanti   # deposited SQANTI3 outputs
+ISOCALL:   data_deposit/source_data          # deposited isocall-universe files
+FIGDATA:   ../nmd/nmd_fig_data             # DGELists, gmap maps, salmon
+MASHR_SR:  ../nmd/shortread_dge/mashr      # gene-level mashr
+MASHR_LR:  ../nmd/isocall_dge/mashr        # isoform-level mashr
+ISOPAIR:   ../nmd/results/isoform_transitions/Version_6.0/isopair_wrapper
+REFERENCE: ../nmd/reference_files          # GENCODE etc. (external downloads)
+MODEL:     ../NMD_orf_model_v5_4ct         # deep-learning model repo (Fig 5 interpretability)
+
+# WHICH VINTAGE of the model's outputs Figure 5 reads. Split out of MODEL 2026-07-28 (W76):
+# data_export_refaug.R had `file.path(.P$MODEL, "results_4ct")` hardcoded, so it exported the
+# PUBLISHED run into a Figure 5 panel while every §5 script taking --results-dir was pointed at
+# the deposit-native results_4ct_dn. It agreed with the paper because it read the paper's own
+# artifacts.
+#
+# REPOINTED 2026-08-04 TO THE DEPOSIT. The default was `../NMD_orf_model_v5_4ct/results_4ct` --
+# the run that model.published_superseded_2026-07-28/README_WHY_THIS_IS_HERE.md says was WRONG
+# TO SHIP and that is explicitly not part of the Zenodo upload. So the default was the very
+# substitution rerun_exceptions.tsv warns about: read the published artifacts and every §5
+# export "reproduces" against a model whose training universe the deposit cannot rebuild. It
+# failed safe in the clean room only because that path does not resolve there; on any machine
+# with the model repo checked out it would have resolved silently.
+#
+# The replacement run IS DEPOSITED and needs no sibling repo and no GPU: source_data/model/,
+# 28 files, the checkpoint plus predictions, the 15 mode-qualified DeepSHAP summaries, the
+# KernelSHAP branch table and the motif logos. Distinguished from the superseded run by
+# sha256 dfd2ffca... vs 0cbebc61... on the checkpoint, and by metrics AUC 0.9208 / AUPRC
+# 0.8245 over n_test 10,597 against the published 0.9306 / 0.8330 over 10,131.
+#
+# CAVEAT, and it is not small: these are the model's OUTPUTS, deposited 2026-07-28. Running the
+# consumers against them demonstrates the analysis code, NOT the training. And the deposited
+# names are pre-B1/B2 -- 03_train.py and evaluate.py were both renamed on 2026-07-29, the day
+# after -- so the current code does not reproduce these filenames. See W295.
+MODEL_RESULTS: data_deposit/source_data/model
+
+# WHERE THE STAGE C FEATURE TABLES ARE, which is not always where the MODEL artifacts are.
+# tx_summary.tsv is a stage C output and NOT a deposit file (D105) -- it is written by
+# export_rds.R --results-dir. In the normal flow it lands BESIDE the model outputs in
+# results_4ct_dn, so the default here is the same directory as MODEL_RESULTS and no existing
+# invocation changes. With stage E SKIPPED, MODEL_RESULTS points at the deposit's TRAINED
+# artifacts while the feature tables are in stage C's results dir, and the two roots separate:
+# the deposit-native harness then sets NMD_FEATURES. Same resolution shape export_rds.R already
+# uses (flag > NMD_RESULTS_DIR > default, whose default preserves published behaviour, W76).
+FEATURES:  data_deposit/source_data/model
+ANNOT:     data_deposit/source_data/annotation   # Ensembl v115 gene/tx maps (deposited)
+PHENO:     ~/Partners HealthCare Dropbox/Peter Castaldi/Research/NMD/full_dataset/pheno
+
+# The manuscript of record. Outside the repo (the Google Doc is canonical; this is the
+# exported copy the claim inventory is built from), so its location is configuration
+# rather than a literal in a builder. The VINTAGE is pinned separately by the sha256 in
+# docs/manuscript_claims.meta.json -- that is what catches an unnoticed re-export.
+MANUSCRIPT: ../nmd/paper/NMD manuscript 2026.7.17.md
+
+# The isopair intermediates every consumer reads. Declared rather than inferred, and kept
+# even now that there is only one tree: on 2026-07-26 two trees existed side by side with
+# identical filenames, and resolving the wrong one yielded pop_BC 2,942 against an expected
+# ~1,400-1,550 with nothing to say so. Consolidated the same day -- the complete FLOORED tree
+# (5,049 C4 pairs, per-CT variants, 78 cache objects) is now `data_mashr`; the partial
+# unfloored probe was moved to `data_mashr.unfloored_probe_2026-07-26`, not deleted.
+ISOPAIR_OUT: tmp/out/data_mashr
+
+# --- outputs ---
+CACHE:     tmp/cache
+OUT:       tmp/out
+FIGURES:   figures

@@ -1,0 +1,309 @@
+---
+title: "NMD predictor head-to-head comparison"
+subtitle: "Our deep-learning model vs NMDetective-B vs the NMDEP rule-tree baseline"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: hide
+    fig_width: 9
+    fig_height: 4.5
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(data.table)
+library(knitr)
+library(DT)
+
+.nmd_root <- local({ d <- getwd(); while (!file.exists(file.path(d, "config", "paths.yml"))) {
+  p <- dirname(d); if (identical(p, d)) stop("repo root not found"); d <- p }; d })
+source(file.path(.nmd_root, "R", "load_config.R")); .P <- nmd_paths(.nmd_root)
+HERE     <- file.path(.P$OUT, "predictor_comparison")
+# 2026-07-26: the chain writes to .P$OUT/predictor_comparison, not the source dir.
+SCORES   <- file.path(.P$OUT, "predictor_comparison", "per_isoform_scores_2026.7.11.tsv")
+METRICS  <- file.path(.P$OUT, "predictor_comparison", "metrics_summary_2026.7.11.tsv")
+FIG_PNG  <- "../../figures/SupplementalFigures/SF43_ModelComparison/figure_s_model_comparison.png"
+
+scores  <- fread(SCORES)
+metrics <- fread(METRICS)
+
+# Head-to-head intersection restricted to the model's held-out test split
+# (chr1/3/5/7; the model never saw these isoforms at training time).
+hh <- scores[!is.na(nmdetective_b_score) &
+             !is.na(nmdep_rule_score) &
+             !is.na(our_model_prob) &
+             h5_split == "test"]
+
+fmt <- function(x) formatC(x, format = "d", big.mark = ",")
+fmt2 <- function(x) formatC(x, format = "f", digits = 2)
+render_dt <- function(df, caption = NULL, pageLength = 10) {
+  datatable(df, caption = caption, rownames = FALSE,
+            options = list(pageLength = pageLength, scrollX = TRUE))
+}
+
+N_ISO    <- nrow(hh)
+N_GENES  <- uniqueN(hh$gene_id)
+N_PTCP   <- nrow(hh[subclass == "NMD+/PTC+"])
+N_PTCN   <- nrow(hh[subclass == "NMD+/PTC-"])
+N_CTRL   <- nrow(hh[subclass == "Control"])
+```
+
+## 1. Purpose & approach
+
+This report benchmarks our deep-learning NMD predictor against two
+published variant-level NMD prediction models — **NMDetective-B**
+(Lindeboom *et al.* 2019) and the **NMDEP rule-tree baseline**
+(Saadat & Fellay 2025) — on the same long-read-observed isoforms,
+using a common continuous gold standard.
+
+Three design choices distinguish this from the original NMDetective /
+NMDEP performance evaluations:
+
+1.  **Common gold standard.** All three models are scored against the
+    **mashr posterior-mean log₂ fold-change of each isoform under SMG1
+    inhibition** (4-CT cross-cell-type estimate), not against the
+    TCGA-derived NMD-efficacy estimates the rule-based models were
+    originally trained on. This is a *cross-dataset generalisation*
+    test: the rule-based models are applied to a domain different
+    from their training domain.
+
+2.  **Features computed from our isoforms, not by canonical-transcript
+    lookup.** For every isoform, the four NMDetective-B features
+    (in-last-exon, distance-to-start, exon-length-at-stop, within-50-nt
+    of last EJ) are computed directly from the long-read-observed
+    transcript structure. This eliminates the canonical-transcript
+    limitation of variant-level models.
+
+3.  **Test-set evaluation.** Because our model has training-set
+    isoforms in the broader cohort, all reported metrics use only the
+    **chr1 / chr3 / chr5 / chr7 held-out test split** — isoforms the
+    deep-learning model never saw at training time. The rule-based
+    models also see these isoforms for the first time, so the
+    comparison is symmetric.
+
+Full-rank NMDetective-A (the random-forest variant) and the full NMDEP
+deep-learning model were deferred from this comparison because their
+trained weights / inference code are not publicly available
+(see §6).
+
+## 2. Cohort
+
+```{r cohort-table, echo=FALSE}
+tbl <- data.table(
+  Subclass = c("NMD+/PTC+", "NMD+/PTC-", "Control", "**Total**"),
+  Isoforms = c(N_PTCP, N_PTCN, N_CTRL, N_ISO),
+  Genes    = c(
+    uniqueN(hh[subclass == "NMD+/PTC+", gene_id]),
+    uniqueN(hh[subclass == "NMD+/PTC-", gene_id]),
+    uniqueN(hh[subclass == "Control",   gene_id]),
+    N_GENES
+  )
+)
+kable(tbl, format.args = list(big.mark = ","),
+      caption = sprintf("Test-set head-to-head cohort: %s isoforms from %s unique genes.",
+                        fmt(N_ISO), fmt(N_GENES)))
+```
+
+The Control comparators are gene-matched to a subset of the
+NMD-susceptible comparators, which is why the unique-gene count
+(`r fmt(N_GENES)`) is below the per-subclass sum.
+
+## 3. Per-isoform feature computation
+
+For each cohort isoform we computed the four NMDetective-B input
+features from its long-read-observed transcript structure:
+
+| Feature                       | Definition                                                                                                  |
+|-------------------------------|-------------------------------------------------------------------------------------------------------------|
+| **`in_last_exon`**            | Is the comparator stop codon in the last exon of the transcript?                                            |
+| **`distance_to_start_nt`**    | Transcript-coordinate distance from the start codon to the stop codon (nt).                                 |
+| **`exon_length_at_stop_nt`**  | Length of the exon containing the stop codon (nt).                                                          |
+| **`within_50nt_of_last_ej`**  | Is the stop codon within 50 nt upstream of the last exon-exon junction (i.e., *not* a PTC by the 50-nt rule)? |
+
+The stop codon used per subclass:
+
+-   **NMD+/PTC+**: the **reference-AUG-projected** stop codon
+    (`comp_stop_tx_pos` from `Isopair::traceReferenceAtg()`), avoiding
+    the SQANTI/TD2 PTC-avoidance bias (see CLAUDE.md).
+-   **NMD+/PTC−**: same reference-AUG-projected stop.
+-   **Control**: the natural stop from the comparator's own
+    GENCODE-annotated CDS, projected into transcript coordinates.
+
+## 4. Scoring
+
+Three models scored on each isoform:
+
+### 4.1 NMDetective-B
+
+The published 4-rule decision tree (Lindeboom *et al.* 2019, Fig. 1c),
+applied to our features with the original thresholds:
+
+-   in last exon → **escape** (leaf score 0.00)
+-   distance to start \< **150** nt → escape (0.12)
+-   exon length at stop \> **407** nt → escape (0.41)
+-   within **50** nt of last EJ → escape (0.20)
+-   otherwise → **trigger** NMD (0.65)
+
+### 4.2 NMDEP rule-tree baseline
+
+Same 4-rule structure with the NMDEP-re-optimised thresholds from
+Table 3 of Saadat & Fellay 2025: **49** / **120** / **355** nt. Leaf
+scores inherited from NMDetective-B for comparability of magnitudes.
+Agreement with NMDetective-B's binary calls is 98.9% — the small
+threshold deltas only shift a handful of borderline cases.
+
+### 4.3 Our model
+
+Per-isoform predicted NMD probability from the trained CNN +
+attention model
+(`peter4244/NMD_orf_model_v5_4ct`,
+`best_model_atg500_stop500.pt`), restricted to the chr1/3/5/7
+held-out test split.
+
+## 5. Metrics
+
+```{r metrics-table, echo=FALSE}
+nm <- function(x) c(nmdetective_b = "NMDetective-B",
+                    nmdep_rule    = "NMDEP rule baseline",
+                    our_model     = "Our model")[x]
+sub_label <- function(s) c("head-to-head:test"            = "Pooled",
+                            "head-to-head:test:NMD+/PTC+" = "NMD+/PTC+",
+                            "head-to-head:test:NMD+/PTC-" = "NMD+/PTC-",
+                            "head-to-head:test:Control"   = "Control")[s]
+
+m <- metrics[stratum %in% names(sub_label())]
+m[, Subclass := factor(sub_label(stratum),
+                        levels = c("Pooled","NMD+/PTC+","NMD+/PTC-","Control"))]
+m[, Model    := factor(nm(model),
+                        levels = c("NMDetective-B","NMDEP rule baseline","Our model"))]
+setorder(m, Subclass, Model)
+
+out <- m[, .(Subclass, Model, n,
+              Spearman = formatC(spearman, digits = 2, format = "f"),
+              Pearson  = formatC(pearson,  digits = 2, format = "f"),
+              `R²`     = formatC(r2,       digits = 2, format = "f"),
+              MAE      = formatC(mae,      digits = 2, format = "f"),
+              RMSE     = formatC(rmse,     digits = 2, format = "f"))]
+kable(out, caption = "Test-set metrics (n = 415 isoforms; chr1/3/5/7 held out).")
+```
+
+### 5.1 Pooled
+
+All three models reach a similar pooled performance on the test set:
+**Spearman ρ `r fmt2(m[Subclass == "Pooled" & Model == "NMDetective-B", spearman])`**
+(NMDetective-B), **`r fmt2(m[Subclass == "Pooled" & Model == "NMDEP rule baseline", spearman])`**
+(NMDEP rule baseline), **`r fmt2(m[Subclass == "Pooled" & Model == "Our model", spearman])`**
+(our model). This pooled near-equality reflects the easy separation
+of NMD-susceptible isoforms from non-NMD Controls, which all three
+models capture.
+
+### 5.2 Stratified by PTC subclass
+
+Within a single PTC subclass — where the easy between-class
+separation is removed — the deep-learning model substantially
+outperforms both rule-based predictors:
+
+-   **NMD+/PTC+** (n = `r N_PTCP`): our model **Spearman `r fmt2(m[Subclass == "NMD+/PTC+" & Model == "Our model", spearman])`**,
+    vs. `r fmt2(m[Subclass == "NMD+/PTC+" & Model == "NMDetective-B", spearman])`
+    (NMDetective-B) and `r fmt2(m[Subclass == "NMD+/PTC+" & Model == "NMDEP rule baseline", spearman])`
+    (NMDEP rule baseline).
+
+-   **NMD+/PTC−** (n = `r N_PTCN`): our model **Spearman `r fmt2(m[Subclass == "NMD+/PTC-" & Model == "Our model", spearman])`**,
+    while **both rule-based models are negatively correlated** with
+    the gold standard (`r fmt2(m[Subclass == "NMD+/PTC-" & Model == "NMDetective-B", spearman])`).
+    This is by construction: every PTC− isoform is a real NMD
+    substrate (median gold log-FC ≈ 2.3) that lacks a premature stop
+    detectable by the 50-nt-rule cascade, so the rule-based models
+    assign them all low scores. The deep-learning model recovers
+    these substrates because it does not depend on a discrete PTC
+    call.
+
+-   **Control** (n = `r N_CTRL`): our model **Spearman `r fmt2(m[Subclass == "Control" & Model == "Our model", spearman])`**,
+    vs. essentially zero for both rule-based models
+    (`r fmt2(m[Subclass == "Control" & Model == "NMDetective-B", spearman])`
+    and `r fmt2(m[Subclass == "Control" & Model == "NMDEP rule baseline", spearman])`).
+    The rule-based models cluster all Control scores near zero
+    (matching the Controls' true log-FC ≈ 0 by coincidence, not by
+    discrimination), which yields a small MAE but near-zero rank
+    correlation.
+
+## 6. Figure
+
+```{r figure, echo=FALSE, out.width="100%", fig.cap="Supplemental Figure S_x — see figures/SupplementalFigures/SF43_ModelComparison/figure_s_model_comparison_legend.md for the published legend."}
+include_graphics(FIG_PNG)
+```
+
+## 7. Take-aways
+
+1.  **Pooled performance is uninformative for this comparison.** The
+    pooled Spearman of ≈0.76–0.77 across all three models would
+    suggest equivalent predictive power; the within-subclass
+    breakdown shows this is driven entirely by the (easy) Controls-vs-NMD-substrate
+    separation.
+
+2.  **Rule-based predictors fail on PTC-negative NMD substrates.**
+    Both rule cascades classify every NMD+/PTC− isoform as "escape NMD"
+    despite their being real NMD substrates by the mashr gold
+    standard. The resulting Spearman ≈ −0.14 is small in magnitude
+    only because the rule scores cluster on a few discrete leaves; the
+    sign is the meaningful result.
+
+3.  **The deep-learning model retains within-subclass discrimination
+    across all three subclasses.** This pattern is consistent with
+    the model learning continuous sequence and structural signal
+    beyond the categorical 50-nt rule.
+
+4.  **The NMDetective-B vs NMDEP rule-tree threshold difference is
+    immaterial** at the scale of this cohort (98.9% binary-call
+    agreement). The two rule-based predictors are effectively a
+    single baseline.
+
+## 8. Deferred models
+
+Two model variants were not scored in this comparison because their
+trained weights / inference code are not publicly available:
+
+-   **Full-rank NMDetective-A** (Lindeboom 2019) — the random-forest
+    variant. The associated figshare deposit
+    ([10.6084/m9.figshare.7803398](https://doi.org/10.6084/m9.figshare.7803398))
+    contains only precomputed per-nucleotide NMD scores as GTF files
+    for canonical UCSC knownGene transcripts (hg19 / hg38 / mm9 / mm10),
+    with no model object or inference code released.
+
+-   **Full NMDEP MLP** (Saadat & Fellay 2025) — a 60-feature deep
+    model that augments the rule tree with Orthrus pre-trained mRNA
+    sequence embeddings and three internal XGBoost auxiliary
+    regressors (half-life / ribosome loading / localization). No
+    public code, weights, or precomputed predictions located at the
+    time of writing
+    ([arXiv:2502.14547](https://arxiv.org/abs/2502.14547)), and the
+    published input pipeline is variant-centric (VEP-annotated
+    stop-gain variants on a single canonical transcript per gene)
+    rather than designed for arbitrary long-read isoform sequences.
+
+## 9. Reproducibility
+
+All files live under `code/nmd_predictor_comparison/`:
+
+| File                                       | Produced by                          |
+|--------------------------------------------|--------------------------------------|
+| `METHODS.md`                               | manual (pre-registration)            |
+| `README.md`                                | manual                               |
+| `predictions_all_atg500_stop500.tsv`       | `explorer_run/run_infer_all.py` (cluster) |
+| `isoforms_2026.7.11.tsv`                   | `01_extract_our_isoforms.R`          |
+| `nmdetective_b_scores_2026.7.11.tsv`       | `02_score_nmdetective_b.R`           |
+| `nmdep_rule_baseline_scores_2026.7.11.tsv` | `03_score_nmdep_rule_baseline.R`     |
+| `per_isoform_scores_2026.7.11.tsv`         | `04_compute_metrics.R`               |
+| `metrics_summary_2026.7.11.tsv`            | `04_compute_metrics.R`               |
+| this report (`.Rmd` and rendered `.html`)  | `Rscript -e 'rmarkdown::render(...)'` |
+
+Figure + legend:
+`figures/SupplementalFigures/SF43_ModelComparison/figure_s_model_comparison.{py,pdf,png,_legend.md}`.
+
+```{r session-info, echo=FALSE}
+sessionInfo()
+```

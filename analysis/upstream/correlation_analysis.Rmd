@@ -1,0 +1,474 @@
+---
+title: "Short-Read Vs Long-Read: Gene Expression Correlation"
+author: "Leshem, Yul"
+date: "2026-02-12"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    code_folding: hide
+    number_sections: true
+---
+
+Code location: `/udd/reyle/nmd_lungcells_2026/code/final/correlation_analysis.Rmd`
+
+# Overview
+
+This report measures concordance between short-read (Illumina/Salmon) and
+long-read (PacBio Kinnex/SQANTI3) RNA-seq at the gene level, restricted to
+the four cell types kept in the paper (AT2, LAE, FB, MV). Long-read isoforms
+are aggregated to genes, both pipelines are filtered to a common
+gene-and-sample set, and TMM-normalized log2 CPM values are compared via
+sample-wise Pearson and Spearman correlation. A gene-length-vs-expression
+diagnostic is run on both pipelines using two length measures (Salmon
+effective length and expression-weighted exonic length).
+
+Note on naming: sample names and the internal cell-type codes still use the
+original `AT` (AT2) and `DD` (LAE) labels, because those codes are what the
+Salmon column names and the project DGEList are keyed on. We keep them for all
+sample matching and relabel to the display names (AT2, LAE) only at the
+plotting / summary boundary.
+
+```{r setup, include=FALSE}
+.nmd_root <- local({ d <- getwd(); while (!file.exists(file.path(d, "config", "paths.yml"))) {
+  p <- dirname(d); if (identical(p, d)) stop("repo root not found"); d <- p }; d })
+source(file.path(.nmd_root, "R", "load_config.R")); .P <- nmd_paths(.nmd_root)
+source(file.path(.nmd_root, "R", "claim_emit.R"))  # Phase 2 claim-value emission
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 6)
+options(bitmapType = "cairo")
+
+```
+
+# Libraries
+
+```{r load-libs}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(edgeR)
+  library(SummarizedExperiment)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(ggplot2)
+  library(patchwork)
+})
+
+# Bioconductor namespace masking guard
+select <- dplyr::select
+filter <- dplyr::filter
+rename <- dplyr::rename
+count  <- dplyr::count
+slice  <- dplyr::slice
+first  <- dplyr::first
+```
+
+# Configuration
+
+```{r config}
+OUTPUT_DIR <- file.path(.P$OUT, "final_figures/comparison")   # outputs never land in the reference tree
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# Inputs
+SR_COUNTS      <- file.path(.P$DEPOSIT, "salmon_gene_counts_4ct.csv")
+DGELIST_ISO    <- file.path(.P$OUT, "dge_isoform_longread_2026.3.3.rds")
+ISO_COUNT_MAT  <- file.path(.P$DEPOSIT, "nmd_lungcells_counts_4ct.csv")
+
+# Deposit columns are <donor>_<treatment>_<CT> with published CT names; this analysis's
+# internal space uses the pre-rename codes AT/DD.
+dep_key <- function(x) vapply(x, function(v){ p <- strsplit(v, "_")[[1]]
+  paste(p[1], p[2], switch(p[3], AT2 = "AT", LAE = "DD", p[3]), sep = "_") }, character(1))
+
+# Four cell types — DD_ALI and DO_ALI are cut from the paper.
+# These are the internal codes used for sample matching (AT = AT2, DD = LAE).
+CT_KEEP <- c("AT", "DD", "FB", "MV")
+
+# Display relabel applied at the plotting / summary boundary only.
+CT_DISPLAY <- c("AT" = "AT2", "DD" = "LAE", "FB" = "FB", "MV" = "MV")
+
+# Helper: extract cell type from a "ID_TREATMENT_CT[_ALI]" sample name.
+# The CT can be one or two underscore-delimited tokens (e.g., "AT" vs "DD_ALI"),
+# so we glue everything from position 3 onward.
+extract_ct <- function(sample_names) {
+  sapply(strsplit(sample_names, "_"), function(x) {
+    paste(x[3:length(x)], collapse = "_")
+  })
+}
+
+```
+
+# Short-Read
+
+Load the gene-level Salmon counts, harmonize sample names, strip Ensembl
+version suffixes, and restrict to the four kept cell types.
+
+
+```{r short-read}
+# No DD_ALI drop step is needed against deposit input: build_4ct_salmon_counts.R selected
+# samples from the SR DGEList, so the ALI cultures the salmon SummarizedExperiment
+# mislabels as plain "_DD" are excluded at source. Verified 2026-07-25 that the deposit's
+# 26 columns are the same sample set the old drop step arrived at.
+sr <- fread(SR_COUNTS, data.table = FALSE)
+rownames(sr) <- sr[[1]]; sr[[1]] <- NULL
+counts_matrix <- as.matrix(sr)
+colnames(counts_matrix) <- dep_key(colnames(counts_matrix))
+cat("Counts matrix:", dim(counts_matrix), "\n")
+
+# ---- Restrict to four kept cell types (drops DO_ALI; DD_ALI already gone) ----
+ct_per_sample <- extract_ct(colnames(counts_matrix))
+keep_idx      <- ct_per_sample %in% CT_KEEP
+n_dropped     <- sum(!keep_idx)
+if (n_dropped > 0) {
+  cat("FILTER: dropping", n_dropped, "samples outside CT_KEEP:",
+      paste(unique(ct_per_sample[!keep_idx]), collapse = ", "), "\n")
+  counts_matrix <- counts_matrix[, keep_idx]
+}
+
+# ---- Strip Ensembl version suffixes ----
+gene_ids_clean <- sub("\\..*", "", rownames(counts_matrix))
+n_dup_total    <- sum(duplicated(gene_ids_clean))
+rownames(counts_matrix) <- gene_ids_clean
+
+cat("Final SR matrix:", dim(counts_matrix), "\n")
+cat("Duplicate gene IDs after version strip:", n_dup_total, "\n")
+cat("Cell types (internal codes):",
+    paste(sort(unique(extract_ct(colnames(counts_matrix)))), collapse = ", "), "\n")
+
+counts_combined <- counts_matrix
+```
+
+# Long-Read
+
+Load the SQANTI3 isoform count matrix, reformat sample names to match
+short-read, restrict to CT_KEEP, then aggregate isoforms to gene level by
+summing.
+
+```{r long-read}
+counts_iso <- fread(ISO_COUNT_MAT, data.table = FALSE)
+cat("Isoform count matrix:", dim(counts_iso), "\n")
+
+# Transcript-to-gene mapping from the long-read DGEList
+dge_iso <- readRDS(DGELIST_ISO)
+cat("Long-read DGEList:", dim(dge_iso), "\n")
+
+tx2gene <- unique(dge_iso$genes[!is.na(dge_iso$genes$txid), c("txid", "gene_id")])
+cat("Transcript-to-gene mappings:", nrow(tx2gene), "\n")
+
+# ---- Format isoform counts ----
+rownames(counts_iso) <- counts_iso$id
+counts_iso$id        <- NULL
+count_mat            <- round(as.matrix(counts_iso))
+
+# ---- Reformat sample names: "Sample##_CT_ID_Treatment" -> "ID_Treatment_CT" ----
+colnames(count_mat) <- dep_key(colnames(count_mat))
+
+# ---- Restrict to four kept cell types (drops DD_ALI and DO_ALI) ----
+ct_per_sample_lr <- extract_ct(colnames(count_mat))
+keep_idx_lr      <- ct_per_sample_lr %in% CT_KEEP
+n_dropped_lr     <- sum(!keep_idx_lr)
+if (n_dropped_lr > 0) {
+  cat("FILTER: dropping", n_dropped_lr, "long-read samples outside CT_KEEP:",
+      paste(unique(ct_per_sample_lr[!keep_idx_lr]), collapse = ", "), "\n")
+  count_mat <- count_mat[, keep_idx_lr]
+}
+
+# ---- Aggregate isoforms -> genes ----
+idx               <- match(rownames(count_mat), tx2gene$txid)
+gene_ids_for_iso  <- tx2gene$gene_id[idx]
+has_gene          <- !is.na(gene_ids_for_iso)
+counts_with_gene  <- count_mat[has_gene, ]
+gene_ids_for_iso  <- sub("\\..*", "", gene_ids_for_iso[has_gene])
+
+cat("Isoforms matched to gene:", sum(has_gene), "of", nrow(count_mat), "\n")
+cat("Isoforms dropped (no gene ID):", sum(!has_gene), "\n")
+
+counts_genelevel <- rowsum(counts_with_gene, group = gene_ids_for_iso)
+cat("After aggregation:", nrow(counts_with_gene), "isoforms ->",
+    nrow(counts_genelevel), "genes\n")
+
+# ---- Sample overlap report ----
+short_names <- colnames(counts_combined)
+long_names  <- colnames(counts_genelevel)
+
+cat("\nSample overlap:\n")
+cat("  Common:           ", length(intersect(short_names, long_names)), "\n")
+cat("  Short-read only:  ", length(setdiff(short_names, long_names)),   "\n")
+cat("  Long-read only:   ", length(setdiff(long_names,  short_names)),  "\n")
+
+if (length(setdiff(short_names, long_names)) > 0) {
+  cat("\nShort-read only:\n"); print(setdiff(short_names, long_names))
+}
+if (length(setdiff(long_names, short_names)) > 0) {
+  cat("\nLong-read only:\n");  print(setdiff(long_names,  short_names))
+}
+
+```
+
+# Combine Short And Long Read
+
+Subset both matrices to the common gene set and common sample set, drop
+genes with all-zero counts in both pipelines, TMM-normalize each pipeline
+separately, and compute log2 CPM.
+
+```{r combine-short-long}
+common_genes   <- intersect(rownames(counts_combined), rownames(counts_genelevel))
+common_samples <- intersect(colnames(counts_combined), colnames(counts_genelevel))
+
+cat("Common genes:  ", length(common_genes),   "\n")
+cat("Common samples:", length(common_samples), "\n")
+
+stopifnot("No common genes — check gene IDs"     = length(common_genes)   > 0)
+stopifnot("No common samples — check name format" = length(common_samples) > 0)
+
+counts_short_matched <- counts_combined[common_genes, common_samples]
+counts_long_matched  <- counts_genelevel[common_genes, common_samples]
+
+# ---- Drop genes with all zeros in BOTH pipelines (uninformative) ----
+expressed_short <- rowSums(counts_short_matched) > 0
+expressed_long  <- rowSums(counts_long_matched)  > 0
+keep_genes      <- expressed_short | expressed_long
+
+cat("\nFILTER: drop genes all-zero in BOTH pipelines.\n")
+cat("  All-zero in SR only:    ", sum(!expressed_short),  "\n")
+cat("  All-zero in LR only:    ", sum(!expressed_long),    "\n")
+cat("  All-zero in BOTH (drop):", sum(!keep_genes),        "\n")
+cat("  Genes before:", length(keep_genes), "/ after:", sum(keep_genes), "\n")
+
+counts_short_matched   <- counts_short_matched[keep_genes, ]
+counts_long_matched    <- counts_long_matched[keep_genes, ]
+common_genes_filtered  <- rownames(counts_short_matched)
+
+# ---- TMM-normalize and compute log2 CPM ----
+dge_short_matched <- calcNormFactors(DGEList(counts = counts_short_matched), method = "TMM")
+dge_long_matched  <- calcNormFactors(DGEList(counts = counts_long_matched),  method = "TMM")
+
+cpm_short_matched <- cpm(dge_short_matched, normalized.lib.sizes = TRUE, log = TRUE)
+cpm_long_matched  <- cpm(dge_long_matched,  normalized.lib.sizes = TRUE, log = TRUE)
+
+stopifnot(identical(rownames(cpm_short_matched), rownames(cpm_long_matched)))
+stopifnot(identical(colnames(cpm_short_matched), colnames(cpm_long_matched)))
+
+cat("\nFinal CPM matrices:", dim(cpm_short_matched), "\n")
+
+# ── Claim 1.2.1 — the common gene set and the matched samples ─────────────────────────
+SR_LR_POP <- paste("genes present after aggregating long-read isoform counts to gene level and",
+                   "intersecting with the short-read gene matrix, then dropping genes that are",
+                   "all-zero in both assays; counted over the samples with BOTH a short-read",
+                   "and a long-read library")
+claim_emit("1.2.1", "genes in the common short-read / long-read set",
+           length(common_genes_filtered), published = "28,651",
+           n = length(common_genes_filtered), population = SR_LR_POP)
+claim_emit("1.2.1", "matched samples", ncol(cpm_short_matched), published = "26",
+           n = ncol(cpm_short_matched), population = SR_LR_POP)
+```
+
+## Sample-Wise Correlation
+
+```{r corr-overall}
+sample_cors_pearson  <- sapply(seq_len(ncol(cpm_short_matched)), function(i) {
+  cor(cpm_short_matched[, i], cpm_long_matched[, i], method = "pearson")
+})
+sample_cors_spearman <- sapply(seq_len(ncol(cpm_short_matched)), function(i) {
+  cor(cpm_short_matched[, i], cpm_long_matched[, i], method = "spearman")
+})
+
+cor_pearson_samplewise  <- mean(sample_cors_pearson)
+cor_spearman_samplewise <- mean(sample_cors_spearman)
+
+cat("Sample-wise Pearson  (mean):", sprintf("%.3f", cor_pearson_samplewise),
+    "| range:", sprintf("%.3f", min(sample_cors_pearson)),
+    "-",        sprintf("%.3f", max(sample_cors_pearson)), "\n")
+cat("Sample-wise Spearman (mean):", sprintf("%.3f", cor_spearman_samplewise),
+    "| range:", sprintf("%.3f", min(sample_cors_spearman)),
+    "-",        sprintf("%.3f", max(sample_cors_spearman)), "\n")
+
+# ── Claim 1.2.2 — sample-wise concordance, six numbers plus the sample count ──────────
+# PER-SAMPLE correlations averaged, NOT a correlation of pooled values: each sample's
+# short-read and long-read log-CPM vectors are correlated across genes, then the 26 coefficients
+# are averaged. Pooling first would give a different and larger number.
+CONCORD_POP <- paste("Pearson/Spearman correlation between short-read and long-read log2 CPM",
+                     "across the common gene set, computed WITHIN each matched sample and then",
+                     "averaged across samples; TMM-normalised separately per assay")
+claim_emit("1.2.2", "samples in the concordance analysis", length(sample_cors_pearson),
+           published = "26", n = length(sample_cors_pearson), population = CONCORD_POP)
+claim_emit("1.2.2", "mean sample-wise Pearson r", cor_pearson_samplewise,
+           published = "0.89", n = length(sample_cors_pearson), population = CONCORD_POP)
+claim_emit("1.2.2", "minimum sample-wise Pearson r", min(sample_cors_pearson),
+           published = "0.83", n = length(sample_cors_pearson), population = CONCORD_POP)
+claim_emit("1.2.2", "maximum sample-wise Pearson r", max(sample_cors_pearson),
+           published = "0.91", n = length(sample_cors_pearson), population = CONCORD_POP)
+claim_emit("1.2.2", "mean sample-wise Spearman rho", cor_spearman_samplewise,
+           published = "0.89", n = length(sample_cors_spearman), population = CONCORD_POP)
+claim_emit("1.2.2", "minimum sample-wise Spearman rho", min(sample_cors_spearman),
+           published = "0.85", n = length(sample_cors_spearman), population = CONCORD_POP)
+claim_emit("1.2.2", "maximum sample-wise Spearman rho", max(sample_cors_spearman),
+           published = "0.90", n = length(sample_cors_spearman), population = CONCORD_POP)
+
+cor_table <- data.frame(
+  sample   = common_samples,
+  pearson  = sprintf("%.3f", sample_cors_pearson),
+  spearman = sprintf("%.3f", sample_cors_spearman)
+)
+print(cor_table)
+
+```
+
+```{r corr-overall-plot, fig.width=10, fig.height=6}
+plot_data <- data.frame(
+  short_read = as.vector(cpm_short_matched),
+  long_read  = as.vector(cpm_long_matched)
+)
+
+p_overall <- ggplot(plot_data, aes(x = short_read, y = long_read)) +
+  geom_hex(bins = 50) +
+  scale_fill_gradientn(colors = c("white", "lightblue", "blue", "darkblue", "red"),
+                       trans = "log10", name = "Count") +
+  annotate("text", x = min(plot_data$short_read), y = max(plot_data$long_read),
+           hjust = 0, vjust = 1,
+           label = paste0("Sample-wise: Spearman = ",
+                          sprintf("%.3f", cor_spearman_samplewise),
+                          ", Pearson = ",
+                          sprintf("%.3f", cor_pearson_samplewise)),
+           size = 3.5) +
+  labs(title = "Short-Read Vs Long-Read Gene Expression",
+       x = "Short-Read Gene log2(CPM)",
+       y = "Long-Read Gene log2(CPM)") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(),
+        plot.title       = element_text(face = "bold"))
+
+print(p_overall)
+
+ggsave(file.path(OUTPUT_DIR, "sr_vs_lr_gene_expression_correlation.png"),
+       p_overall, width = 10, height = 6, dpi = 300, bg = "white")
+```
+
+# Correlation By Cell Type
+
+```{r corr-by-celltype}
+sample_names <- colnames(cpm_short_matched)
+cell_types   <- extract_ct(sample_names)
+unique_cts   <- intersect(CT_KEEP, unique(cell_types))  # preserves CT_KEEP order
+
+cat("Cell type counts (internal codes):\n"); print(table(cell_types))
+
+ct_results <- list()
+for (ct in unique_cts) {
+  ct_samples   <- sample_names[cell_types == ct]
+  cpm_short_ct <- cpm_short_matched[, ct_samples]
+  cpm_long_ct  <- cpm_long_matched[, ct_samples]
+
+  spear <- sapply(seq_len(ncol(cpm_short_ct)), function(i) {
+    cor(cpm_short_ct[, i], cpm_long_ct[, i], method = "spearman")
+  })
+  pears <- sapply(seq_len(ncol(cpm_short_ct)), function(i) {
+    cor(cpm_short_ct[, i], cpm_long_ct[, i], method = "pearson")
+  })
+
+  ct_results[[ct]] <- list(
+    samples              = ct_samples,
+    spearman             = mean(spear),
+    pearson              = mean(pears),
+    sample_cors_spearman = spear,
+    sample_cors_pearson  = pears
+  )
+}
+
+# Relabel internal codes to display names (AT->AT2, DD->LAE) for the summary.
+summary_df <- data.frame(
+  CellType      = unname(CT_DISPLAY[unique_cts]),
+  N_Samples     = sapply(unique_cts, function(ct) length(ct_results[[ct]]$samples)),
+  Spearman_Mean = sapply(unique_cts, function(ct) sprintf("%.3f", ct_results[[ct]]$spearman)),
+  Pearson_Mean  = sapply(unique_cts, function(ct) sprintf("%.3f", ct_results[[ct]]$pearson))
+)
+cat("\nPer-cell-type sample-wise correlation:\n"); print(summary_df)
+
+# ── Claim 1.2.3 — "per cell type Pearson means ranged from 0.88 (FB) to 0.90 (AT2)" ────
+# The RANGE is emitted against the published endpoints. The cell-type ATTRIBUTIONS are emitted
+# per cell type as supporting numbers rather than asserted, because the maximum is not uniquely
+# AT2: LAE and AT2 both round to 0.90 and LAE is fractionally higher, so naming AT2 is not
+# false but is not the only true reading either. Recording every cell type's mean lets a reader
+# see that for themselves instead of taking the sentence's word for it.
+.ct_pearson <- vapply(unique_cts, function(ct) ct_results[[ct]]$pearson, numeric(1))
+CT_CONCORD_POP <- paste("sample-wise short-read / long-read Pearson r averaged within each cell",
+                        "type; same per-sample-then-average construction as the overall figure,",
+                        "over the common gene set")
+claim_emit("1.2.3", "lowest per-cell-type mean Pearson r", min(.ct_pearson),
+           published = "0.88", n = length(.ct_pearson), population = CT_CONCORD_POP)
+claim_emit("1.2.3", "highest per-cell-type mean Pearson r", max(.ct_pearson),
+           published = "0.90", n = length(.ct_pearson), population = CT_CONCORD_POP)
+for (.ct in names(.ct_pearson)) {
+  claim_emit("1.2.3", sprintf("mean Pearson r, %s", unname(CT_DISPLAY[.ct])),
+             .ct_pearson[[.ct]],
+             n = length(ct_results[[.ct]]$samples), population = CT_CONCORD_POP)
+}
+
+```
+
+## Multi-Panel: Per-Cell-Type Hex Scatter
+
+With four cell types this is a clean 2x2 grid.
+
+```{r corr-by-celltype-panel, fig.width=12, fig.height=10}
+ct_plots <- list()
+
+for (ct in unique_cts) {
+  ct_samples   <- ct_results[[ct]]$samples
+  cpm_short_ct <- cpm_short_matched[, ct_samples]
+  cpm_long_ct  <- cpm_long_matched[, ct_samples]
+
+  plot_data <- data.frame(short_read = as.vector(cpm_short_ct),
+                          long_read  = as.vector(cpm_long_ct))
+
+  ct_plots[[ct]] <- ggplot(plot_data, aes(x = short_read, y = long_read)) +
+    geom_hex(bins = 50) +
+    scale_fill_gradientn(
+      colors = c("white", "lightblue", "blue", "darkblue", "red"),
+      trans  = "log10", name = "Count"
+    ) +
+    annotate("text",
+             x = min(plot_data$short_read), y = max(plot_data$long_read),
+             hjust = 0, vjust = 1,
+             label = paste0("r = ",       sprintf("%.3f", ct_results[[ct]]$pearson),
+                            "\nρ = ", sprintf("%.3f", ct_results[[ct]]$spearman)),
+             size = 4, fontface = "bold") +
+    labs(title = CT_DISPLAY[ct],   # display name (AT2 / LAE / FB / MV)
+         x = "Short-Read log2(CPM)",
+         y = "Long-Read log2(CPM)") +
+    theme_minimal() +
+    theme(panel.grid.minor = element_blank(),
+          plot.title       = element_text(size = 14, face = "bold"),
+          legend.position  = "none")
+}
+
+p_cor_panel <- wrap_plots(ct_plots, ncol = 2) +
+  plot_annotation(
+    title    = "Short-Read Vs Long-Read Gene Expression By Cell Type",
+    subtitle = "log2(CPM) with TMM normalization; Pearson r and Spearman ρ per cell type",
+    theme    = theme(plot.title    = element_text(size = 16, face = "bold"),
+                     plot.subtitle = element_text(size = 12, color = "grey40"))
+  )
+
+print(p_cor_panel)
+
+ggsave(file.path(OUTPUT_DIR, "sr_vs_lr_expression_by_celltype_panel.png"),
+       p_cor_panel, width = 12, height = 10, dpi = 300, bg = "white")
+```
+
+# Save Results
+
+```{r save-results}
+fwrite(cor_table,  file.path(OUTPUT_DIR, "samplewise_correlation.csv"))
+fwrite(summary_df, file.path(OUTPUT_DIR, "celltype_correlation_summary.csv"))
+
+cat("All outputs saved to:", OUTPUT_DIR, "\n")
+print(list.files(OUTPUT_DIR, pattern = "\\.(csv|png)$"))
+
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
