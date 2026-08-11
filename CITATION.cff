@@ -1,0 +1,96 @@
+cff-version: 1.2.0
+title: "Nonsense-mediated decay in human lung cells — analysis code"
+message: >-
+  If you use this code, please cite the paper. If you use the data, please also cite the
+  Zenodo archive it comes from.
+type: software
+abstract: >-
+  Analysis code for a long-read RNA sequencing study of nonsense-mediated decay (NMD) in four
+  human lung cell types, including the neural network that predicts NMD sensitivity from the
+  sequence around a transcript's start and stop codons.
+# Author list verified against the submitted manuscript byline, 2026-08-11, and generated from
+# deposit/.zenodo.json so the citation file and the Zenodo record cannot disagree. ORCIDs are
+# deliberately omitted (Pete, 2026-08-11).
+authors:
+  - family-names: "Leshem"
+    given-names: "Yul"
+    affiliation: "Channing Division of Network Medicine, Mass General Brigham, Harvard Medical School, Boston, MA, USA"
+  - family-names: "Kasai"
+    given-names: "Yoshiyuki"
+    affiliation: "Marsico Lung Institute, University of North Carolina at Chapel Hill, Chapel Hill, NC, USA"
+  - family-names: "Eskandar"
+    given-names: "Masih"
+    affiliation: "Department of Electrical and Computer Engineering, Northeastern University, Boston, MA, USA"
+  - family-names: "Thakur"
+    given-names: "Sanika M."
+    affiliation: "The Institute for Experiential AI, Northeastern University, Boston, MA, USA"
+  - family-names: "Santos Cabrera"
+    given-names: "Jose"
+    affiliation: "Channing Division of Network Medicine, Mass General Brigham, Harvard Medical School, Boston, MA, USA"
+  - family-names: "Runyan"
+    given-names: "Matthew"
+    affiliation: "The Institute for Experiential AI, Northeastern University, Boston, MA, USA"
+  - family-names: "Paul"
+    given-names: "Ayan"
+    affiliation: "The Institute for Experiential AI, Northeastern University, Boston, MA, USA"
+  - family-names: "Ziniti"
+    given-names: "John"
+    affiliation: "Channing Division of Network Medicine, Mass General Brigham, Harvard Medical School, Boston, MA, USA"
+  - family-names: "Boueiz"
+    given-names: "Adel"
+    affiliation: "Channing Division of Network Medicine, Mass General Brigham, Harvard Medical School, Boston, MA, USA"
+  - family-names: "Saferali"
+    given-names: "Aabida"
+    affiliation: "Channing Division of Network Medicine, Mass General Brigham, Harvard Medical School, Boston, MA, USA"
+  - family-names: "De Marzio"
+    given-names: "Margherita"
+    affiliation: "Channing Division of Network Medicine, Mass General Brigham, Harvard Medical School, Boston, MA, USA"
+  - family-names: "Dy"
+    given-names: "Jennifer"
+    affiliation: "Department of Electrical and Computer Engineering, Northeastern University, Boston, MA, USA"
+  - family-names: "Laederach"
+    given-names: "Alain"
+    affiliation: "Department of Biology, University of North Carolina at Chapel Hill, Chapel Hill, NC, USA"
+  - family-names: "Tata"
+    given-names: "Aleksandra"
+    affiliation: "Division of Surgical Sciences, Department of Surgery, Duke University, Durham, NC, USA"
+  - family-names: "Tata"
+    given-names: "Purushothama Rao"
+    affiliation: "Departments of Cell Biology and Medicine, Duke University, Durham, NC, USA"
+  - family-names: "Randell"
+    given-names: "Scott H."
+    affiliation: "Marsico Lung Institute, University of North Carolina at Chapel Hill, Chapel Hill, NC, USA"
+  - family-names: "Castaldi"
+    given-names: "Peter J."
+    affiliation: "Channing Division of Network Medicine, Mass General Brigham, Harvard Medical School, Boston, MA, USA"
+repository-code: "https://github.com/peter4244/nmd_lung_longread_reproduction"
+# The CONCEPT DOI, which always resolves to the latest version. Cite this rather than a
+# version DOI: publishing a new version mints a new record id, and a version DOI keeps
+# pointing at the files of the version that minted it.
+doi: "10.5281/zenodo.21897099"
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.21897099"
+    description: "Concept DOI — always the latest version of this reproduction package"
+license: MIT            # ⚠ placeholder — see LICENSE
+version: "0.1.0-draft"
+date-released: 2026-07-29
+keywords:
+  - nonsense-mediated decay
+  - long-read RNA sequencing
+  - alternative splicing
+  - lung
+references:
+  - type: data
+    title: "Source data for the NMD long-read lung study"
+    doi: "10.5281/zenodo.21544336"
+    notes: "Zenodo concept DOI; always resolves to the latest version of the source-data record"
+  - type: data
+    title: "Raw sequencing reads"
+    notes: "GEO accession GSE329233"
+  - type: software
+    title: "Isopair"
+    doi: "10.5281/zenodo.21536494"
+  - type: software
+    title: "Isocall"
+    doi: "10.5281/zenodo.21536485"

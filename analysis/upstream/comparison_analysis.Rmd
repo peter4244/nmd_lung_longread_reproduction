@@ -1,0 +1,601 @@
+---
+title: "Short-Read Gene Vs Long-Read Isoform: NMD Response Comparison"
+author: "Leshem, Yul"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: lumen
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+.nmd_root <- local({ d <- getwd(); while (!file.exists(file.path(d, "config", "paths.yml"))) {
+  p <- dirname(d); if (identical(p, d)) stop("repo root not found"); d <- p }; d })
+source(file.path(.nmd_root, "R", "load_config.R")); .P <- nmd_paths(.nmd_root)
+source(file.path(.nmd_root, "R", "claim_emit.R"))  # Phase 2 claim-value emission
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, dev = "png")
+options(bitmapType = "cairo")
+
+```
+
+Code location: `/udd/reyle/nmd_lungcells_2026/code/final/comparison_analysis.Rmd`
+
+# Overview
+
+Two-pipeline comparison of NMD susceptible gene calls across the four kept
+cell types (AT2, LAE, FB, MV), restricted to short-read gene-level DGE and
+long-read isoform-level DIE. The long-read gene-level DGE pipeline is
+intentionally excluded here.
+
+For long-read isoforms we need a single per-gene logFC summary. We use a
+significance-weighted mean of isoform-level posterior means, with weights
+`-log10(lfsr)` clipped at the analysis threshold so that only confidently
+called isoforms contribute. A gene is considered NMD susceptible in a cell
+type if **any** of its isoforms is significant with positive logFC.
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(ggplot2)
+  library(patchwork)
+  library(scales)
+})
+
+# Bioconductor namespace masking guard
+select <- dplyr::select
+filter <- dplyr::filter
+rename <- dplyr::rename
+count  <- dplyr::count
+slice  <- dplyr::slice
+first  <- dplyr::first
+```
+
+# Configuration
+
+```{r config}
+OUTPUT_DIR <- file.path(.P$OUT, "comparison")
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# Source directories for the two mashr result sets
+SR_DGE_DIR <- file.path(.P$OUT, "mashr_gene")
+DIE_DIR    <- file.path(.P$OUT, "mashr_isoform")
+SR_PATTERN  <- "^nmd_mashr_dge_.*_2026\\.3\\.10\\.csv$"
+DIE_PATTERN <- "^nmd_mashr_die_.*_2026\\.3\\.10\\.csv$"
+
+# Four cell types — DD_ALI and DO_ALI are cut from the paper.
+CT_KEEP  <- c("AT2", "LAE", "FB", "MV")
+CT_ORDER <- CT_KEEP
+
+# Cell-type code (lowercase, from filename) -> display name.
+# Pipeline writes nmd_mashr_*_at2/lae/fb/mv, so the keys are at2/lae/fb/mv.
+CELLTYPE_MAP <- c("at2" = "AT2", "lae" = "LAE", "fb" = "FB", "mv" = "MV")
+
+LFSR_THRESH <- 0.05
+LOGFC_THRESH <- 0
+
+# ── Claim 2.8.3 — the Figure 1C definition of NMD susceptibility ──────────────────────
+# The two published numbers here are THRESHOLDS, not results: "posterior mean logFC > 0 and
+# lfsr < 0.05". Emitting them against themselves would be a check that cannot fail, so they are
+# recorded as SUPPORTING values naming the constants the whole section depends on. What can
+# actually be verified is that the definition is APPLIED consistently, and that is asserted
+# where the feature tables are built rather than claimed here.
+claim_emit("2.8.3", "lfsr threshold defining NMD susceptibility", LFSR_THRESH,
+           population = "the constant applied to every NMD susceptibility call in this report")
+claim_emit("2.8.3", "posterior mean logFC threshold defining NMD susceptibility", LOGFC_THRESH,
+           population = "the constant applied to every NMD susceptibility call in this report")
+
+```
+
+# Load mashr Results
+
+```{r load-results}
+# Helper: read one per-cell-type result CSV and tag with display CT name
+read_results <- function(path, ct_extractor, id_candidates) {
+  ct_code <- ct_extractor(basename(path))
+  ct_name <- CELLTYPE_MAP[ct_code]
+  if (is.na(ct_name) || !ct_name %in% CT_KEEP) return(NULL)
+
+  df <- fread(path)
+  id_col <- intersect(names(df), id_candidates)
+  if (length(id_col) == 0) id_col <- names(df)[1]
+
+  # RETAIN gene_id WHEN THE SOURCE CARRIES IT (added 2026-07-27, §2 tree gate).
+  #
+  # This used to select(ct, .id_col, logFC, adj.P.Val) unconditionally, discarding a
+  # `gene_id` column that the long-read die CSVs DO carry (alongside hgnc_symbol). The
+  # consequence was that 2.1.4's "7,105 unique genes" and 2.1.5's 2,326 / 4,779 could not be
+  # emitted by this report at all, and were recomputed by hand instead.
+  #
+  # The obvious workaround -- map isoforms to genes through `iso_to_gene` -- is WRONG here and
+  # was measured to be so: gmap is Ensembl-derived, most NMD isoforms are novel, and only
+  # 4,540 of 34,387 (13.2%) join. That route gives 2,595 genes against the published 7,105.
+  # The die output's own SQANTI-derived gene_id is the right source, which is also what the
+  # W41 finding concluded independently.
+  #
+  # Guarded on presence and on not colliding with .id_col: for the SR side the id column IS
+  # gene_id, so an unconditional keep would duplicate it.
+  keep <- c("ct", ".id_col", "logFC", "adj.P.Val")
+  out <- df %>%
+    rename(.id_col = !!id_col[1]) %>%
+    mutate(ct = ct_name)
+  if ("gene_id" %in% names(out) && id_col[1] != "gene_id") keep <- c(keep, "gene_id")
+  out %>% select(all_of(keep))
+}
+
+# ---- SR gene-level DGE ----
+sr_files <- list.files(SR_DGE_DIR, pattern = SR_PATTERN, full.names = TRUE)
+cat("FILTER: SR files matching pattern:", length(sr_files), "\n"); print(basename(sr_files))
+sr_dge_all <- lapply(
+  sr_files, read_results,
+  ct_extractor  = function(fn) sub("^nmd_mashr_dge_(.+)_2026.*", "\\1", fn),
+  id_candidates = c("gene_id", "gene", "V1")
+) %>%
+  bind_rows() %>%
+  rename(gene_id = .id_col) %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id))
+
+# ---- LR isoform-level DIE ----
+die_files <- list.files(DIE_DIR, pattern = DIE_PATTERN, full.names = TRUE)
+cat("FILTER: DIE files matching pattern:", length(die_files), "\n"); print(basename(die_files))
+lr_die_all <- lapply(
+  die_files, read_results,
+  ct_extractor  = function(fn) sub("^nmd_mashr_die_(.+)_2026.*", "\\1", fn),
+  id_candidates = c("txid", "isoform", "V1", "gene")
+) %>%
+  bind_rows() %>%
+  rename(txid = .id_col)
+
+stopifnot("No SR rows loaded — check CELLTYPE_MAP vs filenames"  = nrow(sr_dge_all) > 0)
+stopifnot("No LR rows loaded — check CELLTYPE_MAP vs filenames"  = nrow(lr_die_all) > 0)
+
+cat("SR DGE rows:", nrow(sr_dge_all), "\n")
+cat("LR DIE rows:", nrow(lr_die_all), "\n")
+cat("\nPer-CT row counts:\n")
+cat("  SR DGE: "); print(table(sr_dge_all$ct))
+cat("  LR DIE: "); print(table(lr_die_all$ct))
+```
+
+# Build Transcript → Gene Mapping
+
+The LR isoform results are keyed by txid. For both the logFC aggregation
+and the gene-level sharing analysis, we need a txid → gene_id link. Source
+is the project gmap RDS, with a fallback to the long-read DGEList.
+
+```{r load-iso-to-gene}
+GMAP_PATH        <- file.path(.P$ANNOT, "gmap_txlevel_ENSGv115_2025.08.12.rds")
+DGELIST_ISO_PATH <- file.path(.P$OUT, "dge_isoform_longread_2026.3.3.rds")
+
+if (file.exists(GMAP_PATH)) {
+  gmap <- readRDS(GMAP_PATH)
+  tx_col_candidates <- c("ensembl_transcript_id_version",
+                         "ensembl_transcript_id",
+                         "transcript_id_version",
+                         "transcript_id", "txid")
+  tx_col <- intersect(tx_col_candidates, colnames(gmap))[1]
+  if (is.na(tx_col)) stop("No transcript-ID column found in gmap")
+
+  iso_to_gene <- unique(data.frame(
+    txid        = gmap[[tx_col]],
+    gene_id     = gmap$ensembl_gene_id_version,
+    hgnc_symbol = gmap$hgnc_symbol,
+    stringsAsFactors = FALSE
+  ))
+  cat("iso_to_gene from gmap:", nrow(iso_to_gene), "rows\n")
+
+} else if (file.exists(DGELIST_ISO_PATH)) {
+  dge_iso <- readRDS(DGELIST_ISO_PATH)
+  iso_to_gene <- unique(dge_iso$genes[, c("txid", "gene_id", "hgnc_symbol")])
+  cat("iso_to_gene from long-read DGEList:", nrow(iso_to_gene), "rows\n")
+
+} else {
+  stop("Neither gmap RDS nor long-read DGEList found — cannot build iso_to_gene")
+}
+
+iso_to_gene <- iso_to_gene %>%
+  filter(!is.na(gene_id), gene_id != "") %>%
+  mutate(gene_id_clean = sub("\\..*", "", gene_id)) %>%
+  distinct(txid, .keep_all = TRUE)
+
+cat("After cleanup:", nrow(iso_to_gene), "rows\n")
+
+```
+
+# Aggregate LR Isoform logFC To Gene Level
+
+For each gene in each cell type, compute a significance-weighted mean
+isoform logFC:
+
+$$
+\bar{\beta}_{g,c} = \frac{\sum_{i \in g} w_{i,c} \, \beta_{i,c}}{\sum_{i \in g} w_{i,c}}, \quad
+w_{i,c} = \max\!\left(-\log_{10}(\text{lfsr}_{i,c}),\, \epsilon\right)
+$$
+
+The floor $\epsilon$ on the weight prevents non-significant isoforms from
+contributing zero weight (which would crash the divide). It's set to a
+small positive value so high-significance isoforms still dominate.
+
+```{r aggregate-lr-iso-to-gene}
+EPS <- 1e-3  # weight floor
+
+n_before <- nrow(lr_die_all)
+lr_iso_with_gene <- lr_die_all %>%
+  inner_join(iso_to_gene %>% select(txid, gene_id_clean),
+             by = "txid") %>%
+  mutate(weight = pmax(-log10(adj.P.Val), EPS))
+cat(sprintf("FILTER: isoforms joined to a gene_id.\n  Rows before: %d / after join: %d (dropped %d unmapped).\n",
+            n_before, nrow(lr_iso_with_gene), n_before - nrow(lr_iso_with_gene)))
+
+lr_iso_gene <- lr_iso_with_gene %>%
+  group_by(ct, gene_id_clean) %>%
+  summarise(logFC      = sum(weight * logFC) / sum(weight),
+            min_lfsr   = min(adj.P.Val, na.rm = TRUE),
+            n_isoforms = n(),
+            .groups = "drop")
+
+cat("Per-cell-type gene counts after aggregation:\n")
+print(table(lr_iso_gene$ct))
+```
+
+# Combined Long-Format Table For Plotting
+
+```{r build-long-format}
+sr_long <- sr_dge_all %>%
+  mutate(analysis = "Short-Read Gene") %>%
+  select(analysis, ct, gene_id_clean, logFC, lfsr = adj.P.Val)
+
+lr_long <- lr_iso_gene %>%
+  mutate(analysis = "Long-Read Isoform") %>%
+  select(analysis, ct, gene_id_clean, logFC, lfsr = min_lfsr)
+
+combined <- bind_rows(sr_long, lr_long) %>%
+  mutate(analysis = factor(analysis,
+                           levels = c("Short-Read Gene", "Long-Read Isoform")),
+         ct       = factor(ct, levels = CT_ORDER),
+         is_sig   = lfsr < LFSR_THRESH,
+         is_nmd   = is_sig & logFC > LOGFC_THRESH)
+
+cat("Combined table:", nrow(combined), "rows\n")
+cat("\nNMD susceptible counts (lfsr <", LFSR_THRESH, "& logFC >", LOGFC_THRESH, "):\n")
+combined %>%
+  group_by(analysis, ct) %>%
+  summarise(n_total = n(),
+            n_nmd   = sum(is_nmd, na.rm = TRUE),
+            .groups = "drop") %>%
+  print()
+
+```
+
+# logFC Distribution Of NMD Susceptible Genes
+
+Boxplots of posterior-mean logFC restricted to NMD susceptible genes
+(lfsr < 0.05 & logFC > 0), faceted by cell type, dodged by analysis.
+
+```{r logfc-distribution, fig.width=10, fig.height=6}
+nmd_only <- combined %>% filter(is_nmd)
+
+# Median logFC per (analysis, ct) for the dashed reference line
+median_logfc <- nmd_only %>%
+  group_by(analysis, ct) %>%
+  summarise(median_logFC = median(logFC), .groups = "drop")
+overall_median <- median(nmd_only$logFC)
+
+p_logfc <- ggplot(nmd_only, aes(x = ct, y = logFC, fill = analysis)) +
+  geom_boxplot(alpha = 0.85, outlier.size = 0.4, outlier.alpha = 0.4,
+               position = position_dodge(width = 0.75), width = 0.7) +
+  geom_hline(yintercept = overall_median, linetype = "dashed",
+             color = "grey40", linewidth = 0.4) +
+  scale_fill_manual(values = c("Short-Read Gene"   = "#7B8DC9",
+                               "Long-Read Isoform" = "#7BB07B")) +
+  labs(
+    title    = "logFC Distribution Of NMD Susceptible Genes",
+    subtitle = "lfsr < 0.05 & logFC > 0 | dashed line: overall median",
+    x        = "Cell Type",
+    y        = "Posterior Mean logFC (Smg1i Vs DMSO)",
+    fill     = "Analysis"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title      = element_text(face = "bold"),
+        plot.subtitle   = element_text(color = "grey40"),
+        legend.position = "top",
+        panel.grid.minor = element_blank())
+
+print(p_logfc)
+
+ggsave(file.path(OUTPUT_DIR, "logfc_distribution_sr_vs_lriso.png"),
+       p_logfc, width = 10, height = 6, dpi = 300, bg = "white")
+```
+
+```{r logfc-summary-stats}
+# ── Claim 2.1.6 — relational, and it states no number ─────────────────────────────────
+# "Mean posterior logFC substantially larger at isoform than gene level." All SUPPORTING: the
+# paper prints no value, so the assertion is the ORDERING, and it must hold in EVERY cell type
+# rather than on average -- emitting the eight means lets a reader check that directly.
+.mlogfc <- tapply(nmd_only$logFC, list(nmd_only$analysis, nmd_only$ct), mean)
+POP_216 <- paste("mean mashr posterior logFC of NMD susceptible features within each cell type,",
+                 "computed at each platform's OWN resolution: genes for short-read, isoforms for",
+                 "long-read. Not a paired comparison -- the two sets contain different entities")
+for (.a in rownames(.mlogfc)) for (.c in colnames(.mlogfc)) {
+  if (!is.na(.mlogfc[.a, .c]))
+    claim_emit("2.1.6", sprintf("mean posterior logFC, %s, %s", .a, .c), .mlogfc[.a, .c],
+               n = sum(nmd_only$analysis == .a & nmd_only$ct == .c), population = POP_216)
+}
+
+cat("Summary statistics (NMD susceptible genes only):\n")
+nmd_only %>%
+  group_by(analysis, ct) %>%
+  summarise(n      = n(),
+            min    = round(min(logFC), 3),
+            Q1     = round(quantile(logFC, 0.25), 3),
+            median = round(median(logFC), 3),
+            mean   = round(mean(logFC), 3),
+            Q3     = round(quantile(logFC, 0.75), 3),
+            max    = round(max(logFC), 3),
+            .groups = "drop") %>%
+  print()
+
+```
+
+# Shared Vs Cell-Type-Specific NMD Features
+
+For each pipeline, count features (genes for SR, isoforms for LR) at their
+native resolution — no cross-pipeline aggregation. A feature is NMD susceptible
+in cell type X if its own lfsr < 0.05 and logFC > 0 in X. Sharing tier =
+number of cell types where the same feature ID crosses both thresholds.
+
+```{r build-sharing-table}
+# ---- SR side: features = genes ----
+sr_features <- sr_dge_all %>%
+  mutate(ct     = factor(ct, levels = CT_ORDER),
+         is_sig = adj.P.Val < LFSR_THRESH,
+         is_nmd = is_sig & logFC > LOGFC_THRESH) %>%
+  filter(is_nmd) %>%
+  transmute(analysis  = "Short-Read Gene",
+            ct,
+            feature_id = gene_id_clean)
+
+# ---- LR side: features = isoforms (no gene aggregation) ----
+lr_features <- lr_die_all %>%
+  mutate(ct     = factor(ct, levels = CT_ORDER),
+         is_sig = adj.P.Val < LFSR_THRESH,
+         is_nmd = is_sig & logFC > LOGFC_THRESH) %>%
+  filter(is_nmd) %>%
+  transmute(analysis  = "Long-Read Isoform",
+            ct,
+            feature_id = txid)
+
+features_long <- bind_rows(sr_features, lr_features) %>%
+  mutate(analysis = factor(analysis,
+                           levels = c("Short-Read Gene", "Long-Read Isoform")))
+
+# Per-feature sharing count (within an analysis, # CTs the feature appears in)
+sharing_counts <- features_long %>%
+  group_by(analysis, feature_id) %>%
+  summarise(n_cts = n_distinct(ct), .groups = "drop")
+
+# Join back so each (analysis, ct, feature_id) row gets its sharing bin
+sharing_long <- features_long %>%
+  inner_join(sharing_counts, by = c("analysis", "feature_id")) %>%
+  mutate(sharing_bin = factor(as.character(n_cts),
+                              levels = as.character(seq_len(length(CT_KEEP)))))
+
+# Per-CT, per-tier counts
+sharing_summary <- sharing_long %>%
+  group_by(analysis, ct, sharing_bin) %>%
+  summarise(n_features = n(), .groups = "drop") %>%
+  group_by(analysis, ct) %>%
+  mutate(n_total      = sum(n_features),
+         n_specific   = ifelse(sharing_bin == "1", n_features, 0),
+         pct_specific = round(100 * sum(n_specific) / n_total, 1)) %>%
+  ungroup()
+
+totals <- sharing_summary %>%
+  distinct(analysis, ct, n_total, pct_specific)
+
+# ── Claim 2.3.2 — per-cell-type specificity at isoform level ──────────────────────────
+# DENOMINATOR IS PER CELL TYPE: of the isoforms NMD susceptible IN cell type X, the share that
+# are NMD susceptible ONLY in X. Not a share of the 34,387 union.
+.pc <- dplyr::distinct(dplyr::filter(sharing_summary, analysis == "Long-Read Isoform"),
+                       ct, n_total, pct_specific)
+POP_232 <- paste("of the isoforms NMD susceptible in a given cell type, the share NMD",
+                 "susceptible in that cell type ALONE; denominator is that cell type's own",
+                 "NMD susceptible set, isoform resolution, no gene aggregation")
+for (.i in seq_len(nrow(.pc))) {
+  .ctn <- as.character(.pc$ct[.i])
+  claim_emit("2.3.2", sprintf("cell type-specific share, %s (%%)", .ctn),
+             .pc$pct_specific[.i],
+             published = if (.ctn == "LAE") "23.7" else NULL,
+             n = .pc$n_total[.i], population = POP_232)
+}
+.others <- .pc$pct_specific[as.character(.pc$ct) != "LAE"]
+claim_emit("2.3.2", "lowest cell type-specific share outside LAE (%)", min(.others),
+           published = "0.8", n = sum(.pc$n_total), population = POP_232)
+claim_emit("2.3.2", "highest cell type-specific share outside LAE (%)", max(.others),
+           published = "3.4", n = sum(.pc$n_total), population = POP_232)
+
+cat("Sharing tier definitions: sharing_bin = number of cell types a feature is",
+    "NMD susceptible in (1 = cell-type-specific, 4 = all).\n")
+cat("Per-CT totals and % CT-specific:\n")
+print(totals)
+
+cat("\nUnique feature counts per analysis (each feature counted once):\n")
+features_long %>%
+  group_by(analysis) %>%
+  summarise(n_unique_features = n_distinct(feature_id), .groups = "drop") %>%
+  print()
+```
+
+```{r sharing-plot, fig.width=11, fig.height=6}
+# Color gradient: warm for unique (1 CT), deep for shared in all 4
+fill_palette <- c("1" = "#D6604D",  # 1 CT — unique (warmest)
+                  "2" = "#92C5DE",  # 2 CTs
+                  "3" = "#4393C3",  # 3 CTs
+                  "4" = "#2166AC")  # all 4 CTs (deepest)
+
+p_sharing <- ggplot(sharing_summary,
+                    aes(x = ct, y = n_features, fill = sharing_bin)) +
+  geom_col(alpha = 0.9, width = 0.7) +
+  geom_text(data = totals,
+            aes(x = ct, y = n_total,
+                label = paste0(comma(n_total), "\n(", pct_specific, "% specific)"),
+                fill = NULL),
+            vjust = -0.2, size = 3.2, lineheight = 0.9) +
+  facet_wrap(~ analysis, ncol = 2, scales = "free_y") +
+  scale_fill_manual(values = fill_palette,
+                    name = "Shared In # Cell Types",
+                    labels = c("1" = "1 (unique)",
+                               "2" = "2",
+                               "3" = "3",
+                               "4" = "4 (all)")) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.18))) +
+  labs(title    = "Shared Vs Cell-Type-Specific NMD Features Per Analysis",
+       subtitle = "lfsr < 0.05 & logFC > 0 | SR features = genes, LR features = isoforms (native resolution)",
+       x = "Cell Type", y = "Number Of NMD Susceptible Features") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title         = element_text(face = "bold"),
+        plot.subtitle      = element_text(color = "grey40"),
+        strip.text         = element_text(face = "bold", size = 12),
+        legend.position    = "top",
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor   = element_blank())
+
+print(p_sharing)
+
+ggsave(file.path(OUTPUT_DIR, "sharing_sr_genes_vs_lr_isoforms.png"),
+       p_sharing, width = 11, height = 6, dpi = 300, bg = "white")
+
+```
+
+```{r sharing-stats}
+cat("Sharing-tier feature counts per analysis (each feature counted once per CT it appears in):\n")
+sharing_summary %>%
+  group_by(analysis, sharing_bin) %>%
+  summarise(n_feat_x_ct = sum(n_features), .groups = "drop") %>%
+  pivot_wider(names_from = sharing_bin, values_from = n_feat_x_ct,
+              names_prefix = "tier_") %>%
+  print()
+
+cat("\nUnique-feature counts per tier (each feature_id counted once):\n")
+sharing_counts %>%
+  count(analysis, n_cts, name = "n_features") %>%
+  pivot_wider(names_from = n_cts, values_from = n_features,
+              names_prefix = "tier_") %>%
+  print()
+```
+
+# Save Results
+
+## Claims 2.1.4 and 2.1.5 — cross-platform NMD sharing
+
+Every value in §2's two sharing sentences is emitted here. Added 2026-07-27 to close the §2
+tree gate: the numbers were **derivable** from this report's objects but no shipped chunk
+emitted them, so they had been recomputed by hand — which a reader of the deposit cannot do.
+
+The gene mapping comes from the die output's own SQANTI-derived `gene_id`, retained at load
+(see `read_results`). It deliberately does **not** route through `iso_to_gene`: gmap is
+Ensembl-derived and most NMD isoforms are novel, so only 4,540 of 34,387 (13.2%) join, giving
+2,595 genes against the published 7,105.
+
+```{r claims-2-1-4-and-2-1-5}
+lr_sc_214  <- dplyr::filter(sharing_counts, analysis == "Long-Read Isoform")
+lr_lng_214 <- dplyr::filter(features_long,  analysis == "Long-Read Isoform")
+n_iso_214  <- dplyr::n_distinct(lr_lng_214$feature_id)
+core_214   <- sum(lr_sc_214$n_cts == length(CT_KEEP))
+spec_214   <- sum(lr_sc_214$n_cts == 1)
+
+cat(sprintf("2.1.4  NMD susceptible isoforms      : %s\n", format(n_iso_214, big.mark = ",")))
+cat(sprintf("2.1.4  core across all %d cell types  : %s (%.1f%%)\n",
+            length(CT_KEEP), format(core_214, big.mark = ","), 100 * core_214 / n_iso_214))
+cat(sprintf("2.1.4  cell-type specific (1 CT)     : %s (%.1f%%)\n",
+            format(spec_214, big.mark = ","), 100 * spec_214 / n_iso_214))
+spec_ct_214 <- dplyr::filter(lr_lng_214,
+                             feature_id %in% lr_sc_214$feature_id[lr_sc_214$n_cts == 1])
+cat("2.1.4  cell-type-specific isoforms by CT (%):\n")
+print(round(100 * prop.table(table(droplevels(spec_ct_214$ct))), 1))
+
+nmd_214    <- dplyr::filter(lr_die_all, adj.P.Val < LFSR_THRESH, logFC > LOGFC_THRESH)
+lr_genes   <- unique(sub("\\..*", "", nmd_214$gene_id))
+sr_genes   <- unique(dplyr::filter(features_long, analysis == "Short-Read Gene")$feature_id)
+both_genes <- intersect(sr_genes, lr_genes)
+cat(sprintf("\n2.1.4  unique genes those isoforms map to : %s\n", format(length(lr_genes), big.mark = ",")))
+cat(sprintf("2.1.5  unique short-read NMD genes        : %s\n", format(length(sr_genes), big.mark = ",")))
+cat(sprintf("2.1.5  ...of which have an NMD isoform    : %s (%.0f%%)\n",
+            format(length(both_genes), big.mark = ","), 100 * length(both_genes) / length(sr_genes)))
+cat(sprintf("2.1.5  long-read-only NMD genes           : %s\n",
+            format(length(setdiff(lr_genes, sr_genes)), big.mark = ",")))
+
+# ── Claims 2.1.4 and 2.1.5 ────────────────────────────────────────────────────────────
+# TWO DIFFERENT ENTITIES IN ONE PARAGRAPH: 2.1.4 counts ISOFORMS (and the genes they map to),
+# 2.1.5 counts GENES on each platform. The gene mapping uses the DIE output's own SQANTI-derived
+# gene_id, version-stripped -- deliberately NOT the Ensembl gmap, because most NMD isoforms are
+# novel and only 4,540 of 34,387 would join, which would give 2,595 genes instead of 7,105.
+POP_ISO_214 <- paste("long-read isoforms NMD susceptible (lfsr < 0.05 and posterior mean logFC",
+                     "> 0) in at least one of the four primary cell types; sharing tier is the",
+                     "number of cell types the same isoform crosses both thresholds in")
+POP_GENE_215 <- paste("genes NMD susceptible on each platform at its OWN native resolution --",
+                      "short-read gene level vs long-read isoform level rolled up to gene by the",
+                      "SQANTI-derived gene_id -- with no cross-platform aggregation")
+claim_emit("2.1.4", "NMD susceptible isoforms across all cell types", n_iso_214,
+           published = "34,387", n = n_iso_214, population = POP_ISO_214)
+claim_emit("2.1.4", "genes those NMD susceptible isoforms map to", length(lr_genes),
+           published = "7,105", n = n_iso_214, population = POP_GENE_215)
+claim_emit("2.1.4", "core NMD susceptible isoforms shared across all cell types", core_214,
+           published = "19,803", n = n_iso_214, population = POP_ISO_214)
+claim_emit("2.1.4", "core share of NMD susceptible isoforms (%)", 100 * core_214 / n_iso_214,
+           published = "57.6", n = n_iso_214, population = POP_ISO_214)
+claim_emit("2.1.4", "cell type-specific NMD susceptible isoforms", spec_214,
+           published = "9,154", n = n_iso_214, population = POP_ISO_214)
+claim_emit("2.1.4", "cell type-specific share of NMD susceptible isoforms (%)",
+           100 * spec_214 / n_iso_214, published = "26.6", n = n_iso_214,
+           population = POP_ISO_214)
+claim_emit("2.1.4", "LAE share of the cell type-specific isoforms (%)",
+           100 * prop.table(table(droplevels(spec_ct_214$ct)))[["LAE"]],
+           published = "83.4", n = spec_214,
+           population = paste("of the", spec_214, "isoforms NMD susceptible in exactly ONE cell",
+                              "type, the share whose single cell type is LAE"))
+claim_emit("2.1.5", "short-read NMD susceptible genes", length(sr_genes),
+           published = "3,736", n = length(sr_genes), population = POP_GENE_215)
+claim_emit("2.1.5", "short-read NMD genes that also have an NMD susceptible isoform",
+           length(both_genes), published = "2,326", n = length(sr_genes),
+           population = POP_GENE_215)
+claim_emit("2.1.5", "share of short-read NMD genes with an NMD susceptible isoform (%)",
+           100 * length(both_genes) / length(sr_genes), published = "62",
+           n = length(sr_genes), population = POP_GENE_215)
+claim_emit("2.1.5", "NMD susceptible genes detected only by long-read isoform analysis",
+           length(setdiff(lr_genes, sr_genes)), published = "4,779", n = length(lr_genes),
+           population = POP_GENE_215)
+```
+
+```{r save-results}
+# logFC distributions of NMD susceptible genes (gene-level, both pipelines)
+fwrite(nmd_only,
+       file.path(OUTPUT_DIR, "logfc_nmd_responsive_sr_vs_lriso.csv"))
+
+# Feature-resolution sharing breakdown (SR genes vs LR isoforms)
+fwrite(sharing_summary,
+       file.path(OUTPUT_DIR, "sharing_summary_sr_genes_vs_lr_isoforms.csv"))
+
+# Per-feature sharing counts (one row per analysis × feature_id)
+fwrite(sharing_counts,
+       file.path(OUTPUT_DIR, "sharing_counts_per_feature.csv"))
+
+# LR isoform-to-gene aggregation (kept as audit table for the logFC panel)
+fwrite(lr_iso_gene,
+       file.path(OUTPUT_DIR, "lr_iso_aggregated_to_gene.csv"))
+
+cat("All saved to:", OUTPUT_DIR, "\n")
+print(list.files(OUTPUT_DIR, pattern = "sr_genes_vs|sr_vs_lriso|lr_iso"))
+
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
