@@ -1,0 +1,870 @@
+---
+title: "NMD Transcriptional Output: Cross-Pipeline Analysis"
+author: "Leshem, Yul"
+date: "2026-03-18"
+output:
+  html_document:
+    theme: lumen
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+---
+
+Code location: `/udd/reyle/nmd_lungcells_2026/code/final/transcriptional_output.Rmd`
+
+```{r setup, include=FALSE}
+.nmd_root <- local({ d <- getwd(); while (!file.exists(file.path(d, "config", "paths.yml"))) {
+  p <- dirname(d); if (identical(p, d)) stop("repo root not found"); d <- p }; d })
+source(file.path(.nmd_root, "R", "load_config.R")); .P <- nmd_paths(.nmd_root)
+source(file.path(.nmd_root, "R", "claim_emit.R"))  # Phase 2 claim-value emission
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, dev = "png")
+options(bitmapType = "cairo")
+
+```
+
+# Overview
+
+This report quantifies how much of the long-read transcriptome's output is
+suppressed by NMD under DMSO conditions, by measuring how much of each
+isoform's (and gene's) Smg1i CPM appears only after NMD inhibition.
+
+For each cell-type x donor pair we compute the per-isoform delta
+(Smg1i − DMSO), keep only positive deltas (NMD-rescued), and divide by Smg1i
+CPM to get the fraction of output that NMD was degrading. Results are
+aggregated per cell type at both isoform and gene level, and compared with
+short-read gene-level mashr DGE counts.
+
+Naming: the DGEList stores the original ct codes `AT` (= AT2) and `DD` (= LAE);
+we relabel to the display names right after loading and use AT2 / LAE
+throughout.
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(ggplot2)
+  library(tidyr)
+  library(edgeR)
+  library(DT)
+  library(tibble)
+})
+
+# Bioconductor namespace masking guard
+select <- dplyr::select
+filter <- dplyr::filter
+rename <- dplyr::rename
+count  <- dplyr::count
+slice  <- dplyr::slice
+first  <- dplyr::first
+
+# -----------------------------------------------------------------------------
+# Paths and constants
+# -----------------------------------------------------------------------------
+DGELIST_PATH      <- file.path(.P$OUT, "dge_isoform_longread_2026.3.3.rds")
+DGELIST_FILT_PATH <- file.path(.P$OUT, "dge_isoform_longread_filtered_2026.3.3.rds")
+SR_DGE_DIR        <- file.path(.P$OUT, "mashr_gene")
+OUTPUT_DIR        <- file.path(.P$OUT, "transcriptional_output")
+
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# 4 cell types only (DD_ALI / DO_ALI dropped upstream), display naming.
+# AT2 = old AT, LAE = old DD.
+CT_KEEP    <- c("LAE", "AT2", "FB", "MV")
+SR_PATTERN <- "^nmd_mashr_dge_.*_2026\\.3\\.10\\.csv$"
+
+# SR mashr file codes -> display names. Pipeline writes nmd_mashr_dge_at2/lae/fb/mv.
+CELLTYPE_MAP <- c("at2" = "AT2", "lae" = "LAE", "fb" = "FB", "mv" = "MV")
+
+SIGNIFICANCE_THRESHOLD <- 0.05
+```
+
+# Load DGEList And Parse Metadata
+
+```{r load}
+dge <- readRDS(DGELIST_PATH)
+cat("DGEList dimensions:", dim(dge), "\n")
+
+counts_raw <- dge$counts
+
+samp <- dge$samples %>%
+  rownames_to_column("bam_id") %>%
+  mutate(ct        = as.character(ct),
+         treatment = as.character(treatment),
+         donor_id  = id)
+
+# Relabel ct to display names AFTER loading (AT -> AT2, DD -> LAE).
+# counts are keyed by bam_id, so renaming ct does not disturb alignment.
+samp$ct[samp$ct == "AT"] <- "AT2"
+samp$ct[samp$ct == "DD"] <- "LAE"
+
+# Drop ALI cell types
+n_before <- nrow(samp)
+samp     <- samp %>% filter(ct %in% CT_KEEP)
+cat(sprintf("FILTER: keep CT_KEEP {%s}. Samples before: %d / after: %d (dropped %d outside CT_KEEP).\n",
+            paste(CT_KEEP, collapse = ", "), n_before, nrow(samp), n_before - nrow(samp)))
+
+counts_raw <- counts_raw[, samp$bam_id]
+
+# Isoform annotation (one row per txid)
+iso_info <- dge$genes %>%
+  select(any_of(c("txid", "gene_id", "hgnc_symbol")))
+
+cat("\nCell types:", paste(sort(unique(samp$ct)), collapse = ", "), "\n")
+cat("Treatments:", paste(unique(samp$treatment), collapse = ", "), "\n")
+cat("Donors:",     paste(sort(unique(samp$donor_id)), collapse = ", "), "\n")
+
+```
+
+# Identify Matched Donor Pairs
+
+For each cell type, we keep only donors with both Smg1i and DMSO samples. The
+delta calculation is paired within donor.
+
+```{r matched-pairs}
+paired_donors <- samp %>%
+  group_by(ct, donor_id) %>%
+  summarise(has_smg1i = any(treatment == "Smg1i"),
+            has_dmso  = any(treatment == "DMSO"),
+            .groups = "drop") %>%
+  filter(has_smg1i & has_dmso)
+
+cat("Matched donor pairs per cell type:\n")
+paired_donors %>%
+  group_by(ct) %>%
+  summarise(n_pairs = n(),
+            donors  = paste(donor_id, collapse = ", "),
+            .groups = "drop") %>%
+  print(n = 20)
+```
+
+# Normalize Counts (Plain CPM, No TMM)
+
+TMM is not appropriate here because Smg1i genuinely shifts the transcriptome
+composition by rescuing NMD targets — TMM would partially scrub that signal.
+Instead we use plain CPM (library-size correction only).
+
+```{r normalize}
+# normalized.lib.sizes = FALSE tells edgeR to ignore norm.factors and use raw lib sizes
+cpm_mat <- cpm(dge[, samp$bam_id], normalized.lib.sizes = FALSE, log = FALSE)
+
+cat("CPM matrix:", nrow(cpm_mat), "isoforms x", ncol(cpm_mat), "samples\n")
+cat("CPM range:", round(min(cpm_mat), 2), "–", round(max(cpm_mat), 1), "\n")
+
+```
+
+# Per-Isoform Output Lost To NMD
+
+For each isoform $i$ in cell type $c$ and donor $d$:
+
+$$\Delta_{i,d} = \text{CPM}_{i,d}^{\text{Smg1i}} - \text{CPM}_{i,d}^{\text{DMSO}}$$
+
+$$\Delta_{i,d}^{+} = \max(\Delta_{i,d},\; 0)$$
+
+$$f_{i,d} = \begin{cases} \dfrac{\Delta_{i,d}^{+}}{\text{CPM}_{i,d}^{\text{Smg1i}}} & \text{if } \text{CPM}_{i,d}^{\text{Smg1i}} > 0 \\[6pt] 0 & \text{otherwise} \end{cases}$$
+
+$f_{i,d}$ is the fraction of isoform $i$'s transcriptional output lost to NMD
+in donor $d$.
+
+```{r compute-frac-lost}
+results_list <- list()
+
+for (ct_i in sort(unique(paired_donors$ct))) {
+  donors_i <- paired_donors %>% filter(ct == ct_i) %>% pull(donor_id)
+
+  for (d in donors_i) {
+    smg1i_id <- samp %>%
+      filter(ct == ct_i, donor_id == d, treatment == "Smg1i") %>% pull(bam_id)
+    dmso_id  <- samp %>%
+      filter(ct == ct_i, donor_id == d, treatment == "DMSO")  %>% pull(bam_id)
+
+    stopifnot(length(smg1i_id) == 1, length(dmso_id) == 1)
+
+    val_smg1i <- cpm_mat[, smg1i_id]
+    val_dmso  <- cpm_mat[, dmso_id]
+    delta     <- val_smg1i - val_dmso
+    delta_pos <- pmax(delta, 0)
+    frac_lost <- ifelse(val_smg1i > 0, delta_pos / val_smg1i, 0)
+
+    results_list[[paste(ct_i, d, sep = "_")]] <- data.frame(
+      txid      = rownames(cpm_mat),
+      ct        = ct_i,
+      donor_id  = d,
+      smg1i_val = val_smg1i,
+      dmso_val  = val_dmso,
+      delta     = delta,
+      delta_pos = delta_pos,
+      frac_lost = frac_lost,
+      stringsAsFactors = FALSE
+    )
+  }
+}
+
+results_all <- bind_rows(results_list)
+
+stopifnot("txid must be unique in iso_info" = !anyDuplicated(iso_info$txid))
+results_all <- results_all %>% left_join(iso_info, by = "txid")
+
+cat("Total rows (isoform x ct x donor):", nrow(results_all), "\n")
+```
+
+## Average Fraction Lost Across Donors
+
+$$\bar{f}_{i,c} = \frac{1}{|D_c|} \sum_{d \in D_c} f_{i,d}$$
+
+where $D_c$ is the set of matched donors for cell type $c$.
+
+```{r avg-frac-lost}
+avg_lost <- results_all %>%
+  group_by(ct, txid) %>%
+  summarise(mean_frac_lost = mean(frac_lost, na.rm = TRUE),
+            mean_delta_pos = mean(delta_pos, na.rm = TRUE),
+            mean_smg1i_val = mean(smg1i_val, na.rm = TRUE),
+            mean_dmso_val  = mean(dmso_val,  na.rm = TRUE),
+            n_donors       = n(),
+            gene_id        = first(gene_id),
+            hgnc_symbol    = first(hgnc_symbol),
+            .groups = "drop") %>%
+  filter(mean_frac_lost > 0)
+
+cat("Isoforms with positive mean loss to NMD per cell type:\n")
+avg_lost %>%
+  group_by(ct) %>%
+  summarise(n_isoforms = n(), .groups = "drop") %>%
+  print()
+
+```
+
+## Isoforms With Total Loss (100%)
+
+Isoforms with `mean_frac_lost == 1.0` are present only in Smg1i (DMSO == 0 in
+every matched donor) — entirely destroyed by NMD under normal conditions.
+
+```{r pct-total-loss}
+total_loss <- avg_lost %>%
+  mutate(pct_lost = 100 * mean_frac_lost) %>%
+  group_by(ct) %>%
+  summarise(n_total_loss   = sum(pct_lost == 100),
+            n_positive     = n(),
+            pct_total_loss = round(100 * n_total_loss / n_positive, 2),
+            .groups = "drop")
+
+print(total_loss)
+```
+
+## Global % Output Lost Per Cell Type
+
+$$\% \text{ Output Lost}_c = 100 \times \frac{\displaystyle\sum_{i=1}^{N}\sum_{d \in D_c} \Delta_{i,d}^{+}}{\displaystyle\sum_{i=1}^{N}\sum_{d \in D_c} \text{CPM}_{i,d}^{\text{Smg1i}}}$$
+
+```{r global-metric}
+global_metric <- results_all %>%
+  group_by(ct) %>%
+  summarise(sum_delta_pos   = sum(delta_pos),
+            total_smg1i     = sum(smg1i_val),
+            pct_output_lost = 100 * sum_delta_pos / total_smg1i,
+            n_isoform_donor = n(),
+            .groups = "drop") %>%
+  arrange(desc(pct_output_lost))
+
+print(global_metric)
+
+# ── Claim 3.1.3 — isoform-level percent output lost ────────────────────────────────────
+# THE UNIVERSE HERE IS THE UNFILTERED TRANSCRIPTOME, and that is the load-bearing fact about
+# both of §3.1's global metrics. cpm_mat is built from `dge` at :150, never from the filtered
+# DGEList: dge_filt IS loaded at :398 but is used only by the per-isoform boxplot below and is
+# explicitly rm()'d at :437, BEFORE the gene-level chunk. So the study's own 162,800-isoform
+# expressed set does not enter either metric, and two consecutive manuscript sentences about
+# "the isoform level" run over universes about four-fold apart.
+#
+# The direction of that is not neutral. delta_pos = pmax(delta, 0) at :187 is ONE-SIDED, so noise
+# in sub-threshold isoforms adds to the numerator and barely to the denominator, biasing the
+# percentage UP relative to the same computation on the filtered set.
+#
+# A "RANGE" HERE IS A MIN AND MAX OVER FOUR CELL TYPES, not an interval or an interval estimate:
+# the tibble has four rows. Each endpoint is emitted separately, with the cell type named.#
+# DONORS ARE POOLED, NOT AVERAGED: numerator and denominator are each summed over donors before
+# dividing, so a donor contributes in proportion to its library mass. And LAE's four donors
+# (010R, 017Q, 047N, 066Q) share NONE with the three behind AT2, FB and MV (001V, 027U, 029T),
+# which is a property of the sample set and not addressable (C64) -- so any range with LAE at one
+# end spans two disjoint donor sets.
+ISO_METRIC_POP <- paste("share of total Smg1i CPM mass lost to NMD, over the UNFILTERED isoform",
+                        "universe (every isoform in the DGEList, expressed or not, NMD susceptible",
+                        "or not); numerator and denominator each summed over the cell type's",
+                        "matched Smg1i/DMSO donor pairs, so donors are mass-weighted-pooled rather",
+                        "than averaged. NOT the study's filtered 162,800-isoform set, and NOT a",
+                        "per-isoform average")
+claim_emit("3.1.3", "isoform-level percent output lost, lowest cell type (%)",
+           min(global_metric$pct_output_lost), published = "14.4",
+           n = sum(global_metric$n_isoform_donor), population = ISO_METRIC_POP)
+claim_emit("3.1.3", "isoform-level percent output lost, highest cell type (%)",
+           max(global_metric$pct_output_lost), published = "18.2",
+           n = sum(global_metric$n_isoform_donor), population = ISO_METRIC_POP)
+for (.i in seq_len(nrow(global_metric))) {
+  claim_emit("3.1.3", sprintf("isoform-level percent output lost, %s (%%)", global_metric$ct[.i]),
+             global_metric$pct_output_lost[.i], n = global_metric$n_isoform_donor[.i],
+             population = ISO_METRIC_POP)
+}
+
+```
+
+```{r barplot-global, fig.width=10, fig.height=6}
+p_global <- ggplot(global_metric,
+                   aes(x = reorder(ct, pct_output_lost),
+                       y = pct_output_lost, fill = ct)) +
+  geom_col(alpha = 0.8) +
+  geom_text(aes(label = paste0(round(pct_output_lost, 2), "%")),
+            hjust = -0.1, size = 4) +
+  coord_flip() +
+  labs(
+    title    = "% Transcriptional Output Lost To NMD By Cell Type",
+    subtitle = "Isoform-level",
+    x        = "Cell Type",
+    y        = "% Output Lost To NMD"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none",
+        plot.title      = element_text(face = "bold"),
+        plot.subtitle   = element_text(color = "grey40")) +
+  expand_limits(y = max(global_metric$pct_output_lost) * 1.15)
+
+print(p_global)
+
+ggsave(file.path(OUTPUT_DIR, "pct_output_lost_barplot.png"),
+       p_global, width = 10, height = 6, dpi = 300, bg = "white")
+```
+
+## % Output Lost Vs Number Of NMD Susceptible Isoforms
+
+```{r scatter-output-vs-nisoforms, fig.width=8, fig.height=6}
+n_responsive <- avg_lost %>%
+  group_by(ct) %>%
+  summarise(n_nmd_isoforms = n(), .groups = "drop")
+
+scatter_df <- global_metric %>% left_join(n_responsive, by = "ct")
+
+fit       <- lm(pct_output_lost ~ n_nmd_isoforms, data = scatter_df)
+r2        <- summary(fit)$r.squared
+slope     <- coef(fit)[2]
+fit_label <- sprintf("slope = %.2e, R² = %.3f", slope, r2)
+
+p_scatter <- ggplot(scatter_df, aes(x = n_nmd_isoforms, y = pct_output_lost)) +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", color = "grey40") +
+  geom_point(aes(color = ct), size = 4) +
+  geom_text(aes(label = ct), vjust = -1, size = 4.5) +
+  annotate("text",
+           x     = min(scatter_df$n_nmd_isoforms),
+           y     = max(scatter_df$pct_output_lost) * 1.05,
+           label = fit_label, hjust = 0, size = 4, color = "grey30") +
+  labs(title = "% Output Lost Vs NMD Susceptible Isoforms",
+       x = "Number Of NMD Susceptible Isoforms",
+       y = "% Output Lost To NMD") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none",
+        plot.title      = element_text(face = "bold")) +
+  expand_limits(y = max(scatter_df$pct_output_lost) * 1.15,
+                x = max(scatter_df$n_nmd_isoforms) * 1.05)
+
+print(p_scatter)
+
+ggsave(file.path(OUTPUT_DIR, "output_lost_vs_n_isoforms_scatter.png"),
+       p_scatter, width = 8, height = 6, dpi = 300, bg = "white")
+
+```
+
+## % Output Lost Vs Significant Short-Read DGE Genes
+
+Cross-pipeline check: does long-read transcriptional output loss track with
+short-read gene-level NMD susceptible counts?
+
+```{r scatter-output-vs-sig-genes, fig.width=8, fig.height=6}
+sr_files <- list.files(SR_DGE_DIR, pattern = SR_PATTERN, full.names = TRUE)
+cat("SR files matching pattern:", length(sr_files), "\n"); print(basename(sr_files))
+
+# SR file pattern: nmd_mashr_dge_<ct>_<date>.csv -> sub() pulls <ct>
+n_sig_genes <- lapply(sr_files, function(f) {
+  ct_code <- sub("^nmd_mashr_dge_(.+)_2026.*", "\\1", basename(f))
+  ct_name <- CELLTYPE_MAP[ct_code]
+  if (is.na(ct_name) || !ct_name %in% CT_KEEP) return(NULL)
+
+  df    <- fread(f)
+  n_sig <- sum(df$adj.P.Val < SIGNIFICANCE_THRESHOLD & df$logFC > 0, na.rm = TRUE)
+  data.frame(ct = ct_name, n_sig_genes = n_sig)
+}) %>% bind_rows()
+
+stopifnot("No SR files mapped — check CELLTYPE_MAP vs filenames" = nrow(n_sig_genes) > 0)
+
+scatter_sr <- global_metric %>% left_join(n_sig_genes, by = "ct")
+
+fit_sr       <- lm(pct_output_lost ~ n_sig_genes, data = scatter_sr)
+r2_sr        <- summary(fit_sr)$r.squared
+slope_sr     <- coef(fit_sr)[2]
+fit_label_sr <- sprintf("slope = %.2e, R² = %.3f", slope_sr, r2_sr)
+
+p_scatter_sr <- ggplot(scatter_sr, aes(x = n_sig_genes, y = pct_output_lost)) +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", color = "grey40") +
+  geom_point(aes(color = ct), size = 4) +
+  geom_text(aes(label = ct), vjust = -1, size = 4.5) +
+  annotate("text",
+           x     = min(scatter_sr$n_sig_genes),
+           y     = max(scatter_sr$pct_output_lost) * 1.05,
+           label = fit_label_sr, hjust = 0, size = 4, color = "grey30") +
+  labs(title    = "% Output Lost Vs Significant Short-Read DGE Genes",
+       subtitle = "NMD susceptible genes: lfsr < 0.05 & logFC > 0",
+       x = "Number Of NMD Susceptible Genes (Short-Read)",
+       y = "% Output Lost To NMD") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none",
+        plot.title      = element_text(face = "bold"),
+        plot.subtitle   = element_text(color = "grey40")) +
+  expand_limits(y = max(scatter_sr$pct_output_lost) * 1.15,
+                x = max(scatter_sr$n_sig_genes) * 1.05)
+
+print(p_scatter_sr)
+
+ggsave(file.path(OUTPUT_DIR, "output_lost_vs_sig_sr_genes_scatter.png"),
+       p_scatter_sr, width = 8, height = 6, dpi = 300, bg = "white")
+```
+
+## Per-Isoform Fraction Lost (Filtered Isoforms)
+
+The filtered DGEList drops lowly-expressed isoforms. We use it here to keep
+the per-isoform distribution comparable to what limma-voom actually tested.
+
+```{r boxplot-isoform, fig.width=10, fig.height=6}
+dge_filt      <- readRDS(DGELIST_FILT_PATH)
+filt_isoforms <- rownames(dge_filt$counts)
+cat("Filtered isoform set:", length(filt_isoforms), "\n")
+
+plot_data <- results_all %>%
+  filter(frac_lost > 0, txid %in% filt_isoforms)
+
+cat("Isoform-donor rows after filtering:", nrow(plot_data), "\n")
+
+p_isoform_dist <- ggplot(plot_data, aes(x = ct, y = frac_lost, fill = ct)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.3, outlier.alpha = 0.3) +
+  labs(title    = "Per-Isoform Fraction Lost To NMD",
+       subtitle = "(Smg1i − DMSO) / Smg1i CPM, positive deltas, filtered isoforms",
+       x = "Cell Type", y = "Fraction Lost To NMD") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none",
+        plot.title      = element_text(face = "bold"),
+        plot.subtitle   = element_text(color = "grey40"))
+
+print(p_isoform_dist)
+
+ggsave(file.path(OUTPUT_DIR, "isoform_frac_lost_boxplot.png"),
+       p_isoform_dist, width = 10, height = 6, dpi = 300, bg = "white")
+
+boxplot_stats <- plot_data %>%
+  group_by(ct) %>%
+  summarise(n      = n(),
+            min    = round(min(frac_lost), 4),
+            Q1     = round(quantile(frac_lost, 0.25), 4),
+            median = round(median(frac_lost),         4),
+            mean   = round(mean(frac_lost),           4),
+            Q3     = round(quantile(frac_lost, 0.75), 4),
+            max    = round(max(frac_lost), 4),
+            sd     = round(sd(frac_lost),  4),
+            IQR    = round(IQR(frac_lost), 4),
+            .groups = "drop")
+
+# ── Claim 3.1.4 — the per-isoform distribution, and the half that does not hold ─────────
+# THIS is the chunk that uses the study's FILTERED universe -- plot_data is built from dge_filt,
+# unlike the two global metrics above, which is why 3.1.4 and 3.1.3 are not comparable despite
+# sitting in the same paragraph. It is also a DIFFERENT DENOMINATOR: each isoform's own Smg1i CPM,
+# not the library's total mass.
+#
+# THE PUBLISHED "IQR 30-100%" DOES NOT HOLD FOR MV, whose Q1 is 25.7 and Q3 96.2, against
+# AT2 31.4-100.0, FB 30.2-100.0 and LAE 31.6-100.0. So the stated interval understates the MV
+# spread at BOTH ends. The median half does reproduce. Q1 and Q3 are therefore emitted per cell
+# type as well as the min/max, because a single published interval over four cell types cannot be
+# checked from summary endpoints alone -- which is how the MV exception survived.
+BOX_POP <- paste("NMD susceptible isoforms in the study's FILTERED expressed universe -- not the",
+                 "unfiltered transcriptome the two global metrics above use -- with each isoform's",
+                 "percent lost taken against ITS OWN Smg1i CPM rather than against total library",
+                 "mass; one value per isoform, summarised within cell type")
+claim_emit("3.1.4", "per-isoform percent lost, lowest cell-type median (%)",
+           100 * min(boxplot_stats$median), published = "60",
+           n = sum(boxplot_stats$n), population = BOX_POP)
+claim_emit("3.1.4", "per-isoform percent lost, highest cell-type median (%)",
+           100 * max(boxplot_stats$median), published = "67",
+           n = sum(boxplot_stats$n), population = BOX_POP)
+for (.i in seq_len(nrow(boxplot_stats))) {
+  .ct <- boxplot_stats$ct[.i]
+  claim_emit("3.1.4", sprintf("per-isoform percent lost, %s median (%%)", .ct),
+             100 * boxplot_stats$median[.i], n = boxplot_stats$n[.i], population = BOX_POP)
+  claim_emit("3.1.4", sprintf("per-isoform percent lost, %s Q1 (%%)", .ct),
+             100 * boxplot_stats$Q1[.i], n = boxplot_stats$n[.i], population = BOX_POP)
+  claim_emit("3.1.4", sprintf("per-isoform percent lost, %s Q3 (%%)", .ct),
+             100 * boxplot_stats$Q3[.i], n = boxplot_stats$n[.i], population = BOX_POP)
+}
+
+print(boxplot_stats)
+
+rm(dge_filt)
+
+```
+
+## Top 10 Isoforms By Mean % Lost
+
+```{r top10}
+top10_per_ct <- avg_lost %>%
+  group_by(ct) %>%
+  arrange(desc(mean_frac_lost), desc(mean_delta_pos)) %>%
+  slice_head(n = 10) %>%
+  mutate(pct_lost       = round(100 * mean_frac_lost, 2),
+         mean_smg1i_val = round(mean_smg1i_val, 1),
+         mean_dmso_val  = round(mean_dmso_val,  1),
+         mean_delta_pos = round(mean_delta_pos, 1)) %>%
+  select(ct, txid, hgnc_symbol, gene_id, pct_lost, mean_delta_pos,
+         mean_smg1i_val, mean_dmso_val, n_donors)
+
+for (ct_i in sort(unique(top10_per_ct$ct))) {
+  cat("\n--- ", ct_i, " ---\n")
+  print(top10_per_ct %>% filter(ct == ct_i), n = 10)
+}
+```
+
+## Bottom 10 Isoforms By Mean % Lost
+
+Smallest positive fractional loss — barely affected by NMD.
+
+```{r bottom10}
+bottom10_per_ct <- avg_lost %>%
+  group_by(ct) %>%
+  arrange(mean_frac_lost, mean_delta_pos) %>%
+  slice_head(n = 10) %>%
+  mutate(pct_lost       = round(100 * mean_frac_lost, 2),
+         mean_smg1i_val = round(mean_smg1i_val, 1),
+         mean_dmso_val  = round(mean_dmso_val,  1),
+         mean_delta_pos = round(mean_delta_pos, 1)) %>%
+  select(ct, txid, hgnc_symbol, gene_id, pct_lost, mean_delta_pos,
+         mean_smg1i_val, mean_dmso_val, n_donors)
+
+for (ct_i in sort(unique(bottom10_per_ct$ct))) {
+  cat("\n--- ", ct_i, " ---\n")
+  print(bottom10_per_ct %>% filter(ct == ct_i), n = 10)
+}
+
+```
+
+# Gene-Level Output Lost To NMD
+
+Isoform CPMs are summed within gene before the same delta calculation:
+
+$$\Delta_{g,d}^{+} = \max\!\left(\text{CPM}_{g,d}^{\text{Smg1i}} - \text{CPM}_{g,d}^{\text{DMSO}},\; 0\right)$$
+
+$$\% \text{ Output Lost}_c = 100 \times \frac{\displaystyle\sum_{g=1}^{G}\sum_{d \in D_c} \Delta_{g,d}^{+}}{\displaystyle\sum_{g=1}^{G}\sum_{d \in D_c} \text{CPM}_{g,d}^{\text{Smg1i}}}$$
+
+```{r gene-level-output}
+iso_to_gene <- iso_info %>%
+  select(txid, gene_id, hgnc_symbol) %>%
+  filter(!is.na(gene_id) & gene_id != "")
+
+# Subset CPM matrix to isoforms with gene annotation
+keep_iso <- intersect(rownames(cpm_mat), iso_to_gene$txid)
+cpm_gene <- cpm_mat[keep_iso, samp$bam_id]
+
+# Aggregate isoforms -> genes (rowsum groups by the second arg; alignment is critical)
+gene_ids <- iso_to_gene$gene_id[match(keep_iso, iso_to_gene$txid)]
+stopifnot(length(gene_ids) == nrow(cpm_gene))
+stopifnot(!any(is.na(gene_ids)))
+
+cpm_gene_agg <- rowsum(cpm_gene, group = gene_ids)
+cat("Gene-level CPM matrix:", nrow(cpm_gene_agg), "genes x", ncol(cpm_gene_agg), "samples\n")
+
+# One row per gene
+gene_anno <- iso_to_gene %>%
+  group_by(gene_id) %>%
+  summarise(hgnc_symbol = first(hgnc_symbol),
+            n_isoforms  = n(),
+            .groups = "drop")
+
+gene_results_list <- list()
+
+for (ct_i in sort(unique(paired_donors$ct))) {
+  donors_i <- paired_donors %>% filter(ct == ct_i) %>% pull(donor_id)
+
+  for (d in donors_i) {
+    smg1i_id <- samp %>%
+      filter(ct == ct_i, donor_id == d, treatment == "Smg1i") %>% pull(bam_id)
+    dmso_id  <- samp %>%
+      filter(ct == ct_i, donor_id == d, treatment == "DMSO")  %>% pull(bam_id)
+
+    stopifnot(length(smg1i_id) == 1, length(dmso_id) == 1)
+
+    val_smg1i <- cpm_gene_agg[, smg1i_id]
+    val_dmso  <- cpm_gene_agg[, dmso_id]
+    delta     <- val_smg1i - val_dmso
+    delta_pos <- pmax(delta, 0)
+    frac_lost <- ifelse(val_smg1i > 0, delta_pos / val_smg1i, 0)
+
+    gene_results_list[[paste(ct_i, d, sep = "_")]] <- data.frame(
+      gene_id   = rownames(cpm_gene_agg),
+      ct        = ct_i,
+      donor_id  = d,
+      smg1i_val = val_smg1i,
+      dmso_val  = val_dmso,
+      delta     = delta,
+      delta_pos = delta_pos,
+      frac_lost = frac_lost,
+      stringsAsFactors = FALSE
+    )
+  }
+}
+
+gene_results_all <- bind_rows(gene_results_list) %>%
+  left_join(gene_anno, by = "gene_id")
+
+cat("Total rows (gene x ct x donor):", nrow(gene_results_all), "\n")
+```
+
+## Global Gene-Level Metric
+
+```{r gene-level-global-metric}
+gene_global_metric <- gene_results_all %>%
+  group_by(ct) %>%
+  summarise(sum_delta_pos   = sum(delta_pos),
+            total_smg1i     = sum(smg1i_val),
+            pct_output_lost = 100 * sum_delta_pos / total_smg1i,
+            n_gene_donor    = n(),
+            .groups = "drop") %>%
+  arrange(desc(pct_output_lost))
+
+print(gene_global_metric)
+
+# ── Claim 3.1.2 — gene-level percent output lost ───────────────────────────────────────
+# Same construction as the isoform metric above and the SAME unfiltered universe: gene_results_all
+# aggregates the unfiltered isoform CPM matrix by gene_id, restricted only by dropping missing or
+# empty gene ids. "At the gene level" does not signal that.
+#
+# NOTE FOR THE RANGE: unlike 3.1.3, BOTH endpoints of this one (AT2 and MV) come from the same
+# three donors, so it is the one §3 range not spanning disjoint donor sets. Worth knowing when the
+# two sentences are read side by side.
+GENE_METRIC_POP <- paste("share of total Smg1i CPM mass lost to NMD, aggregated to GENE level from",
+                         "the UNFILTERED isoform universe (isoforms with a missing or empty gene id",
+                         "dropped, which removes negligible mass); numerator and denominator each",
+                         "summed over the cell type's matched donor pairs, so donors are",
+                         "mass-weighted-pooled. NOT a per-gene average")
+claim_emit("3.1.2", "gene-level percent output lost, lowest cell type (%)",
+           min(gene_global_metric$pct_output_lost), published = "11.1",
+           n = sum(gene_global_metric$n_gene_donor), population = GENE_METRIC_POP)
+claim_emit("3.1.2", "gene-level percent output lost, highest cell type (%)",
+           max(gene_global_metric$pct_output_lost), published = "12.5",
+           n = sum(gene_global_metric$n_gene_donor), population = GENE_METRIC_POP)
+for (.i in seq_len(nrow(gene_global_metric))) {
+  claim_emit("3.1.2", sprintf("gene-level percent output lost, %s (%%)",
+                              gene_global_metric$ct[.i]),
+             gene_global_metric$pct_output_lost[.i], n = gene_global_metric$n_gene_donor[.i],
+             population = GENE_METRIC_POP)
+}
+
+# Isoform-level vs gene-level side-by-side
+compare_level <- global_metric %>%
+  select(ct, pct_isoform = pct_output_lost) %>%
+  left_join(gene_global_metric %>% select(ct, pct_gene = pct_output_lost),
+            by = "ct") %>%
+  mutate(diff_pct = pct_isoform - pct_gene,
+         ratio    = pct_isoform / pct_gene)
+
+cat("\nIsoform-level vs Gene-level:\n")
+print(compare_level)
+
+```
+
+```{r gene-level-barplot, fig.width=10, fig.height=6}
+p_gene_global <- ggplot(gene_global_metric,
+                        aes(x = reorder(ct, pct_output_lost),
+                            y = pct_output_lost, fill = ct)) +
+  geom_col(alpha = 0.8) +
+  geom_text(aes(label = paste0(round(pct_output_lost, 2), "%")),
+            hjust = -0.1, size = 4) +
+  coord_flip() +
+  labs(title    = "% Transcriptional Output Lost To NMD By Cell Type",
+       subtitle = "Gene-level",
+       x = "Cell Type",
+       y = "% Output Lost To NMD") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none",
+        plot.title      = element_text(face = "bold"),
+        plot.subtitle   = element_text(color = "grey40")) +
+  expand_limits(y = max(gene_global_metric$pct_output_lost) * 1.15)
+
+print(p_gene_global)
+
+ggsave(file.path(OUTPUT_DIR, "pct_output_lost_gene_level_barplot.png"),
+       p_gene_global, width = 10, height = 6, dpi = 300, bg = "white")
+```
+
+## Genes With Positive Mean Loss
+
+```{r gene-level-avg-lost}
+gene_avg_lost <- gene_results_all %>%
+  group_by(ct, gene_id) %>%
+  summarise(mean_frac_lost = mean(frac_lost, na.rm = TRUE),
+            mean_delta_pos = mean(delta_pos, na.rm = TRUE),
+            mean_smg1i_val = mean(smg1i_val, na.rm = TRUE),
+            mean_dmso_val  = mean(dmso_val,  na.rm = TRUE),
+            n_donors       = n(),
+            hgnc_symbol    = first(hgnc_symbol),
+            .groups = "drop") %>%
+  filter(mean_frac_lost > 0)
+
+gene_avg_lost %>%
+  group_by(ct) %>%
+  summarise(n_genes = n(), .groups = "drop") %>%
+  print()
+
+```
+
+## Top 100 Genes By Output Lost
+
+```{r top100-gene-table}
+top100_genes <- gene_avg_lost %>%
+  group_by(ct) %>%
+  arrange(desc(mean_delta_pos)) %>%
+  slice_head(n = 100) %>%
+  mutate(pct_lost       = round(100 * mean_frac_lost, 2),
+         mean_smg1i_val = round(mean_smg1i_val, 2),
+         mean_dmso_val  = round(mean_dmso_val,  2),
+         mean_delta_pos = round(mean_delta_pos, 2)) %>%
+  select(ct, gene_id, hgnc_symbol, pct_lost, mean_delta_pos,
+         mean_smg1i_val, mean_dmso_val, n_donors) %>%
+  ungroup()
+
+datatable(
+  top100_genes,
+  filter  = "top",
+  options = list(pageLength = 20, scrollX = TRUE, scrollY = "500px"),
+  caption = "Top 100 Genes By Mean CPM Lost To NMD Per Cell Type"
+) %>%
+  formatRound(columns = c("pct_lost", "mean_delta_pos",
+                          "mean_smg1i_val", "mean_dmso_val"),
+              digits = 2)
+```
+
+# Shared Vs Cell-Type-Specific Genes
+
+How many genes lose output in only one cell type vs across multiple?
+
+```{r shared-vs-unique-all-genes, fig.width=10, fig.height=6}
+all_gene_cts_full <- gene_avg_lost %>%
+  select(gene_id, ct) %>%
+  distinct()
+
+gene_n_cts_full <- all_gene_cts_full %>%
+  group_by(gene_id) %>%
+  summarise(n_cell_types = n(), .groups = "drop")
+
+all_gene_cts_full <- all_gene_cts_full %>%
+  left_join(gene_n_cts_full, by = "gene_id") %>%
+  mutate(category = ifelse(n_cell_types == 1,
+                           "Cell-Type-Specific",
+                           "Shared (2+ cell types)"))
+
+n_ct <- length(CT_KEEP)
+
+sharing_summary_full <- all_gene_cts_full %>%
+  group_by(ct, category) %>%
+  summarise(n_genes = n(), .groups = "drop")
+
+sharing_detail_full <- all_gene_cts_full %>%
+  mutate(sharing_bin = case_when(
+    n_cell_types == 1     ~ "1 (unique)",
+    n_cell_types == n_ct  ~ paste0(n_ct, " (all)"),
+    TRUE                  ~ as.character(n_cell_types)
+  )) %>%
+  group_by(ct, sharing_bin) %>%
+  summarise(n_genes = n(), .groups = "drop")
+
+cat("Total unique genes across all cell types:",
+    n_distinct(all_gene_cts_full$gene_id), "\n\n")
+
+gene_n_cts_full %>%
+  group_by(n_cell_types) %>%
+  summarise(n_genes = n(), .groups = "drop") %>%
+  mutate(label = case_when(
+    n_cell_types == 1    ~ "unique to 1 CT",
+    n_cell_types == n_ct ~ paste0("shared across all ", n_ct, " CTs"),
+    TRUE                 ~ paste0("shared across ", n_cell_types, " CTs")
+  )) %>%
+  print()
+
+p_sharing_full <- ggplot(sharing_summary_full,
+                         aes(x = ct, y = n_genes, fill = category)) +
+  geom_col(alpha = 0.8) +
+  geom_text(aes(label = n_genes), position = position_stack(vjust = 0.5), size = 4) +
+  scale_fill_manual(values = c("Cell-Type-Specific"     = "#E69F00",
+                               "Shared (2+ cell types)" = "#56B4E9")) +
+  labs(title = "Genes With Output Lost: Shared Vs Cell-Type-Specific",
+       x = "Cell Type", y = "Number Of Genes", fill = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title      = element_text(face = "bold"),
+        legend.position = "top")
+
+print(p_sharing_full)
+
+ggsave(file.path(OUTPUT_DIR, "all_genes_output_lost_shared_vs_unique.png"),
+       p_sharing_full, width = 10, height = 6, dpi = 300, bg = "white")
+
+p_detail_full <- ggplot(sharing_detail_full,
+                        aes(x = ct, y = n_genes, fill = sharing_bin)) +
+  geom_col(alpha = 0.8) +
+  geom_text(aes(label = n_genes), position = position_stack(vjust = 0.5), size = 3.5) +
+  scale_fill_brewer(palette = "YlGnBu") +
+  labs(title = "Genes With Output Lost: Sharing Across Cell Types",
+       x = "Cell Type", y = "Number Of Genes", fill = "# Cell Types") +
+  theme_minimal(base_size = 14) +
+  theme(plot.title      = element_text(face = "bold"),
+        legend.position = "top")
+
+print(p_detail_full)
+
+ggsave(file.path(OUTPUT_DIR, "all_genes_output_lost_sharing_detail.png"),
+       p_detail_full, width = 10, height = 6, dpi = 300, bg = "white")
+
+```
+
+# Save Results
+
+```{r save-results}
+# Isoform-level
+fwrite(results_all,     file.path(OUTPUT_DIR, "transcriptional_output_all_donors_cpm.csv"))
+fwrite(avg_lost,        file.path(OUTPUT_DIR, "transcriptional_output_avg_by_ct_cpm.csv"))
+fwrite(global_metric,   file.path(OUTPUT_DIR, "pct_output_lost_by_ct_cpm.csv"))
+fwrite(top10_per_ct,    file.path(OUTPUT_DIR, "top10_isoforms_lost_per_ct.csv"))
+fwrite(bottom10_per_ct, file.path(OUTPUT_DIR, "bottom10_isoforms_lost_per_ct.csv"))
+fwrite(boxplot_stats,   file.path(OUTPUT_DIR, "boxplot_summary_stats.csv"))
+fwrite(total_loss,      file.path(OUTPUT_DIR, "pct_isoforms_total_loss.csv"))
+
+# Gene-level
+fwrite(gene_results_all,    file.path(OUTPUT_DIR, "transcriptional_output_gene_level_all_donors.csv"))
+fwrite(gene_avg_lost,       file.path(OUTPUT_DIR, "transcriptional_output_gene_level_avg_by_ct.csv"))
+fwrite(gene_global_metric,  file.path(OUTPUT_DIR, "pct_output_lost_gene_level_by_ct.csv"))
+fwrite(compare_level,       file.path(OUTPUT_DIR, "isoform_vs_gene_level_comparison.csv"))
+fwrite(top100_genes,        file.path(OUTPUT_DIR, "top100_genes_output_lost_per_ct.csv"))
+
+# Top 500 per cell type — saved as a separate "all genes" reference table
+all_genes_table <- gene_avg_lost %>%
+  group_by(ct) %>%
+  arrange(desc(mean_delta_pos)) %>%
+  slice_head(n = 500) %>%
+  ungroup() %>%
+  mutate(pct_lost       = round(100 * mean_frac_lost, 2),
+         mean_smg1i_val = round(mean_smg1i_val, 2),
+         mean_dmso_val  = round(mean_dmso_val,  2),
+         mean_delta_pos = round(mean_delta_pos, 2)) %>%
+  select(ct, gene_id, hgnc_symbol, pct_lost, mean_delta_pos,
+         mean_smg1i_val, mean_dmso_val, n_donors)
+
+fwrite(all_genes_table, file.path(OUTPUT_DIR, "all_genes_output_lost_per_ct.csv"))
+
+cat("All outputs saved to:", OUTPUT_DIR, "\n")
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
