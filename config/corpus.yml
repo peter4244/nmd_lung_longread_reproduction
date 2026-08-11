@@ -1,0 +1,194 @@
+# The code corpus, declared as data.
+#
+# WHY THIS IS A FILE AND NOT A LIST IN extract.py: P16. Map data inside the map builder
+# means a data error and a logic error are the same diff, and the corpus cannot be checked
+# without running the builder. The existing SOURCES/PRODUCED_BY tables inside
+# build_lineage.py are the anti-pattern this avoids.
+#
+# P13: every tree is declared with its excludes, and extract.py PRINTS what each glob
+# matched and what each exclude removed. A corpus that silently shrinks turns "no producer
+# found" into a false finding.
+
+# ---------------------------------------------------------------------------------------
+# Node layers. Only `pipeline` and `report` are code nodes in the dependency graph.
+#
+#   report   — terminal code layer; manuscript claims attach here
+#   pipeline — reads data, writes data; alternates with intermediates
+#   style    — renders content the reports already computed. Ships in the fresh repo,
+#              carries no claim path. Its content MUST match its source report (runbook
+#              rule 5) — that is a check, not an assumption; Figure 1A's 0.881-vs-0.90 is
+#              what happens when it is assumed.
+#   verification — checks published claims against the rebuild. READS source data, so it MUST
+#              be enumerable, but carries no claim path: a claim is never attributed to a
+#              verify_* script. Declared 2026-07-27 (W49) because it was in no tree at all,
+#              which made the extractor blind to 31 code files and let a "no other consumer"
+#              sweep miss three real ones. An exclusion nobody declared is the worst kind.
+#   library  — an R package the other code calls. Declared dependency, never a node.
+#   upstream — produces the deposit's source files. G1 terminates at its outputs, so it
+#              contributes no edges. Ships under code availability only.
+# ---------------------------------------------------------------------------------------
+
+trees:
+
+  G1:
+    description: >
+      The legacy code as it actually is, Channing paths and all. This is the tree the
+      published numbers came from, and step 1 maps it without transforming it (P3).
+    roots:
+      - id: analysis_repo
+        path: ~/claude_projects/nmd
+        github: peter4244/nmd_isopair_analysis
+        include:
+          - code/upstream/**/*.Rmd
+          - code/upstream/**/*.R
+          - code/*.Rmd
+          - code/*.R
+          - code/nmd_predictor_comparison/**/*.{R,Rmd,py}
+          - results/isoform_transitions/Version_6.0/isopair_wrapper/**/*.{R,Rmd}
+          - results/isoform_transitions/Version_6.0/scripts/core/**/*.R
+          - results/isoform_transitions/Version_6.0/scripts/nmd/**/*.R
+        style:
+          # Figure generation. Included in the census and the packing list, excluded from
+          # claim paths.
+          - figures/**/*.py
+          - figures/**/*.R
+          - code/upstream/Figures/**/*.Rmd
+
+      - id: model_repo
+        path: ~/claude_projects/NMD_orf_model_v5_4ct
+        github: peter4244/NMD_orf_model_v5_4ct
+        commit: 35924ad          # v2.0.0, the version of record. NOT re-pinned (W57):
+                                   # G1 records what produced the PUBLISHED numbers, so moving
+                                   # this pin would rewrite history. G2's copy IS re-pinned.
+        include:
+          - "*.py"
+          - "*.R"
+          - "*.Rmd"
+          - scripts/**/*.py
+
+  DEPOSIT:
+    description: >
+      The deposit builders — the documented join between what the legacy code reads and
+      what the deposit ships. Not analysis code and never on a claim path, but extracting
+      them yields the `deposited_as` alias map mechanically: each builder's reads are the
+      legacy names, its writes are the deposited names. Hand-typing that map is how you
+      get an alias table that drifts from the deposit it describes.
+    roots:
+      - id: deposit_builders
+        path: ~/claude_projects/nmd/deposit
+        include:
+          - "*.R"
+
+  G2:
+    description: >
+      The partially converted tree. Extracted, never hand-built: it is the product of
+      step 2 repointing G1, so its map follows from re-running extract on it.
+
+      SCOPE, settled 2026-07-26: the fresh repo is `analysis/` + `figures/` + the model
+      repo, with Isopair and Isocall as pinned libraries. G2 previously declared only
+      `analysis/`, so all twelve §5 claims were untraced for want of a tree to walk and the
+      figure producers resolved to nothing. Mirrors G1's shape deliberately -- two graphs
+      that disagree about what code EXISTS cannot be compared (S10).
+    roots:
+      - id: fresh
+        path: .
+        include:
+          - analysis/**/*.{R,Rmd,py}
+          # THE CONFIG BOOTSTRAP IS PART OF THE TREE (W68, 2026-07-27). R/load_config.R is the
+          # most-sourced file in the repo -- 94 call-sites -- and every path-converted script
+          # begins by sourcing it. It sat outside `analysis/**`, so it could never appear in
+          # `necessary`, and a keep-list built from that would produce a tree where no path
+          # resolves. python/nmd_paths.py is its Python counterpart. Neither reads data; they
+          # terminate immediately and only ever enter via the packing list.
+          - R/*.R
+          - python/*.py
+        style:
+          # Renders what the reports already computed. In the census and the packing list,
+          # off the claim paths -- the same treatment G1 gives them, and what the 2026-07-26
+          # finding settled: `05_final_report_mashr.Rmd::compute_event_freq` reproduces
+          # Figure 3 Panel C exactly, so the figure adds conventions, not numbers.
+          - figures/**/*.py
+          - figures/**/*.R
+          - figures/**/*.Rmd
+        verification:
+          # Off the claim paths, but they read the deposit and must therefore be findable.
+          - verification/**/*.R
+          - verification/**/*.py
+          - verification/**/*.sh
+
+      # PINNED LIBRARY, added 2026-07-27 (W63, Pete's ruling). 4.1.1 asserts a property of the
+      # Isopair LIBRARY -- that it detects 12 splicing event types -- and its producers are
+      # Isopair's own R/event-detection.R and README. It was the last untraced claim besides
+      # 5.2.1, not because anything is missing but because the library was cited by DOI and
+      # never declared as a tree a producer could resolve in. A replicator installs Isopair
+      # v1.0.0 and reads those 12 event types, so the library IS the terminus, and recording it
+      # that way is truer than waiving the claim out as EXTERNAL.
+      - id: isopair_lib
+        path: ~/claude_projects/Isopair
+        commit: ea33f74          # v1.0.0, 10.5281/zenodo.21536494 (re-checked 2026-07-28, W57)
+        include:
+          - R/*.R
+
+      - id: model_repo
+        path: ~/claude_projects/NMD_orf_model_v5_4ct
+        github: peter4244/NMD_orf_model_v5_4ct
+        commit: ff3a0bf          # RE-PINNED 2026-07-28 (W57): what the rerun projects.
+                                   # G1 keeps 35924ad -- it records what produced the PUBLISHED
+                                   # numbers, and moving that pin would rewrite history. This pin
+                                   # is G2's: the tree a reader is asked to rebuild from, which
+                                   # includes the determinism hardening, the deposit-native
+                                   # retrain and every --results-dir fix.
+        include:
+          - "*.py"
+          - "*.R"
+          - "*.Rmd"
+          - scripts/**/*.py
+        # RETIRED FROM G2 2026-07-27 (W60), and KEPT IN G1. relabel_tx_summary_4ct.R produced
+        # the published labels, so G1 must carry it or the record of how the paper was made is
+        # gone (P3). It is not needed to rebuild from the deposit: export_rds.R writes
+        # results_4ct/tx_summary.tsv directly from the scan, and the relabel re-reads a copy of
+        # that same output -- two writers, one artifact (S4). Verified inert on the
+        # deposit-native scaffold by verification/phaseC/relabel_is_noop.py (0 dropped, 0
+        # disagreements over 42,043 isoforms) and invoked by no slurm wrapper
+        # (superseded/step4_findings.md:106). This is S10's normal case, not a discrepancy.
+        exclude:
+          - "relabel_tx_summary_4ct.R"   # root-relative glob; no leading slash, which tools/lint_paths.sh reads as an absolute path
+
+# Excluded everywhere. Each pattern is reported with its hit count so the exclusion is
+# itself a measurement (P13).
+exclude:
+  - "**/archive/**"
+  - "**/archive_v3.0_junction_based/**"
+  - "**/superseded/**"
+  - "**/deprecated/**"
+  - "**/*.channing-backup/**"
+  - "**/node_modules/**"
+  - "**/old/**"
+  - "**/dev/**"
+  - "**/tests/**"
+  - "**/*_cache/**"
+  - "**/*_files/**"
+  - "**/.Rproj.user/**"
+
+# Not nodes. Called by the code above; shipped and version-pinned, never traversed.
+libraries:
+  - id: Isopair
+    path: ~/claude_projects/Isopair
+    github: peter4244/Isopair
+    zenodo: 10.5281/zenodo.21536494
+    calls: library(Isopair)
+  - id: Isocall_v1
+    path: ~/claude_projects/nmd/isocall_pipeline
+    github: peter4244/Isocall_v1
+    zenodo: 10.5281/zenodo.21536485
+    note: >
+      Nextflow pipeline, upstream of the deposit — it produces the SQANTI inputs that are
+      deposited as source. Cited under code availability; contributes no edges.
+
+# Produce the deposit's source files. G1 terminates at their outputs.
+upstream:
+  - id: sqanti3_by_chromosome
+    note: >
+      Outputs are deposit source files (source_data/sqanti/, 4 files). NOT named in
+      paper/code_availability.md, which lists four repos; plan §4 calls it the fifth.
+      One of the two is wrong — open for Pete.

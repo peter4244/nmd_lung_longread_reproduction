@@ -1,0 +1,998 @@
+---
+title: "DE by Cell Type Under DMSO"
+subtitle: "Identifying cell-type-specific isoforms and genes at baseline (no Smg1i)"
+author: "Leshem, Yul"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+    df_print: paged
+    theme: flatly
+---
+Code location: `/udd/reyle/nmd_lungcells_2026/code/final/ct_de.Rmd`
+
+```{r setup, include=FALSE}
+.nmd_root <- local({ d <- getwd(); while (!file.exists(file.path(d, "config", "paths.yml"))) {
+  p <- dirname(d); if (identical(p, d)) stop("repo root not found"); d <- p }; d })
+source(file.path(.nmd_root, "R", "load_config.R")); .P <- nmd_paths(.nmd_root)
+source(file.path(.nmd_root, "R", "claim_emit.R"))  # Phase 2 claim-value emission
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 5)
+options(bitmapType = "cairo")
+```
+
+# Overview
+
+This analysis identifies isoforms and genes whose **baseline (DMSO) expression is cell-type-specific** — i.e., that distinguish AT2, LAE, FB, MV from each other independent of NMD inhibition.
+
+**Contrast structure:** one-vs-rest per cell type (CT_X vs mean of the other three) → defines CT-marker features.
+
+**Primary level: long-read isoform (LR DIE).** Secondary level: short-read gene (SR DGE), which is also used for topGO overrepresentation.
+
+**Adaptive shrinkage:** after the per-CT limma contrasts, we run `mashr` jointly across all four one-vs-rest effects to (a) borrow strength across CTs, (b) get `lfsr`-based significance that respects the joint structure, and (c) enable sharing analysis (how many markers are CT-specific vs broadly distinctive).
+
+**Prerequisite packages:** `mashr` and `ashr` must be installed *before* knitting
+(`install.packages("ashr"); BiocManager::install("mashr")`). This document does not
+install packages at render time.
+
+DMSO samples only.
+
+# Configuration
+
+```{r config}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(patchwork)
+  library(edgeR)
+  library(limma)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(reshape2)
+})
+
+# Paths
+LR_ISO_PATH  <- file.path(.P$OUT, "dge_isoform_longread_filtered_2026.3.3.rds")
+SR_GENE_PATH <- file.path(.P$OUT, "dge_shortread_gene_filtered_2026.3.2.rds")
+OUT_DIR      <- file.path(.P$OUT, "de_by_celltype_dmso")
+MASH_DIR     <- file.path(OUT_DIR, "mashr")
+FIG_DIR      <- file.path(OUT_DIR, "figures")   # keep figures with this analysis (was BASE/figure)
+dir.create(OUT_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(MASH_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(FIG_DIR,  recursive = TRUE, showWarnings = FALSE)
+
+stopifnot(file.exists(LR_ISO_PATH))
+stopifnot(file.exists(SR_GENE_PATH))
+
+# Cell types kept, in display naming (AT2 = old AT, LAE = old DD)
+CT_KEEP <- c("AT2", "LAE", "FB", "MV")
+
+# Relabel helper: map the DGEList's internal ct codes to display names.
+relabel_ct <- function(samples_df) {
+  samples_df$ct <- as.character(samples_df$ct)
+  samples_df$ct[samples_df$ct == "AT"] <- "AT2"
+  samples_df$ct[samples_df$ct == "DD"] <- "LAE"
+  samples_df
+}
+
+# Significance thresholds
+LFSR_CUT      <- 0.05    # for mashr-shrunk results
+PADJ_CUT      <- 0.05    # for limma BH-adjusted results
+LOGFC_MARKER  <- 1       # |logFC| > 1 (~2-fold) for CT-marker classification
+
+DATE_STAMP <- format(Sys.Date(), "%Y.%m.%d")
+```
+
+# Load Data
+
+We load both the long-read isoform DGEList and the short-read gene DGEList that were used in the main DGE/DIE pipelines, subset to DMSO samples and the four kept cell types.
+
+```{r donor_helper}
+# DGELists in this project use different donor column names:
+#   LR isoform DGEList: $samples$id
+#   SR gene DGEList:    $samples$sample_id
+# Pick whichever exists.
+get_donor <- function(samples_df) {
+  candidates <- c("id", "sample_id", "donor", "donor_id")
+  hit <- candidates[candidates %in% colnames(samples_df)][1]
+  if (is.na(hit)) stop("No donor column found in samples. Available: ",
+                        paste(colnames(samples_df), collapse = ", "))
+  samples_df[[hit]]
+}
+```
+
+```{r load_lr_isoform}
+# Long-read isoform DGEList (filtered, same object as DIE pipeline input)
+y_iso <- readRDS(LR_ISO_PATH)
+
+# Relabel ct to display names AFTER loading (AT -> AT2, DD -> LAE)
+y_iso$samples <- relabel_ct(y_iso$samples)
+
+# Subset to DMSO samples and four kept CTs
+keep_iso <- y_iso$samples$treatment == "DMSO" &
+            y_iso$samples$ct %in% CT_KEEP
+cat(sprintf("FILTER: DMSO + CT_KEEP {%s}. Samples before: %d / after: %d.\n",
+            paste(CT_KEEP, collapse = ", "), ncol(y_iso), sum(keep_iso)))
+y_iso_dmso <- y_iso[, keep_iso]
+
+# Drop unused factor levels and rebuild as plain character → factor
+y_iso_dmso$samples$ct        <- factor(as.character(y_iso_dmso$samples$ct), levels = CT_KEEP)
+y_iso_dmso$samples$treatment <- factor(as.character(y_iso_dmso$samples$treatment))
+# Donor: copy whichever column exists into a uniform `donor_factor`
+y_iso_dmso$samples$donor_factor <- factor(as.character(get_donor(y_iso_dmso$samples)))
+
+stopifnot(nrow(y_iso_dmso$samples) == ncol(y_iso_dmso))
+stopifnot(!any(is.na(y_iso_dmso$samples$ct)))
+stopifnot(!any(is.na(y_iso_dmso$samples$donor_factor)))
+
+cat("LR isoform DMSO DGEList:",
+    nrow(y_iso_dmso), "isoforms x",
+    ncol(y_iso_dmso), "samples\n")
+print(table(y_iso_dmso$samples$ct, y_iso_dmso$samples$donor_factor))
+```
+
+```{r load_sr_gene}
+# Short-read gene DGEList (filtered, same object as SR DGE pipeline input)
+y_gene <- readRDS(SR_GENE_PATH)
+
+# Relabel ct to display names AFTER loading (AT -> AT2, DD -> LAE)
+y_gene$samples <- relabel_ct(y_gene$samples)
+
+keep_gene <- y_gene$samples$treatment == "DMSO" &
+             y_gene$samples$ct %in% CT_KEEP
+cat(sprintf("FILTER: DMSO + CT_KEEP {%s}. Samples before: %d / after: %d.\n",
+            paste(CT_KEEP, collapse = ", "), ncol(y_gene), sum(keep_gene)))
+y_gene_dmso <- y_gene[, keep_gene]
+
+y_gene_dmso$samples$ct        <- factor(as.character(y_gene_dmso$samples$ct), levels = CT_KEEP)
+y_gene_dmso$samples$treatment <- factor(as.character(y_gene_dmso$samples$treatment))
+y_gene_dmso$samples$donor_factor <- factor(as.character(get_donor(y_gene_dmso$samples)))
+
+stopifnot(nrow(y_gene_dmso$samples) == ncol(y_gene_dmso))
+stopifnot(!any(is.na(y_gene_dmso$samples$ct)))
+stopifnot(!any(is.na(y_gene_dmso$samples$donor_factor)))
+
+cat("SR gene DMSO DGEList:",
+    nrow(y_gene_dmso), "genes x",
+    ncol(y_gene_dmso), "samples\n")
+print(table(y_gene_dmso$samples$ct, y_gene_dmso$samples$donor_factor))
+```
+
+# Helper: Fit Limma-Voom and Extract Contrasts
+
+Wraps the standard pipeline: `voom` → `duplicateCorrelation` → `lmFit` → `contrasts.fit` → `eBayes` → `topTable`. Donor structure: donors are shared across three of the four cell types (partially crossed, unbalanced). Donor therefore enters as a random effect via duplicateCorrelation(block = donor).
+
+The helper also returns the post-contrast `fit2` object so that downstream `mashr` can pull effect sizes (`coefficients`) and moderated SEs (`coefficients / t`).
+
+```{r fit_helper}
+fit_voom_contrasts <- function(y, contrasts_mat, design, block, level = "feature") {
+  # Refilter for DMSO-only subset
+  keep <- filterByExpr(y, design = design, min.count = 5, min.total.count = 10)
+  y2 <- y[keep, , keep.lib.sizes = FALSE]
+  y2 <- calcNormFactors(y2, method = "TMM")
+
+  cat(sprintf("FILTER: filterByExpr on DMSO subset — %d %ss retained (was %d)\n",
+              nrow(y2), level, nrow(y)))
+
+  v <- voom(y2, design, plot = FALSE)
+
+  corfit <- duplicateCorrelation(v, design, block = block)
+  cat(sprintf("Within-donor correlation: %.3f\n", corfit$consensus.correlation))
+
+  fit <- lmFit(v, design, block = block, correlation = corfit$consensus.correlation)
+
+  fit2 <- contrasts.fit(fit, contrasts_mat)
+  fit2 <- eBayes(fit2)
+
+  out <- lapply(colnames(contrasts_mat), function(cn) {
+    tt <- topTable(fit2, coef = cn, number = Inf, sort.by = "none")
+    tt$feature_id <- rownames(tt)
+    tt$contrast <- cn
+    as.data.table(tt)
+  })
+  names(out) <- colnames(contrasts_mat)
+  list(toptables = out, fit2 = fit2, dge_filtered = y2)
+}
+```
+
+# One-vs-Rest Contrasts
+
+For each CT, define a one-vs-rest contrast: that CT minus the mean of the other three. This identifies CT-marker features — features whose expression in CT_X differs from the rest of the panel.
+
+```{r ovr_design}
+build_ovr_contrasts <- function(y) {
+  ct  <- droplevels(factor(y$samples$ct, levels = CT_KEEP))
+  don <- droplevels(factor(y$samples$donor_factor))
+
+  cat(sprintf("ncol(y)=%d  length(ct)=%d  length(don)=%d\n",
+              ncol(y), length(ct), length(don)))
+  stopifnot(length(ct)  == ncol(y))
+  stopifnot(length(don) == ncol(y))
+
+  # Match SR pipeline: ct only in design, donor enters via duplicateCorrelation block
+  design <- model.matrix(~ 0 + ct)
+  colnames(design) <- gsub("^ct", "", colnames(design))
+
+  # One-vs-rest: each CT minus mean of other three (display names AT2/LAE)
+  cm <- makeContrasts(
+    AT2_vs_rest = AT2 - (LAE + FB + MV)/3,
+    LAE_vs_rest = LAE - (AT2 + FB + MV)/3,
+    FB_vs_rest  = FB  - (AT2 + LAE + MV)/3,
+    MV_vs_rest  = MV  - (AT2 + LAE + FB)/3,
+    levels = design
+  )
+  list(design = design, contrasts = cm, donor = don)
+}
+```
+
+## LR Isoform Level (Primary)
+
+```{r ovr_iso}
+ovr_iso <- build_ovr_contrasts(y_iso_dmso)
+res_iso <- fit_voom_contrasts(
+  y_iso_dmso, ovr_iso$contrasts, ovr_iso$design,
+  block = ovr_iso$donor, level = "isoform"
+)
+res_ovr_iso     <- res_iso$toptables
+fit2_iso        <- res_iso$fit2
+y_iso_dmso_filt <- res_iso$dge_filtered
+
+ovr_iso_dt <- rbindlist(res_ovr_iso, idcol = "ct_contrast")
+invisible(ovr_iso_dt[, `:=`(
+  ct          = sub("_vs_rest$", "", ct_contrast),
+  is_marker   = adj.P.Val < PADJ_CUT & logFC >  LOGFC_MARKER,
+  is_depleted = adj.P.Val < PADJ_CUT & logFC < -LOGFC_MARKER
+)])
+
+cat("\n=== LR Isoform CT-marker counts (one-vs-rest, unshrunken limma) ===\n")
+print(ovr_iso_dt[, .(
+  n_marker_up   = sum(is_marker),
+  n_marker_down = sum(is_depleted),
+  n_tested      = .N
+), by = ct])
+```
+
+## SR Gene Level (Secondary)
+
+```{r ovr_gene}
+ovr_gene <- build_ovr_contrasts(y_gene_dmso)
+res_gene <- fit_voom_contrasts(
+  y_gene_dmso, ovr_gene$contrasts, ovr_gene$design,
+  block = ovr_gene$donor, level = "gene"
+)
+res_ovr_gene     <- res_gene$toptables
+fit2_gene        <- res_gene$fit2
+y_gene_dmso_filt <- res_gene$dge_filtered
+
+ovr_gene_dt <- rbindlist(res_ovr_gene, idcol = "ct_contrast")
+invisible(ovr_gene_dt[, `:=`(
+  ct          = sub("_vs_rest$", "", ct_contrast),
+  is_marker   = adj.P.Val < PADJ_CUT & logFC >  LOGFC_MARKER,
+  is_depleted = adj.P.Val < PADJ_CUT & logFC < -LOGFC_MARKER
+)])
+
+cat("\n=== SR Gene CT-marker counts (one-vs-rest, unshrunken limma) ===\n")
+print(ovr_gene_dt[, .(
+  n_marker_up   = sum(is_marker),
+  n_marker_down = sum(is_depleted),
+  n_tested      = .N
+), by = ct])
+```
+
+# Adaptive Shrinkage Across Cell Types (mashr)
+
+We jointly shrink the four one-vs-rest contrast effects with `mashr`. The four contrasts are non-independent by construction (each CT minus mean of the other three), so the **null correlation matrix `Vhat`** is essential — it is what lets `mashr` not over-call shared signal that is just the residual structure of the contrast design.
+
+The procedure mirrors the SR DGE pipeline exactly:
+
+1. Pull `bhat` (effect sizes) and `shat` (moderated SEs = `coef / t`) from `fit2`.
+2. Filter to features with finite, positive SEs in all four contrasts.
+3. Estimate `Vhat` from a random subset (the `mashr`-recommended workflow).
+4. Build a covariance library (data-driven PCA + canonical patterns).
+5. Fit, extract posterior means (`pm`) and `lfsr`.
+
+```{r mashr-libs}
+# mashr + ashr are prerequisites (see Overview). Fail loudly if absent rather
+# than installing at render time on someone else's machine.
+.need <- c("ashr", "mashr")
+.miss <- .need[!vapply(.need, requireNamespace, logical(1), quietly = TRUE)]
+if (length(.miss))
+  stop("Missing required package(s): ", paste(.miss, collapse = ", "),
+       ". Install before knitting:  install.packages('ashr'); BiocManager::install('mashr')")
+suppressPackageStartupMessages({
+  library(mashr)
+  library(ashr)
+})
+```
+
+```{r mashr-helper}
+# Generic mashr runner for any limma fit2 object with multiple contrasts.
+# Returns a list with the model, posterior means, lfsr, sharing matrices,
+# and Vhat — keyed by the contrast names from fit2.
+# seed = 42 matches the short-read pipeline's RNG for the random Vhat subset.
+run_mashr_on_fit <- function(fit2, level_label = "feature", n_random = 20000, seed = 42) {
+
+  bhat <- fit2$coefficients
+  shat <- fit2$coefficients / fit2$t
+
+  # Drop features with non-finite or zero SE in any contrast
+  finite_rows <- apply(shat, 1, function(x) all(is.finite(x) & x > 0))
+  cat(sprintf("[%s] %ss with valid SEs in all contrasts: %d of %d\n",
+              level_label, level_label, sum(finite_rows), nrow(shat)))
+  bhat <- bhat[finite_rows, , drop = FALSE]
+  shat <- shat[finite_rows, , drop = FALSE]
+  stopifnot(identical(dim(bhat), dim(shat)))
+
+  # Strong signals (used to seed data-driven covariances)
+  mash_data_init <- mash_set_data(Bhat = bhat, Shat = shat)
+  m_1by1 <- mash_1by1(mash_data_init)
+  strong <- get_significant_results(m_1by1, thresh = 0.05)
+  cat(sprintf("[%s] Strong (1-by-1) signals: %d\n", level_label, length(strong)))
+
+  # Estimate null correlation from a random subset
+  set.seed(seed)
+  n_use <- min(n_random, nrow(bhat))
+  random_idx <- sample(seq_len(nrow(bhat)), n_use)
+  mash_data_random <- mash_set_data(Bhat = bhat[random_idx, , drop = FALSE],
+                                    Shat = shat[random_idx, , drop = FALSE])
+  Vhat <- estimate_null_correlation_simple(mash_data_random)
+  cat(sprintf("[%s] Null correlation Vhat:\n", level_label))
+  print(round(Vhat, 3))
+
+  # Final mash data with Vhat
+  mash_data <- mash_set_data(Bhat = bhat, Shat = shat, V = Vhat)
+
+  # Covariance library: data-driven PCA (if enough strong signals) + canonical
+  if (length(strong) >= 5) {
+    U_pca <- cov_pca(mash_data, npc = min(5, ncol(bhat) - 1), subset = strong)
+  } else {
+    U_pca <- list()
+    cat(sprintf("[%s] Too few strong signals; skipping data-driven covariances\n",
+                level_label))
+  }
+  U_c   <- cov_canonical(mash_data)
+  U_all <- c(U_pca, U_c)
+  cat(sprintf("[%s] Total covariance matrices: %d\n", level_label, length(U_all)))
+
+  # Fit
+  t_start <- Sys.time()
+  m <- mash(mash_data, Ulist = U_all, outputlevel = 2)
+  cat(sprintf("[%s] mashr fit complete in %.1f min\n",
+              level_label,
+              as.numeric(difftime(Sys.time(), t_start, units = "mins"))))
+
+  pi_vals <- get_estimated_pi(m)
+  cat(sprintf("[%s] Estimated mixture weights (>1%%):\n", level_label))
+  print(round(sort(pi_vals[pi_vals > 0.01], decreasing = TRUE), 3))
+
+  pm   <- get_pm(m)
+  lfsr <- get_lfsr(m)
+
+  # Per-contrast significance
+  cat(sprintf("[%s] Significant features per contrast (lfsr < %.2f):\n",
+              level_label, LFSR_CUT))
+  print(apply(lfsr, 2, function(x) sum(x < LFSR_CUT)))
+
+  # Sharing
+  n_sig_total <- length(get_significant_results(m, thresh = LFSR_CUT))
+  cat(sprintf("[%s] Total significant features (any contrast): %d\n",
+              level_label, n_sig_total))
+
+  if (n_sig_total >= 2) {
+    sharing      <- get_pairwise_sharing(m, factor = 0.5, lfsr_thresh = LFSR_CUT)
+    sharing_sign <- get_pairwise_sharing(m, factor = 0,   lfsr_thresh = LFSR_CUT)
+  } else {
+    sharing <- sharing_sign <- NULL
+  }
+
+  list(model = m, pm = pm, lfsr = lfsr,
+       sharing = sharing, sharing_sign = sharing_sign,
+       Vhat = Vhat, bhat = bhat, shat = shat,
+       strong = strong)
+}
+```
+
+## LR Isoform Mashr (Primary)
+
+```{r mashr-iso}
+mash_iso <- run_mashr_on_fit(fit2_iso, level_label = "isoform")
+```
+
+## SR Gene Mashr (Secondary)
+
+```{r mashr-gene}
+mash_gene <- run_mashr_on_fit(fit2_gene, level_label = "gene")
+```
+
+# Mashr-Shrunken CT-Marker Tables
+
+Build long tables using shrunken effects. Marker classification:
+
+- `is_marker_mash`   = `pm > LOGFC_MARKER  & lfsr < LFSR_CUT` (CT-enriched)
+- `is_depleted_mash` = `pm < -LOGFC_MARKER & lfsr < LFSR_CUT` (CT-depleted)
+
+```{r mashr-long-tables}
+mash_long <- function(mash_res, feature_col = "feature_id") {
+  pm   <- mash_res$pm
+  lfsr <- mash_res$lfsr
+  stopifnot(identical(rownames(pm), rownames(lfsr)))
+  stopifnot(identical(colnames(pm), colnames(lfsr)))
+
+  out <- rbindlist(lapply(colnames(pm), function(cn) {
+    data.table(
+      feature_id  = rownames(pm),
+      ct_contrast = cn,
+      pm          = pm[, cn],
+      lfsr        = lfsr[, cn]
+    )
+  }))
+  setnames(out, "feature_id", feature_col)
+
+  out[, ct := sub("_vs_rest$", "", ct_contrast)]
+  out[, is_marker_mash   := pm >  LOGFC_MARKER & lfsr < LFSR_CUT]
+  out[, is_depleted_mash := pm < -LOGFC_MARKER & lfsr < LFSR_CUT]
+  out[]
+}
+
+ovr_iso_mash_dt  <- mash_long(mash_iso)
+ovr_gene_mash_dt <- mash_long(mash_gene)
+
+# Attach gene annotation to isoform-level mashr table (matches non-mashr table)
+iso2gene <- as.data.table(y_iso_dmso$genes)[
+  , .(feature_id = txid,
+      gene_ensg  = sub("\\.\\d+$", "", gene_id),
+      gene_sym   = hgnc_symbol)
+]
+ovr_iso_mash_dt <- merge(ovr_iso_mash_dt, iso2gene, by = "feature_id", all.x = TRUE)
+
+cat("\n=== LR Isoform CT-marker counts (mashr-shrunken) ===\n")
+print(ovr_iso_mash_dt[, .(
+  n_marker_up   = sum(is_marker_mash),
+  n_marker_down = sum(is_depleted_mash),
+  n_tested      = .N
+), by = ct])
+
+# ── Claim 1.3.2 — the testable set and the four per-cell-type counts ──────────────────
+# "SIGNIFICANTLY ASSOCIATED WITH" MEANS UP-REGULATED MARKERS ONLY, and the manuscript does not
+# say so. Verified against the canonical render (nmd_channing_renders/final/ct_de.html): the
+# published LAE 28,930 / AT2 22,131 / MV 21,429 / FB 18,422 are this table's n_marker_up under
+# mashr shrinkage. The DEPLETED counts are of the same order and are excluded -- LAE alone has
+# 23,701 -- so a reader taking "associated with" to include both directions would be out by
+# roughly a factor of two. The depleted counts are emitted as supporting numbers so the
+# asymmetry is on the record.
+#
+# The unshrunken limma table gives different values (LAE 24,611 up) and is NOT what the paper
+# reports; naming mashr here is what stops the two being confused.
+MARKER_POP <- paste("long-read isoforms passing filterByExpr on the DMSO-only subset, tested",
+                    "one-vs-rest per cell type (that cell type against the mean of the other",
+                    "three) and called markers after mashr shrinkage: posterior mean >",
+                    "LOGFC_MARKER and lfsr < LFSR_CUT. UP-REGULATED ONLY -- depleted isoforms",
+                    "meeting the mirror-image threshold are not counted")
+.mk <- ovr_iso_mash_dt[, .(up = sum(is_marker_mash), down = sum(is_depleted_mash),
+                            tested = .N), by = ct]
+claim_emit("1.3.2", "isoforms expressed at testable levels under DMSO",
+           .mk$tested[1], published = "105,938", n = .mk$tested[1],
+           population = paste("long-read isoforms retained by filterByExpr (min.count = 5,",
+                              "min.total.count = 10) on the DMSO-only subset; the denominator",
+                              "every one-vs-rest contrast is tested over"))
+for (.i in seq_len(nrow(.mk))) {
+  .ct <- as.character(.mk$ct[.i])
+  claim_emit("1.3.2", sprintf("isoforms significantly associated with %s (up-regulated)", .ct),
+             .mk$up[.i],
+             published = switch(.ct, LAE = "28,930", AT2 = "22,131",
+                                MV = "21,429", FB = "18,422", NULL),
+             n = .mk$tested[.i], population = MARKER_POP)
+  claim_emit("1.3.2", sprintf("isoforms significantly DEPLETED in %s (not counted by the claim)", .ct),
+             .mk$down[.i], n = .mk$tested[.i], population = MARKER_POP)
+}
+
+cat("\n=== SR Gene CT-marker counts (mashr-shrunken) ===\n")
+print(ovr_gene_mash_dt[, .(
+  n_marker_up   = sum(is_marker_mash),
+  n_marker_down = sum(is_depleted_mash),
+  n_tested      = .N
+), by = ct])
+```
+
+## Unshrunken vs Shrunken Comparison
+
+```{r mashr-vs-limma}
+cmp_iso <- merge(
+  ovr_iso_dt[,      .(n_limma_marker = sum(is_marker)),      by = ct],
+  ovr_iso_mash_dt[, .(n_mash_marker  = sum(is_marker_mash)), by = ct],
+  by = "ct"
+)
+invisible(cmp_iso[, ratio := round(n_mash_marker / pmax(n_limma_marker, 1), 2)])
+cat("\n=== LR Isoform: limma vs mashr CT-marker counts ===\n"); print(cmp_iso)
+
+cmp_gene <- merge(
+  ovr_gene_dt[,      .(n_limma_marker = sum(is_marker)),      by = ct],
+  ovr_gene_mash_dt[, .(n_mash_marker  = sum(is_marker_mash)), by = ct],
+  by = "ct"
+)
+invisible(cmp_gene[, ratio := round(n_mash_marker / pmax(n_limma_marker, 1), 2)])
+cat("\n=== SR Gene: limma vs mashr CT-marker counts ===\n"); print(cmp_gene)
+```
+
+## Pairwise Sharing Heatmap (LR Isoform)
+
+How often does a CT-marker isoform also reach significance (same sign, within 2-fold magnitude) in another CT's one-vs-rest contrast? Because the contrasts are by construction zero-sum — being up in CT_X means being relatively down in the other three — sharing values here are expected to be **low and slightly negative**, not high. Anything > 0.2 indicates a feature whose magnitude is similar in two CTs (e.g., shared by AT2 and LAE relative to FB+MV).
+
+```{r mashr-sharing-iso, fig.width=8, fig.height=7}
+plot_sharing <- function(mash_res, level_label, fig_path) {
+  if (is.null(mash_res$sharing)) {
+    cat(sprintf("[%s] No sharing matrix (too few significant); skipping plot\n", level_label))
+    return(invisible(NULL))
+  }
+  s <- mash_res$sharing
+  rownames(s) <- gsub("_vs_rest$", "", rownames(s))
+  colnames(s) <- gsub("_vs_rest$", "", colnames(s))
+
+  ct_order <- intersect(CT_KEEP, rownames(s))
+
+  df <- melt(s)
+  colnames(df) <- c("CT1", "CT2", "Sharing")
+  df$CT1 <- factor(df$CT1, levels = ct_order)
+  df$CT2 <- factor(df$CT2, levels = ct_order)
+
+  p <- ggplot(df, aes(x = CT1, y = CT2, fill = Sharing)) +
+    geom_tile(color = "white", linewidth = 0.8) +
+    geom_text(aes(label = round(Sharing, 2)),
+              size = 4, fontface = "bold",
+              color = ifelse(df$Sharing > 0.6, "white", "grey20")) +
+    scale_fill_gradient2(low = "#D73027", mid = "white", high = "#185FA5",
+                         midpoint = 0, limits = c(-1, 1), name = "Sharing") +
+    labs(title    = sprintf("Pairwise Effect Sharing — %s", level_label),
+         subtitle = sprintf("Same sign & within 2-fold magnitude (lfsr < %.2f)",
+                            LFSR_CUT),
+         x = NULL, y = NULL) +
+    theme_minimal(base_size = 13) +
+    theme(axis.text.x   = element_text(angle = 45, hjust = 1, face = "bold"),
+          axis.text.y   = element_text(face = "bold"),
+          panel.grid    = element_blank(),
+          plot.title    = element_text(face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(color = "grey40", hjust = 0.5))
+
+  ggsave(fig_path, p, width = 8, height = 7, dpi = 300, bg = "white")
+  print(p)
+}
+
+plot_sharing(mash_iso,  "LR Isoform",
+             file.path(FIG_DIR, paste0("de_by_ct_dmso_mashr_sharing_iso_",  DATE_STAMP, ".png")))
+plot_sharing(mash_gene, "SR Gene",
+             file.path(FIG_DIR, paste0("de_by_ct_dmso_mashr_sharing_gene_", DATE_STAMP, ".png")))
+```
+
+## logFC Correlation Across CTs (Mashr Posterior Means)
+
+```{r mashr-logfc-cor, fig.width=8, fig.height=7}
+plot_pm_cor <- function(mash_res, level_label, fig_path) {
+  pm   <- mash_res$pm
+  lfsr <- mash_res$lfsr
+
+  any_sig <- rowSums(lfsr < LFSR_CUT) >= 1
+  cat(sprintf("[%s] Features significant in any contrast: %d of %d\n",
+              level_label, sum(any_sig), nrow(pm)))
+  if (sum(any_sig) < 2) return(invisible(NULL))
+
+  pm_sig <- pm[any_sig, , drop = FALSE]
+  cor_mat <- cor(pm_sig, method = "pearson")
+  rownames(cor_mat) <- gsub("_vs_rest$", "", rownames(cor_mat))
+  colnames(cor_mat) <- gsub("_vs_rest$", "", colnames(cor_mat))
+  ct_order <- intersect(CT_KEEP, rownames(cor_mat))
+
+  df <- melt(cor_mat)
+  colnames(df) <- c("CT1", "CT2", "r")
+  df$CT1 <- factor(df$CT1, levels = ct_order)
+  df$CT2 <- factor(df$CT2, levels = ct_order)
+
+  p <- ggplot(df, aes(x = CT1, y = CT2, fill = r)) +
+    geom_tile(color = "white", linewidth = 0.8) +
+    geom_text(aes(label = round(r, 2)),
+              size = 4, fontface = "bold",
+              color = ifelse(abs(df$r) > 0.6, "white", "grey20")) +
+    scale_fill_gradient2(low = "#D73027", mid = "white", high = "#185FA5",
+                         midpoint = 0, limits = c(-1, 1), name = "Pearson r") +
+    labs(title    = sprintf("logFC Correlation Across CTs — %s", level_label),
+         subtitle = "Pearson r of posterior mean logFC (one-vs-rest contrasts)",
+         x = NULL, y = NULL) +
+    theme_minimal(base_size = 13) +
+    theme(axis.text.x   = element_text(angle = 45, hjust = 1, face = "bold"),
+          axis.text.y   = element_text(face = "bold"),
+          panel.grid    = element_blank(),
+          plot.title    = element_text(face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(color = "grey40", hjust = 0.5))
+
+  ggsave(fig_path, p, width = 8, height = 7, dpi = 300, bg = "white")
+  print(p)
+}
+
+plot_pm_cor(mash_iso,  "LR Isoform",
+            file.path(FIG_DIR, paste0("de_by_ct_dmso_mashr_pmcor_iso_",  DATE_STAMP, ".png")))
+plot_pm_cor(mash_gene, "SR Gene",
+            file.path(FIG_DIR, paste0("de_by_ct_dmso_mashr_pmcor_gene_", DATE_STAMP, ".png")))
+```
+
+## Save Mashr Outputs
+
+```{r mashr-save}
+# Models
+saveRDS(mash_iso$model,
+        file.path(MASH_DIR, paste0("mashr_model_iso_",  DATE_STAMP, ".rds")))
+saveRDS(mash_gene$model,
+        file.path(MASH_DIR, paste0("mashr_model_gene_", DATE_STAMP, ".rds")))
+
+# Long tables (the user-facing artifacts)
+fwrite(ovr_iso_mash_dt,
+       file.path(MASH_DIR, paste0("ovr_iso_mashr_results_",  DATE_STAMP, ".csv")))
+fwrite(ovr_gene_mash_dt,
+       file.path(MASH_DIR, paste0("ovr_gene_mashr_results_", DATE_STAMP, ".csv")))
+
+# Wide pm / lfsr matrices (mirrors SR DGE pipeline format)
+write_pm_lfsr <- function(mash_res, gene_anno, level_tag) {
+  pm_df   <- as.data.frame(mash_res$pm);   pm_df$feature_id   <- rownames(pm_df)
+  lfsr_df <- as.data.frame(mash_res$lfsr); lfsr_df$feature_id <- rownames(lfsr_df)
+  if (!is.null(gene_anno)) {
+    pm_df   <- merge(pm_df,   gene_anno, by = "feature_id", all.x = TRUE)
+    lfsr_df <- merge(lfsr_df, gene_anno, by = "feature_id", all.x = TRUE)
+  }
+  fwrite(pm_df,
+         file.path(MASH_DIR, sprintf("mashr_posterior_means_%s_%s.csv",
+                                     level_tag, DATE_STAMP)))
+  fwrite(lfsr_df,
+         file.path(MASH_DIR, sprintf("mashr_lfsr_%s_%s.csv",
+                                     level_tag, DATE_STAMP)))
+}
+
+# Isoform: include gene-symbol annotation
+iso_anno <- iso2gene[, .(feature_id, gene_sym, gene_ensg)]
+write_pm_lfsr(mash_iso, iso_anno, "iso")
+
+# Gene: include external_gene_name from DGEList
+gene_anno_dt <- as.data.table(y_gene_dmso_filt$genes)[
+  , .(feature_id = ensembl_gene_id_version,
+      external_gene_name)
+]
+gene_anno_dt <- gene_anno_dt[!duplicated(feature_id)]
+write_pm_lfsr(mash_gene, gene_anno_dt, "gene")
+
+# Sharing matrices
+if (!is.null(mash_iso$sharing)) {
+  fwrite(as.data.frame(mash_iso$sharing),
+         file.path(MASH_DIR, paste0("mashr_sharing_2fold_iso_", DATE_STAMP, ".csv")),
+         row.names = TRUE)
+  fwrite(as.data.frame(mash_iso$sharing_sign),
+         file.path(MASH_DIR, paste0("mashr_sharing_sign_iso_", DATE_STAMP, ".csv")),
+         row.names = TRUE)
+}
+if (!is.null(mash_gene$sharing)) {
+  fwrite(as.data.frame(mash_gene$sharing),
+         file.path(MASH_DIR, paste0("mashr_sharing_2fold_gene_", DATE_STAMP, ".csv")),
+         row.names = TRUE)
+  fwrite(as.data.frame(mash_gene$sharing_sign),
+         file.path(MASH_DIR, paste0("mashr_sharing_sign_gene_", DATE_STAMP, ".csv")),
+         row.names = TRUE)
+}
+
+# Vhat
+fwrite(as.data.frame(mash_iso$Vhat),
+       file.path(MASH_DIR, paste0("mashr_Vhat_iso_",  DATE_STAMP, ".csv")),
+       row.names = TRUE)
+fwrite(as.data.frame(mash_gene$Vhat),
+       file.path(MASH_DIR, paste0("mashr_Vhat_gene_", DATE_STAMP, ".csv")),
+       row.names = TRUE)
+
+cat("\nmashr outputs saved to:", MASH_DIR, "\n")
+print(list.files(MASH_DIR))
+```
+
+## Overlap Across Levels (Mashr-Shrunken)
+
+Genes whose mRNA is a CT-marker at both the SR gene level (mashr) and the LR isoform level (mashr, any isoform).
+
+```{r mashr-overlap}
+# Harmonize both sides on bare ENSG (strip version suffix) so the intersect works.
+ovr_iso_dt <- merge(ovr_iso_dt, iso2gene, by = "feature_id", all.x = TRUE)
+
+iso_marker_genes <- ovr_iso_dt[is_marker == TRUE,
+  .(ensg = unique(gene_ensg)), by = ct][!is.na(ensg) & ensg != ""]
+
+gene_marker_genes <- ovr_gene_dt[is_marker == TRUE,
+  .(ensg = sub("\\.\\d+$", "", feature_id)), by = ct]
+
+overlap_tab <- merge(
+  iso_marker_genes[, .N, by = ct][, .(ct, n_iso_marker_genes = N)],
+  gene_marker_genes[, .N, by = ct][, .(ct, n_gene_marker = N)],
+  by = "ct"
+)
+invisible(overlap_tab[, n_both := mapply(function(c) {
+  length(intersect(iso_marker_genes[ct == c, ensg],
+                   gene_marker_genes[ct == c, ensg]))
+}, ct)])
+invisible(overlap_tab[, `:=`(
+  pct_iso_in_gene = round(100 * n_both / n_iso_marker_genes, 1),
+  pct_gene_in_iso = round(100 * n_both / n_gene_marker,      1)
+)])
+
+cat("\n=== Iso↔Gene marker overlap (bare ENSG) ===\n")
+print(overlap_tab)
+
+fwrite(overlap_tab, file.path(OUT_DIR, "iso_gene_marker_overlap.csv"))
+```
+
+
+
+## CT-Marker Counts Per CT
+
+```{r counts_barplot, fig.width=10, fig.height=5}
+counts_iso  <- ovr_iso_dt[, .(level = "Isoform (LR)", n = sum(is_marker)), by = ct]
+counts_gene <- ovr_gene_dt[, .(level = "Gene (SR)",   n = sum(is_marker)), by = ct]
+counts_all  <- rbind(counts_iso, counts_gene)
+counts_all[, ct := factor(ct, levels = CT_KEEP)]
+
+p_counts <- ggplot(counts_all, aes(x = ct, y = n, fill = ct)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = scales::comma(n)), vjust = -0.4, size = 3.2) +
+  facet_wrap(~ level, scales = "free_y") +
+  scale_fill_brewer(palette = "Set2", guide = "none") +
+  scale_y_continuous(labels = scales::comma, expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title    = "Cell-Type Marker Features Under DMSO",
+    subtitle = sprintf(
+      "One-vs-rest contrast | adj.P < %.2f & logFC > %.0f",
+      PADJ_CUT, LOGFC_MARKER
+    ),
+    x = "Cell Type", y = "Number of Markers"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.major.x = element_blank())
+
+print(p_counts)
+ggsave(file.path(FIG_DIR, "de_by_ct_dmso_counts.png"),
+       p_counts, width = 10, height = 5, dpi = 300)
+```
+
+### Limma Vs Mashr CT-Marker Counts
+
+```{r counts_barplot_mash, fig.width=10, fig.height=5}
+counts_compare <- rbind(
+  ovr_iso_dt[,       .(level = "Isoform (LR)", method = "limma", n = sum(is_marker)),       by = ct],
+  ovr_iso_mash_dt[,  .(level = "Isoform (LR)", method = "mashr", n = sum(is_marker_mash)),  by = ct],
+  ovr_gene_dt[,      .(level = "Gene (SR)",    method = "limma", n = sum(is_marker)),       by = ct],
+  ovr_gene_mash_dt[, .(level = "Gene (SR)",    method = "mashr", n = sum(is_marker_mash)),  by = ct]
+)
+counts_compare[, ct := factor(ct, levels = CT_KEEP)]
+counts_compare[, method := factor(method, levels = c("limma", "mashr"))]
+
+p_counts_cmp <- ggplot(counts_compare, aes(x = ct, y = n, fill = method)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  geom_text(aes(label = scales::comma(n)),
+            position = position_dodge(width = 0.8),
+            vjust = -0.4, size = 2.8) +
+  facet_wrap(~ level, scales = "free_y") +
+  scale_fill_manual(values = c("limma" = "#9ECAE1", "mashr" = "#08519C"),
+                    name = NULL) +
+  scale_y_continuous(labels = scales::comma, expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title    = "CT-Marker Counts: Unshrunken Vs Mashr-Shrunken",
+    subtitle = sprintf("limma: adj.P < %.2f & logFC > %.0f | mashr: lfsr < %.2f & pm > %.0f",
+                       PADJ_CUT, LOGFC_MARKER, LFSR_CUT, LOGFC_MARKER),
+    x = "Cell Type", y = "Number of CT-Enriched Markers"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.major.x = element_blank(),
+        legend.position = "top")
+
+print(p_counts_cmp)
+ggsave(file.path(FIG_DIR, paste0("de_by_ct_dmso_counts_limma_vs_mashr_", DATE_STAMP, ".png")),
+       p_counts_cmp, width = 10, height = 5, dpi = 300, bg = "white")
+```
+
+## Top Markers Per CT
+
+Top 10 isoform markers per CT by `logFC`, with gene symbol annotation.
+
+```{r top_markers}
+top_iso_markers <- ovr_iso_dt[is_marker == TRUE,
+  .SD[order(-logFC)][1:10], by = ct,
+  .SDcols = c("feature_id", "gene_sym", "gene_ensg", "logFC", "AveExpr", "adj.P.Val")
+]
+setnames(top_iso_markers, "gene_sym", "gene")
+print(top_iso_markers)
+
+fwrite(top_iso_markers,
+       file.path(OUT_DIR, "top10_iso_markers_per_ct.csv"))
+
+top_gene_markers <- ovr_gene_dt[is_marker == TRUE,
+  .SD[order(-logFC)][1:10], by = ct,
+  .SDcols = c("feature_id", "logFC", "AveExpr", "adj.P.Val")
+]
+setnames(top_gene_markers, "feature_id", "gene")
+print(top_gene_markers)
+
+fwrite(top_gene_markers,
+       file.path(OUT_DIR, "top10_gene_markers_per_ct.csv"))
+```
+
+### Top Markers Per CT (Mashr)
+
+```{r top_markers_mash}
+top_iso_markers_mash <- ovr_iso_mash_dt[is_marker_mash == TRUE,
+  .SD[order(-pm)][1:10], by = ct,
+  .SDcols = c("feature_id", "gene_sym", "gene_ensg", "pm", "lfsr")
+]
+setnames(top_iso_markers_mash, "gene_sym", "gene")
+print(top_iso_markers_mash)
+fwrite(top_iso_markers_mash,
+       file.path(MASH_DIR, paste0("top10_iso_markers_per_ct_mashr_", DATE_STAMP, ".csv")))
+
+top_gene_markers_mash <- ovr_gene_mash_dt[is_marker_mash == TRUE,
+  .SD[order(-pm)][1:10], by = ct,
+  .SDcols = c("feature_id", "pm", "lfsr")
+]
+setnames(top_gene_markers_mash, "feature_id", "gene")
+print(top_gene_markers_mash)
+fwrite(top_gene_markers_mash,
+       file.path(MASH_DIR, paste0("top10_gene_markers_per_ct_mashr_", DATE_STAMP, ".csv")))
+```
+
+## Heatmap of CT-Marker Expression
+
+Take the union of the top 25 markers per CT (isoform level) and plot mean log-CPM by CT × donor.
+
+```{r marker_heatmap, fig.width=8, fig.height=10}
+top25_per_ct <- ovr_iso_dt[is_marker == TRUE,
+  .SD[order(-logFC)][1:25], by = ct]
+marker_set <- unique(top25_per_ct$feature_id)
+
+# Mean log-CPM per CT × sample
+log_cpm <- cpm(y_iso_dmso, log = TRUE, prior.count = 1)
+log_cpm_mark <- log_cpm[rownames(log_cpm) %in% marker_set, , drop = FALSE]
+
+# Z-score per row
+z <- t(scale(t(log_cpm_mark)))
+
+# Annotation
+ann_col <- data.frame(
+  CellType = y_iso_dmso$samples$ct,
+  Donor    = y_iso_dmso$samples$donor_factor,
+  row.names = colnames(z)
+)
+ann_colors <- list(
+  CellType = setNames(brewer.pal(4, "Set2"), CT_KEEP)
+)
+
+# Order columns by CT then donor
+ord <- order(ann_col$CellType, ann_col$Donor)
+z   <- z[, ord]
+ann_col <- ann_col[ord, , drop = FALSE]
+
+# Order rows by CT-marker block
+row_ann <- top25_per_ct[!duplicated(feature_id),
+  .(feature_id, marker_ct = ct)]
+row_order <- match(rownames(z), row_ann$feature_id)
+z <- z[order(row_ann$marker_ct[row_order]), , drop = FALSE]
+
+pheatmap(
+  z,
+  cluster_rows = FALSE, cluster_cols = FALSE,
+  annotation_col = ann_col, annotation_colors = ann_colors,
+  show_rownames = FALSE, show_colnames = FALSE,
+  color = colorRampPalette(rev(brewer.pal(11, "RdBu")))(50),
+  breaks = seq(-3, 3, length.out = 51),
+  main = "Top 25 CT-Marker Isoforms Per CT (Z-scored log-CPM, DMSO)",
+  filename = file.path(FIG_DIR, "de_by_ct_dmso_heatmap.png"),
+  width = 8, height = 10
+)
+```
+
+# GSEA — topGO Overrepresentation On SR Gene Markers
+
+We test whether CT-marker genes (one-vs-rest, SR DGE level, adj.P < 0.05 & logFC > 1) are enriched for GO terms relative to the universe of all SR genes tested. Run separately per CT and per ontology (BP, MF, CC). Classic Fisher test; FDR-adjusted across terms within each (CT, ontology). topGO requires Ensembl gene IDs without version suffix or HGNC symbols — we map via the SR DGEList annotation.
+
+```{r topgo_libs}
+suppressPackageStartupMessages({
+  library(topGO)
+  library(org.Hs.eg.db)
+})
+```
+
+```{r topgo_prep}
+# SR gene IDs in this project: rownames(y_gene_dmso) are ensembl_gene_id_version
+# topGO works best with bare ENSG IDs or symbols; strip version suffix.
+sr_universe_ensg <- sub("\\.\\d+$", "", rownames(y_gene_dmso))
+names(sr_universe_ensg) <- rownames(y_gene_dmso)
+
+# Map per-CT marker gene IDs (versioned) → bare ENSG
+get_marker_ensg <- function(ct_x) {
+  vers <- ovr_gene_dt[ct == ct_x & is_marker == TRUE, feature_id]
+  unname(sub("\\.\\d+$", "", vers))
+}
+
+# Universe: every gene that survived filtering and was tested
+all_ensg_bare <- unique(sr_universe_ensg)
+cat("topGO universe size:", length(all_ensg_bare), "\n")
+for (ct_x in CT_KEEP) {
+  cat(sprintf("  %s markers: %d\n", ct_x, length(get_marker_ensg(ct_x))))
+}
+```
+
+```{r topgo_run}
+run_topgo_one <- function(ct_x, ontology = "BP") {
+  marker_ensg <- get_marker_ensg(ct_x)
+  if (length(marker_ensg) == 0) return(NULL)
+
+  gene_list <- factor(as.integer(all_ensg_bare %in% marker_ensg))
+  names(gene_list) <- all_ensg_bare
+
+  GOdata <- new(
+    "topGOdata",
+    ontology     = ontology,
+    allGenes     = gene_list,
+    annot        = annFUN.org,
+    mapping      = "org.Hs.eg.db",
+    ID           = "ensembl",
+    nodeSize     = 10
+  )
+
+  result_fisher <- runTest(GOdata, algorithm = "classic", statistic = "fisher")
+
+  # Pull all tested terms so FDR is meaningful and N is honest
+  all_terms <- usedGO(GOdata)
+  tab <- GenTable(GOdata, classicFisher = result_fisher,
+                  orderBy = "classicFisher", topNodes = length(all_terms))
+
+  # GenTable returns Fisher p as character (sometimes "<1e-30") — coerce safely
+  tab$pvalue <- as.numeric(gsub("<", "", tab$classicFisher))
+  tab$FDR    <- p.adjust(tab$pvalue, method = "BH")
+  tab$ct     <- ct_x
+  tab$ontology <- ontology
+
+  setDT(tab)
+  tab[order(FDR)]
+}
+
+topgo_all <- list()
+for (ct_x in CT_KEEP) {
+  for (ont in c("BP", "MF", "CC")) {
+    cat(sprintf("topGO %s | %s ...\n", ct_x, ont))
+    topgo_all[[paste(ct_x, ont, sep = "_")]] <-
+      run_topgo_one(ct_x, ontology = ont)
+  }
+}
+
+topgo_dt <- rbindlist(topgo_all, fill = TRUE)
+
+cat("\nAll tested terms per CT × ontology:\n")
+print(topgo_dt[, .N, by = .(ct, ontology)])
+
+cat("\nSignificant terms (FDR < 0.05) per CT × ontology:\n")
+print(topgo_dt[FDR < 0.05, .N, by = .(ct, ontology)])
+```
+
+## Top Terms Per CT (BP)
+
+```{r topgo_top_bp}
+top_bp <- topgo_dt[ontology == "BP" & FDR < 0.05][
+  order(ct, FDR)][, head(.SD, 25), by = ct]
+print(top_bp[, .(ct, GO.ID, Term, Significant, Annotated, pvalue, FDR)])
+```
+
+## Save topGO Results
+
+```{r topgo_save}
+fwrite(topgo_dt, file.path(OUT_DIR, "topgo_results_all.csv"))
+fwrite(topgo_dt[FDR < 0.05],
+       file.path(OUT_DIR, "topgo_results_FDR05.csv"))
+cat("topGO results saved to:", OUT_DIR, "\n")
+```
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```

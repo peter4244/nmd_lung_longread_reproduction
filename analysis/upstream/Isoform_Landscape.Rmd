@@ -1,0 +1,1127 @@
+---
+title: "SQANTI3 Isoform Characterization"
+subtitle: "Long-read isoform landscape across cell types and treatments"
+author: "Leshem, Yul"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: lumen
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+.nmd_root <- local({ d <- getwd(); while (!file.exists(file.path(d, "config", "paths.yml"))) {
+  p <- dirname(d); if (identical(p, d)) stop("repo root not found"); d <- p }; d })
+source(file.path(.nmd_root, "R", "load_config.R")); .P <- nmd_paths(.nmd_root)
+source(file.path(.nmd_root, "R", "claim_emit.R"))  # Phase 2 claim-value emission
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 12, fig.height = 8, dev = "png")
+options(bitmapType = "cairo")
+
+```
+
+# Overview
+
+Code location: `/udd/reyle/nmd_lungcells_2026/code/final/Isoform_Landscape.Rmd`
+
+This report characterizes the long-read isoform landscape across the four
+primary lung cell types (AT2, LAE, FB, MV): structural category (SQANTI3),
+cell-type expression sharing, length distributions, and pairwise expression
+similarity within and across treatment conditions.
+
+Note: the ALI cell types (DD_ALI, DO_ALI) are excluded; this is a descriptive
+isoform landscape with no donor-paired modeling. The DGEList stores the
+original ct codes `AT` (= AT2) and `DD` (= LAE); we relabel to the display
+names right after loading and use AT2 / LAE throughout.
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(ggplot2)
+  library(tidyr)
+  library(reshape2)
+  library(patchwork)
+  library(scales)
+  library(edgeR)
+})
+
+# Bioconductor namespace masking guard
+select <- dplyr::select
+filter <- dplyr::filter
+rename <- dplyr::rename
+count  <- dplyr::count
+slice  <- dplyr::slice
+first  <- dplyr::first
+```
+
+# Configuration
+
+```{r config}
+DGE_FILT_PATH <- file.path(.P$OUT, "dge_isoform_longread_filtered_2026.3.3.rds")
+
+# SQANTI3 classification (for structural_category)
+SQ_CLASS_PATH <- file.path(.P$SQANTI, "nmd_lungcells_classification.txt")
+
+OUTPUT_DIR <- file.path(.P$OUT, "isoform_characterization")
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# The four primary lung cell types (ALI types excluded), display naming.
+# AT2 = old AT, LAE = old DD.
+CT_KEEP   <- c("LAE", "AT2", "FB", "MV")
+CAT_ORDER <- c("FSM", "ISM", "NIC", "NNC", "Other")
+
+# Relabel helper: rename the DGEList's internal ct codes to display names.
+# Safe on the loaded object — only a metadata column is renamed.
+relabel_ct <- function(ct_vec) {
+  ct_vec <- as.character(ct_vec)
+  ct_vec[ct_vec == "AT"] <- "AT2"
+  ct_vec[ct_vec == "DD"] <- "LAE"
+  ct_vec
+}
+
+```
+
+# Load Data
+
+```{r load-dgelist}
+dge_filt <- readRDS(DGE_FILT_PATH)
+cat("Filtered DGEList:", nrow(dge_filt), "isoforms x", ncol(dge_filt), "samples\n")
+
+# Relabel ct to display names AFTER loading (AT -> AT2, DD -> LAE)
+dge_filt$samples$ct <- relabel_ct(dge_filt$samples$ct)
+
+# Keep the 4 primary cell types; restrict to DMSO only for the baseline isoform landscape.
+# (ALI types are dropped here via CT_KEEP, so no explicit 029T exclusion is needed.)
+ct_char   <- as.character(dge_filt$samples$ct)
+trt_char  <- as.character(dge_filt$samples$treatment)
+keep_samp <- ct_char %in% CT_KEEP & trt_char == "DMSO"
+cat(sprintf("FILTER: 4 primary CTs {%s} + DMSO only. Samples before: %d / after: %d.\n",
+            paste(CT_KEEP, collapse = ", "), ncol(dge_filt), sum(keep_samp)))
+dge_filt  <- dge_filt[, keep_samp, keep.lib.sizes = FALSE]
+
+cat("After restricting to the 4 primary cell types (DMSO only):\n")
+cat("  ", nrow(dge_filt), "isoforms x", ncol(dge_filt), "samples\n")
+cat("  Cell types:", paste(sort(unique(as.character(dge_filt$samples$ct))), collapse = ", "), "\n")
+cat("  Treatments:", paste(sort(unique(as.character(dge_filt$samples$treatment))), collapse = ", "), "\n")
+
+# Hoist sample-metadata reference and cell-type vector
+samp_filt <- dge_filt$samples
+cts       <- sort(unique(as.character(samp_filt$ct)))
+```
+
+```{r load-sqanti}
+sq <- fread(SQ_CLASS_PATH)
+cat("SQANTI3 classification:", nrow(sq), "rows\n")
+
+sq_filt <- sq %>%
+  filter(isoform %in% rownames(dge_filt$counts)) %>%
+  mutate(
+    novelty = case_when(
+      structural_category == "full-splice_match"       ~ "Known (FSM)",
+      structural_category == "incomplete-splice_match" ~ "Known Variant (ISM)",
+      structural_category == "novel_in_catalog"        ~ "Novel (NIC)",
+      structural_category == "novel_not_in_catalog"    ~ "Novel (NNC)",
+      TRUE                                             ~ structural_category
+    ),
+    known_novel = case_when(
+      structural_category %in% c("full-splice_match", "incomplete-splice_match") ~ "Known",
+      structural_category %in% c("novel_in_catalog",  "novel_not_in_catalog")    ~ "Novel",
+      TRUE                                                                       ~ "Other"
+    ),
+    category_short = case_when(
+      structural_category == "full-splice_match"       ~ "FSM",
+      structural_category == "incomplete-splice_match" ~ "ISM",
+      structural_category == "novel_in_catalog"        ~ "NIC",
+      structural_category == "novel_not_in_catalog"    ~ "NNC",
+      TRUE                                             ~ "Other"
+    )
+  )
+
+cat("Matched to filtered DGEList:", nrow(sq_filt), "isoforms\n")
+
+```
+
+```{r helper-get-expressed}
+# Returns isoform IDs with at least one count across the given sample indices
+get_expressed <- function(dge, sample_idx) {
+  counts_sub <- dge$counts[, sample_idx, drop = FALSE]
+  rownames(counts_sub)[rowSums(counts_sub) > 0]
+}
+```
+
+# Total Isoforms — Known Vs Novel
+
+```{r q1-total}
+cat_table <- sq_filt %>%
+  count(structural_category, novelty, known_novel) %>%
+  arrange(desc(n)) %>%
+  mutate(pct = round(100 * n / sum(n), 2))
+
+cat("Structural category breakdown:\n")
+print(cat_table)
+
+kn_table <- sq_filt %>%
+  count(known_novel) %>%
+  mutate(pct = round(100 * n / sum(n), 2))
+
+cat("\nKnown vs Novel:\n")
+print(kn_table)
+
+cat("\nTotal isoforms:", nrow(sq_filt), "\n")
+cat("Unique genes:",    length(unique(sq_filt$associated_gene)), "\n")
+
+# ── Claims 1.1.1 (two of its five values) and 1.1.3 ───────────────────────────────────
+# THE ISOFORM UNIVERSE IS NOT DMSO-RESTRICTED, even though this report's DGEList is.
+# load-dgelist:101 subsets dge_filt by COLUMN (samples), so rownames -- the isoform set --
+# are untouched, and sq_filt is defined by `isoform %in% rownames(dge_filt$counts)`. Every
+# count in this chunk therefore spans all 26 samples' isoforms. The DMSO restriction bites on
+# the per-cell-type EXPRESSION questions further down (q2-*), not here, and conflating the two
+# is exactly what produced the 1.3.4 defect.
+UNIVERSE_POP <- paste("isoforms in the filtered long-read DGEList that also carry a SQANTI3",
+                      "classification row; the four primary cell types' isoform set, NOT",
+                      "restricted by treatment -- the DMSO filter at load-dgelist subsets",
+                      "samples, not isoforms")
+claim_emit("1.1.1", "expressed isoforms", nrow(sq_filt),
+           published = "162,800", n = nrow(sq_filt), population = UNIVERSE_POP)
+claim_emit("1.1.1", "genes with an expressed isoform",
+           length(unique(sq_filt$associated_gene)), published = "18,270",
+           n = nrow(sq_filt), population = UNIVERSE_POP)
+
+# 1.1.3 -- the SQANTI structural-category breakdown. One emission per number: the sentence
+# states seven, and a single row declaring all seven would be matched set-wise with no
+# positional pairing.
+.cat_n   <- function(cs) sum(sq_filt$category_short == cs)
+.kn_pct  <- function(kn) 100 * sum(sq_filt$known_novel == kn) / nrow(sq_filt)
+SQANTI_POP <- paste(UNIVERSE_POP, "| structural category as called by SQANTI3 against the",
+                    "GENCODE v49 reference GTF")
+claim_emit("1.1.3", "full splice match (FSM) isoforms", .cat_n("FSM"),
+           published = "55,770", n = nrow(sq_filt), population = SQANTI_POP)
+claim_emit("1.1.3", "incomplete splice match (ISM) isoforms", .cat_n("ISM"),
+           published = "31,667", n = nrow(sq_filt), population = SQANTI_POP)
+claim_emit("1.1.3", "FSM + ISM share of isoforms (%)", .kn_pct("Known"),
+           published = "53.7", n = nrow(sq_filt), population = SQANTI_POP)
+claim_emit("1.1.3", "novel in catalog (NIC) isoforms", .cat_n("NIC"),
+           published = "44,193", n = nrow(sq_filt), population = SQANTI_POP)
+claim_emit("1.1.3", "novel not in catalog (NNC) isoforms", .cat_n("NNC"),
+           published = "28,045", n = nrow(sq_filt), population = SQANTI_POP)
+claim_emit("1.1.3", "NIC + NNC share of isoforms (%)", .kn_pct("Novel"),
+           published = "44.4", n = nrow(sq_filt), population = SQANTI_POP)
+claim_emit("1.1.3", "other structural class share of isoforms (%)", .kn_pct("Other"),
+           published = "1.9", n = nrow(sq_filt), population = SQANTI_POP)
+
+```
+
+```{r q1-barplot, fig.width=10, fig.height=6}
+p_cat <- ggplot(cat_table, aes(x = reorder(novelty, n), y = n, fill = known_novel)) +
+  geom_col(alpha = 0.8) +
+  geom_text(aes(label = paste0(comma(n), " (", pct, "%)")), hjust = -0.05, size = 3.5) +
+  coord_flip() +
+  scale_fill_manual(values = c("Known" = "steelblue",
+                               "Novel" = "coral",
+                               "Other" = "gray60")) +
+  scale_y_continuous(labels = comma) +
+  labs(title    = "SQANTI3 Structural Categories",
+       subtitle = paste0("Total: ", comma(nrow(sq_filt)),
+                         " isoforms from ",
+                         comma(length(unique(sq_filt$associated_gene))),
+                         " genes"),
+       x = NULL, y = "Number Of Isoforms", fill = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title      = element_text(face = "bold"),
+        plot.subtitle   = element_text(color = "grey40"),
+        legend.position = "top") +
+  expand_limits(y = max(cat_table$n) * 1.25)
+
+print(p_cat)
+
+ggsave(file.path(OUTPUT_DIR, "structural_categories.png"),
+       p_cat, width = 10, height = 6, dpi = 300, bg = "white")
+```
+
+# Structural Classes By Cell Type
+
+```{r q4-by-ct}
+cat_by_ct <- list()
+for (ct_i in cts) {
+  idx       <- which(as.character(samp_filt$ct) == ct_i)
+  expressed <- get_expressed(dge_filt, idx)
+
+  ct_sq <- sq_filt %>% filter(isoform %in% expressed)
+  cat_by_ct[[ct_i]] <- ct_sq %>%
+    count(category_short) %>%
+    mutate(ct  = ct_i,
+           pct = round(100 * n / sum(n), 2),
+           category_short = factor(category_short, levels = CAT_ORDER))
+}
+
+cat_by_ct_df <- bind_rows(cat_by_ct)
+print(cat_by_ct_df %>% arrange(ct, category_short))
+
+```
+
+```{r q4-stacked, fig.width=12, fig.height=7}
+p_cat_ct <- ggplot(cat_by_ct_df, aes(x = ct, y = n, fill = category_short)) +
+  geom_col(alpha = 0.8) +
+  geom_text(aes(label = comma(n)),
+            position = position_stack(vjust = 0.5), size = 3.5) +
+  scale_fill_manual(values = c("FSM"   = "#2166AC",
+                               "ISM"   = "#67A9CF",
+                               "NIC"   = "#EF8A62",
+                               "NNC"   = "#B2182B",
+                               "Other" = "gray70")) +
+  scale_y_continuous(labels = comma) +
+  labs(title    = "Structural Categories By Cell Type",
+       subtitle = "Number of expressed isoforms in analysis set",
+       x = "Cell Type", y = "Number Of Isoforms", fill = "Category") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title      = element_text(face = "bold"),
+        plot.subtitle   = element_text(color = "grey40"),
+        legend.position = "top")
+
+print(p_cat_ct)
+
+ggsave(file.path(OUTPUT_DIR, "structural_categories_by_ct.png"),
+       p_cat_ct, width = 12, height = 7, dpi = 300, bg = "white")
+```
+
+## Isoforms Per Gene
+
+```{r iso-per-gene}
+# Verify the gene column exists. SQANTI3 typically uses `associated_gene`
+# but some pipelines rename it. Print available cols on failure.
+gene_col <- intersect(c("associated_gene", "associated_genes", "gene", "gene_id"),
+                      colnames(sq_filt))[1]
+if (is.na(gene_col)) {
+  stop("No gene column found in sq_filt. Available columns:\n  ",
+       paste(colnames(sq_filt), collapse = ", "))
+}
+cat("Using gene column:", gene_col, "\n\n")
+
+# Per-gene isoform count, base R to dodge namespace-masking traps
+gene_vec <- sq_filt[[gene_col]]
+gene_vec <- gene_vec[!is.na(gene_vec) & gene_vec != ""]
+
+iso_per_gene <- as.data.frame(
+  table(associated_gene = gene_vec),
+  stringsAsFactors = FALSE
+)
+colnames(iso_per_gene) <- c("associated_gene", "n_isoforms")
+iso_per_gene <- iso_per_gene[order(-iso_per_gene$n_isoforms), ]
+rownames(iso_per_gene) <- NULL
+
+cat("Isoforms per gene (filtered set):\n")
+cat("  Genes:                       ", nrow(iso_per_gene), "\n")
+cat("  Total isoforms accounted for:", sum(iso_per_gene$n_isoforms), "\n")
+cat("  Median:                      ", median(iso_per_gene$n_isoforms), "\n")
+cat("  Mean:                        ", round(mean(iso_per_gene$n_isoforms), 2), "\n")
+cat("  IQR (Q1, Q3):                ",
+    quantile(iso_per_gene$n_isoforms, 0.25), ", ",
+    quantile(iso_per_gene$n_isoforms, 0.75), "\n")
+cat("  Max:                         ", max(iso_per_gene$n_isoforms), "\n\n")
+
+multi_iso  <- sum(iso_per_gene$n_isoforms >= 2)
+single_iso <- sum(iso_per_gene$n_isoforms == 1)
+ge10_iso   <- sum(iso_per_gene$n_isoforms >= 10)
+
+cat("Genes with multiple isoforms (>=2):",
+    multi_iso, " (",
+    round(100 * multi_iso / nrow(iso_per_gene), 1), "%)\n", sep = "")
+cat("Genes with a single isoform:       ",
+    single_iso, " (",
+    round(100 * single_iso / nrow(iso_per_gene), 1), "%)\n", sep = "")
+cat("Genes with >=10 isoforms:          ",
+    ge10_iso, " (",
+    round(100 * ge10_iso / nrow(iso_per_gene), 1), "%)\n", sep = "")
+
+# Distribution table (capped at 20+) — base R aggregate
+bin_vec  <- ifelse(iso_per_gene$n_isoforms >= 20, "20+",
+                   as.character(iso_per_gene$n_isoforms))
+dist_tbl <- as.data.frame(table(bin = bin_vec), stringsAsFactors = FALSE)
+colnames(dist_tbl) <- c("bin", "n_genes")
+dist_tbl$bin_num <- ifelse(dist_tbl$bin == "20+", 20L, as.integer(dist_tbl$bin))
+dist_tbl <- dist_tbl[order(dist_tbl$bin_num), ]
+dist_tbl$pct <- round(100 * dist_tbl$n_genes / sum(dist_tbl$n_genes), 2)
+rownames(dist_tbl) <- NULL
+
+cat("\nDistribution of isoforms per gene (capped at 20+):\n")
+print(dist_tbl[, c("bin", "n_genes", "pct")], row.names = FALSE)
+
+# ── Claim 1.1.4 — the isoforms-per-gene distribution, ten stated numbers ──────────────
+IPG_POP <- paste("genes with at least one isoform in the filtered long-read DGEList that",
+                 "carries a SQANTI3 classification row; one row per gene, counting its",
+                 "isoforms. Not restricted by treatment or cell type")
+claim_emit("1.1.4", "median isoforms per gene", median(iso_per_gene$n_isoforms),
+           published = "5", n = nrow(iso_per_gene), population = IPG_POP)
+claim_emit("1.1.4", "mean isoforms per gene", mean(iso_per_gene$n_isoforms),
+           published = "8.9", n = nrow(iso_per_gene), population = IPG_POP)
+claim_emit("1.1.4", "isoforms per gene, 25th percentile",
+           unname(quantile(iso_per_gene$n_isoforms, 0.25)),
+           published = "2", n = nrow(iso_per_gene), population = IPG_POP)
+claim_emit("1.1.4", "isoforms per gene, 75th percentile",
+           unname(quantile(iso_per_gene$n_isoforms, 0.75)),
+           published = "13", n = nrow(iso_per_gene), population = IPG_POP)
+claim_emit("1.1.4", "maximum isoforms in one gene", max(iso_per_gene$n_isoforms),
+           published = "97", n = nrow(iso_per_gene), population = IPG_POP)
+claim_emit("1.1.4", "genes with two or more isoforms (count)", multi_iso,
+           published = "13,941", n = nrow(iso_per_gene), population = IPG_POP)
+claim_emit("1.1.4", "genes with two or more isoforms (%)",
+           100 * multi_iso / nrow(iso_per_gene),
+           published = "76.3", n = nrow(iso_per_gene), population = IPG_POP)
+claim_emit("1.1.4", "genes with ten or more isoforms (count)", ge10_iso,
+           published = "5,963", n = nrow(iso_per_gene), population = IPG_POP)
+claim_emit("1.1.4", "genes with ten or more isoforms (%)",
+           100 * ge10_iso / nrow(iso_per_gene),
+           published = "32.6", n = nrow(iso_per_gene), population = IPG_POP)
+
+# Bind into the names the histogram chunk expects
+dist_table <- dist_tbl
+
+```
+
+```{r iso-per-gene-hist, fig.width=10, fig.height=6}
+p_ipg <- ggplot(iso_per_gene %>% dplyr::mutate(capped = pmin(n_isoforms, 20)),
+                aes(x = capped)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "white", alpha = 0.85) +
+  scale_x_continuous(breaks = c(1, 5, 10, 15, 20),
+                     labels = c("1", "5", "10", "15", "20+")) +
+  scale_y_continuous(labels = comma) +
+  labs(title    = "Isoforms Per Gene",
+       subtitle = paste0(comma(nrow(iso_per_gene)), " genes | ",
+                         comma(sum(iso_per_gene$n_isoforms)), " isoforms | ",
+                         "median ", median(iso_per_gene$n_isoforms),
+                         ", mean ", round(mean(iso_per_gene$n_isoforms), 1),
+                         ", max ", max(iso_per_gene$n_isoforms)),
+       x = "Number Of Isoforms (capped at 20+)",
+       y = "Number Of Genes") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(color = "grey40"))
+
+print(p_ipg)
+
+ggsave(file.path(OUTPUT_DIR, "isoforms_per_gene.png"),
+       p_ipg, width = 10, height = 6, dpi = 300, bg = "white")
+```
+
+```{r iso-per-gene-save}
+fwrite(iso_per_gene, file.path(OUTPUT_DIR, "isoforms_per_gene.csv"))
+fwrite(dist_table %>% dplyr::select(bin, n_genes, pct),
+       file.path(OUTPUT_DIR, "isoforms_per_gene_distribution.csv"))
+
+```
+# Expressed Isoforms By Cell Type
+
+## Per Cell Type, Per Treatment
+
+```{r q2-unique}
+ct_isoforms <- list()
+for (ct_i in cts) {
+  idx <- which(as.character(samp_filt$ct) == ct_i)
+  ct_isoforms[[ct_i]] <- get_expressed(dge_filt, idx)
+}
+
+ct_summary <- data.frame(
+  ct          = names(ct_isoforms),
+  n_expressed = sapply(ct_isoforms, length),
+  stringsAsFactors = FALSE
+) %>% arrange(desc(n_expressed))
+
+cat("Expressed isoforms per cell type:\n"); print(ct_summary)
+
+ct_treat_list <- list()
+for (ct_i in cts) {
+  for (trt in c("DMSO", "Smg1i")) {
+    idx <- which(as.character(samp_filt$ct) == ct_i &
+                 as.character(samp_filt$treatment) == trt)
+    if (length(idx) == 0) next
+    n_expr <- length(get_expressed(dge_filt, idx))
+    ct_treat_list[[paste(ct_i, trt)]] <- data.frame(
+      ct = ct_i, treatment = trt, n_expressed = n_expr, stringsAsFactors = FALSE
+    )
+  }
+}
+ct_treat_df <- bind_rows(ct_treat_list)
+cat("\nBy cell type and treatment:\n")
+print(ct_treat_df %>% arrange(ct, treatment))
+```
+
+## Cell-Type-Specific Vs Shared in Both Conditions
+
+```{r q2-sharing-counts}
+all_iso <- unique(unlist(ct_isoforms))
+
+# Long table: one row per (isoform, ct) where the isoform was expressed in ct
+iso_long <- rbindlist(lapply(names(ct_isoforms), function(ct_i) {
+  data.table(isoform = ct_isoforms[[ct_i]], ct = ct_i)
+}))
+
+iso_ct_count <- iso_long[, .(n_cts = uniqueN(ct)), by = isoform]
+
+cat("Isoforms specific to a single cell type:\n")
+# CAPTURED INTO A NAMED OBJECT rather than only printed: claims 1.3.4 and 1.3.5 are both
+# computed from these counts, and a number that exists only inside a cat() cannot be emitted.
+ct_specific <- setNames(
+  vapply(names(ct_isoforms),
+         function(ct_i) iso_ct_count[n_cts == 1 & isoform %in% ct_isoforms[[ct_i]], .N],
+         integer(1)),
+  names(ct_isoforms))
+for (ct_i in names(ct_isoforms)) {
+  cat("  ", ct_i, ":", ct_specific[[ct_i]], "\n")
+}
+
+# ── Claims 1.3.5 and 1.3.4 — AND THE POPULATION SPLIT BETWEEN THEM ────────────────────
+# THESE TWO SENTENCES ARE ADJACENT IN THE PAPER AND ARE COMPUTED OVER DIFFERENT SAMPLE SETS.
+# This report restricts to DMSO at load-dgelist:101 (`trt_char == "DMSO"`), so every count
+# here is over the DMSO samples of the four primary cell types.
+#
+#   1.3.5's four COUNTS (8,087 / 2,267 / 2,015 / 1,131) reproduce EXACTLY on that DMSO set.
+#   1.3.4's PERCENTAGE RANGE (0.36-2.24%) does NOT: the DMSO set gives 0.88-5.48%. The
+#   published range reproduces exactly over ALL 26 SAMPLES instead.
+#
+# So the paragraph quotes DMSO-restricted counts and all-sample percentages side by side, and
+# neither sentence names its sample set. The denominators are emitted alongside the numerators
+# below so the mismatch is visible in the record rather than inferable from it.
+SPECIFIC_POP <- paste("isoforms detected (>=1 count) in exactly ONE of the four primary cell",
+                      "types, out of the isoforms detected in that cell type. DMSO SAMPLES",
+                      "ONLY -- load-dgelist:101 restricts this report to trt_char == 'DMSO',",
+                      "so the 13 Smg1i samples contribute nothing to either the numerator or",
+                      "the denominator")
+for (ct_i in names(ct_specific)) {
+  claim_emit("1.3.5", sprintf("cell type-restricted isoforms, %s (count)", ct_i),
+             ct_specific[[ct_i]],
+             published = switch(ct_i, LAE = "8,087", AT2 = "2,267",
+                                MV = "2,015", FB = "1,131", NULL),
+             n = length(ct_isoforms[[ct_i]]), population = SPECIFIC_POP)
+  claim_emit("1.3.5", sprintf("isoforms expressed in %s (denominator)", ct_i),
+             length(ct_isoforms[[ct_i]]),
+             n = length(ct_isoforms[[ct_i]]), population = SPECIFIC_POP)
+}
+
+# 1.3.4 -- the share, which is where the population defect surfaces. Emitted against the
+# published endpoints so the disagreement is recorded, per the project's rule that a differing
+# value is a finding about the paper rather than a bug to fix.
+ct_specific_pct <- vapply(names(ct_specific),
+                          function(ct_i) 100 * ct_specific[[ct_i]] /
+                                         length(ct_isoforms[[ct_i]]),
+                          numeric(1))
+claim_emit("1.3.4", "lowest cell type-restricted share across cell types (%)",
+           min(ct_specific_pct), published = "0.88",
+           n = length(all_iso), population = SPECIFIC_POP)
+claim_emit("1.3.4", "highest cell type-restricted share across cell types (%)",
+           max(ct_specific_pct), published = "5.48",
+           n = length(all_iso), population = SPECIFIC_POP)
+for (ct_i in names(ct_specific_pct)) {
+  claim_emit("1.3.4", sprintf("cell type-restricted share, %s (%%)", ct_i),
+             ct_specific_pct[[ct_i]], n = length(ct_isoforms[[ct_i]]),
+             population = SPECIFIC_POP)
+}
+
+cat("\nExpressed across any cell type:", length(all_iso), "\n")
+cat("Expressed in all", length(ct_isoforms), "cell types:",
+    iso_ct_count[n_cts == length(ct_isoforms), .N], "\n")
+
+```
+
+```{r seem ct specific}
+# Does NMD make isoforms look cell-type-restricted? Compare DMSO-only vs SMG1i-only
+# expression breadth (equal sample numbers per CT per treatment).
+MINCOUNT <- 1   # reads required...
+MINSAMP  <- 1   # ...in at least this many samples of a CT×treatment to call "expressed"
+
+# Reload the FULL DGEList (both treatments). 4-CT-native: the input already contains only
+# the four manuscript cell types, so this asserts scope rather than filtering it. The old
+# `!(ct == "DO_ALI" & id == "029T")` clause was already dead code even on 6-CT input --
+# DO_ALI is not in CT_KEEP, so `ct %in% CT_KEEP` had excluded it first.
+dge_all <- readRDS(DGE_FILT_PATH)
+# Relabel ct to display names AFTER loading (AT -> AT2, DD -> LAE)
+dge_all$samples$ct <- relabel_ct(dge_all$samples$ct)
+
+sc <- as.character(dge_all$samples$ct)
+stopifnot("input carries cell types outside the manuscript scope" = setequal(unique(sc), CT_KEEP))
+cat(sprintf("4-CT-native input verified (%s): %d samples.\n",
+            paste(CT_KEEP, collapse = ", "), ncol(dge_all)))
+sampA   <- dge_all$samples
+ctsA    <- sort(unique(as.character(sampA$ct)))
+all_iso <- rownames(dge_all$counts)
+
+# expressed-isoform logical vector for one CT × treatment
+expr_vec <- function(ct_i, trt){
+  idx <- which(as.character(sampA$ct) == ct_i & as.character(sampA$treatment) == trt)
+  if (length(idx) == 0) return(setNames(rep(FALSE, length(all_iso)), all_iso))
+  rowSums(dge_all$counts[, idx, drop = FALSE] >= MINCOUNT) >= MINSAMP
+}
+mat_dmso <- sapply(ctsA, expr_vec, trt = "DMSO")   # isoform × CT logical
+mat_smg  <- sapply(ctsA, expr_vec, trt = "Smg1i")
+rownames(mat_dmso) <- all_iso; rownames(mat_smg) <- all_iso
+
+n_dmso <- rowSums(mat_dmso); n_smg <- rowSums(mat_smg)
+cat(sprintf("Samples per CT×treatment:\n")); print(table(sampA$ct, sampA$treatment))
+
+# ---- isoforms that look CT-restricted under DMSO (expressed in exactly 1 CT) ----
+restr_dmso <- all_iso[n_dmso == 1]
+# for each, the CTs it gains under SMG1i that it did NOT have in DMSO
+gained_other <- rowSums(mat_smg[restr_dmso, , drop = FALSE] & !mat_dmso[restr_dmso, , drop = FALSE])
+res <- data.frame(
+  isoform   = restr_dmso,
+  dmso_ct   = ctsA[apply(mat_dmso[restr_dmso, , drop = FALSE], 1, which.max)],
+  n_ct_smg  = n_smg[restr_dmso],
+  gained_cts_under_smg = gained_other,
+  unmasked  = gained_other >= 1,         # appears in >=1 OTHER CT only under SMG1i
+  stringsAsFactors = FALSE
+)
+cat(sprintf("\nDMSO-restricted isoforms (1 CT): %d\n", nrow(res)))
+cat(sprintf("  ...appearing in >=1 OTHER CT under SMG1i (NMD-masked elsewhere): %d (%.1f%%)\n",
+            sum(res$unmasked), 100*mean(res$unmasked)))
+cat("  Breakdown by the cell type they were 'restricted' to (DMSO):\n")
+print(res %>% group_by(dmso_ct) %>%
+        summarise(n_restricted = n(), n_unmasked = sum(unmasked),
+                  pct_unmasked = round(100*mean(unmasked),1), .groups="drop"))
+
+# ---- symmetric control: restricted under SMG1i, do they expand under DMSO? ----
+restr_smg <- all_iso[n_smg == 1]
+gained_d  <- rowSums(mat_dmso[restr_smg, , drop = FALSE] & !mat_smg[restr_smg, , drop = FALSE])
+cat(sprintf("\nCONTROL — SMG1i-restricted isoforms (1 CT): %d; appearing in >=1 OTHER CT under DMSO: %d (%.1f%%)\n",
+            length(restr_smg), sum(gained_d >= 1), 100*mean(gained_d >= 1)))
+cat("If the DMSO->SMG1i unmasking rate is much higher than this control, the apparent CT-restriction is NMD-driven, not detection noise.\n")
+
+fwrite(res, file.path(OUTPUT_DIR, "ct_restriction_nmd_unmasking.csv"))
+```
+
+```{r q2-unique-barplot-split, fig.width=10, fig.height=8}
+unique_sharing <- data.frame(
+  ct      = names(ct_isoforms),
+  n_total = sapply(ct_isoforms, length),
+  n_specific = sapply(names(ct_isoforms), function(ct_i) {
+    specific_isos <- iso_ct_count[n_cts == 1, isoform]
+    sum(ct_isoforms[[ct_i]] %in% specific_isos)
+  }),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(n_shared = n_total - n_specific) %>%
+  pivot_longer(cols = c(n_shared, n_specific),
+               names_to = "category", values_to = "n") %>%
+  mutate(category = ifelse(category == "n_specific",
+                           "Cell-Type-Specific",
+                           "Shared (2+ Cell Types)"))
+
+# Order x-axis by total count
+ct_order <- unique_sharing %>%
+  group_by(ct) %>%
+  summarise(total = sum(n), .groups = "drop") %>%
+  arrange(desc(total)) %>%
+  pull(ct)
+unique_sharing$ct <- factor(unique_sharing$ct, levels = ct_order)
+
+fill_vals <- c("Cell-Type-Specific"     = "#F4A582",
+               "Shared (2+ Cell Types)" = "#2166AC")
+
+# Split-axis layout: top panel zooms into the shared bulk, bottom panel
+# resolves the much smaller cell-type-specific counts.
+p_top <- ggplot(unique_sharing, aes(x = ct, y = n, fill = category)) +
+  geom_col(alpha = 0.8) +
+  geom_text(aes(label = comma(n)), position = position_stack(vjust = 0.5), size = 3.5) +
+  scale_fill_manual(values = fill_vals) +
+  scale_y_continuous(labels = comma) +
+  coord_cartesian(ylim = c(125000, NA)) +
+  labs(title    = "Expressed Isoforms Per Cell Type: Shared Vs Cell-Type-Specific",
+       subtitle = "Cell-type-specific = expressed in only one cell type",
+       y = NULL, x = NULL, fill = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title      = element_text(face = "bold"),
+        plot.subtitle   = element_text(color = "grey40"),
+        legend.position = "top",
+        axis.text.x     = element_blank(),
+        axis.ticks.x    = element_blank(),
+        plot.margin     = margin(5, 5, 2, 5))
+
+p_bottom <- ggplot(unique_sharing, aes(x = ct, y = n, fill = category)) +
+  geom_col(alpha = 0.8) +
+  scale_fill_manual(values = fill_vals) +
+  scale_y_continuous(labels = comma) +
+  coord_cartesian(ylim = c(0, 50000)) +
+  labs(x = "Cell Type", y = NULL, fill = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none",
+        plot.margin     = margin(2, 5, 5, 5))
+
+p_combined <- p_top / plot_spacer() / p_bottom +
+  plot_layout(heights = c(3, 0.15, 1))
+
+p_final <- wrap_elements(p_combined) +
+  labs(tag = "Number Of Expressed Isoforms") +
+  theme(plot.tag          = element_text(size = 13, angle = 90),
+        plot.tag.position = "left")
+
+print(p_final)
+
+ggsave(file.path(OUTPUT_DIR, "expressed_isoforms_shared_vs_specific.png"),
+       p_final, width = 10, height = 8, dpi = 300, bg = "white")
+
+```
+
+# Isoform Length Distribution
+
+## Overall — Known Vs Novel
+
+```{r q3-overall-density, fig.width=12, fig.height=6}
+sq_filt_len <- sq_filt %>% filter(!is.na(length))
+
+p_len_overall <- ggplot(sq_filt_len, aes(x = log10(length), color = known_novel)) +
+  geom_freqpoly(bins = 80, linewidth = 1) +
+  scale_color_manual(values = c("Known" = "steelblue",
+                                "Novel" = "coral",
+                                "Other" = "gray60")) +
+  labs(title    = "Isoform Length Distribution",
+       subtitle = paste0("All ", comma(nrow(sq_filt_len)),
+                         " isoforms — SQANTI3 transcript length"),
+       x = "log10(Isoform Length, bp)", y = "Number Of Isoforms", color = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title      = element_text(face = "bold"),
+        plot.subtitle   = element_text(color = "grey40"),
+        legend.position = "top")
+
+print(p_len_overall)
+
+ggsave(file.path(OUTPUT_DIR, "length_distribution.png"),
+       p_len_overall, width = 12, height = 6, dpi = 300, bg = "white")
+
+cat("Length by known/novel:\n")
+sq_filt %>%
+  filter(!is.na(length)) %>%
+  group_by(known_novel) %>%
+  summarise(n      = n(),
+            median = median(length),
+            mean   = round(mean(length), 1),
+            Q1     = quantile(length, 0.25),
+            Q3     = quantile(length, 0.75),
+            .groups = "drop") %>%
+  print()
+```
+
+## Build Per-Treatment Length Table
+
+```{r build-length-data}
+length_data <- list()
+for (ct_i in cts) {
+  for (trt in c("DMSO", "Smg1i")) {
+    idx <- which(as.character(samp_filt$ct) == ct_i &
+                 as.character(samp_filt$treatment) == trt)
+    if (length(idx) == 0) next
+    expressed <- get_expressed(dge_filt, idx)
+    length_data[[paste(ct_i, trt)]] <- sq_filt %>%
+      filter(isoform %in% expressed, !is.na(length)) %>%
+      select(isoform, length, known_novel, category_short) %>%
+      mutate(ct = ct_i, treatment = trt)
+  }
+}
+length_data <- bind_rows(length_data)
+
+cat("length_data:", nrow(length_data), "rows\n")
+cat("Cell types:", paste(sort(unique(length_data$ct)), collapse = ", "), "\n")
+cat("Treatments:", paste(unique(length_data$treatment), collapse = ", "), "\n")
+
+```
+
+
+## By Cell Type And Treatment
+
+```{r q3-by-ct-density, fig.width=14, fig.height=10}
+p_len_ct <- ggplot(length_data, aes(x = log10(length), color = treatment)) +
+  geom_freqpoly(bins = 80, linewidth = 0.8) +
+  facet_wrap(~ ct, ncol = 2, scales = "free_y") +
+  scale_color_manual(values = c("DMSO" = "orange", "Smg1i" = "purple")) +
+  labs(title = "Isoform Length By Cell Type And Treatment",
+       x = "log10(Isoform Length, bp)", y = "Number Of Isoforms", color = "Treatment") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title      = element_text(face = "bold"),
+        strip.text      = element_text(face = "bold", size = 13),
+        legend.position = "top")
+
+print(p_len_ct)
+
+ggsave(file.path(OUTPUT_DIR, "length_distribution_by_ct_treatment.png"),
+       p_len_ct, width = 14, height = 10, dpi = 300, bg = "white")
+```
+
+```{r q3-stats}
+# ── Claim 1.1.2 — "length distributions were unimodal and centered near 2.5 kb" ────────
+# THREE ASSERTIONS, ONLY ONE OF WHICH IS A NUMBER. "centered near 2.5 kb" is an approximation
+# to one significant decimal, not a point estimate, so the median is recorded as SUPPORTING --
+# emitting it against published = 2.5 would score the computed 2.58 kb as a disagreement for a
+# claim the ledger adjudicates as reproducing. "Unimodal" and "minimal variation across cell
+# types or treatments" are NOT MEASURED by this chunk and no emission pretends otherwise; the
+# modal 100-nt bin is 1,800-1,900 nt, so "centered" matches the median rather than the mode.
+.len <- sq_filt$length[!is.na(sq_filt$length)]
+LENGTH_POP <- paste("SQANTI3 transcript length over the isoform universe (all isoforms in the",
+                    "filtered DGEList with a classification row and a non-missing length);",
+                    "not restricted by treatment or cell type")
+claim_emit("1.1.2", "median isoform length in kb (paper states ~2.5 kb)",
+           median(.len) / 1000, n = length(.len), population = LENGTH_POP)
+claim_emit("1.1.2", "median isoform length (nt)", median(.len),
+           n = length(.len), population = LENGTH_POP)
+claim_emit("1.1.2", "mean isoform length (nt)", mean(.len),
+           n = length(.len), population = LENGTH_POP)
+
+cat("--- Length Stats By Treatment ---\n")
+length_data %>%
+  group_by(treatment) %>%
+  summarise(n = n(), min = min(length), Q1 = quantile(length, 0.25),
+            median = median(length), mean = round(mean(length), 1),
+            Q3 = quantile(length, 0.75), max = max(length),
+            .groups = "drop") %>%
+  print()
+
+cat("\n--- Length Stats By Cell Type And Treatment ---\n")
+length_data %>%
+  group_by(ct, treatment) %>%
+  summarise(n = n(), min = min(length), Q1 = quantile(length, 0.25),
+            median = median(length), mean = round(mean(length), 1),
+            Q3 = quantile(length, 0.75), max = max(length),
+            .groups = "drop") %>%
+  print()
+
+```
+
+# Pairwise Expression Similarity Across Cell Types
+
+## Build Mean Log-CPM Matrices
+
+```{r build-cpm-matrices}
+# Helper: mean log-CPM per cell type, optionally restricted to one treatment
+build_cpm_matrix <- function(dge, samp, cts, treatment = NULL) {
+  out <- list()
+  for (ct_i in cts) {
+    idx <- if (is.null(treatment)) {
+      which(as.character(samp$ct) == ct_i)
+    } else {
+      which(as.character(samp$ct) == ct_i &
+            as.character(samp$treatment) == treatment)
+    }
+    if (length(idx) == 0) next
+    ct_cpm    <- cpm(dge[, idx], log = TRUE, prior.count = 1)
+    out[[ct_i]] <- rowMeans(ct_cpm)
+  }
+  do.call(cbind, out)
+}
+
+cpm_ct_mat    <- build_cpm_matrix(dge_filt, samp_filt, cts)
+cpm_dmso_mat  <- build_cpm_matrix(dge_filt, samp_filt, cts, treatment = "DMSO")
+cpm_smg1i_mat <- build_cpm_matrix(dge_filt, samp_filt, cts, treatment = "Smg1i")
+
+# Combined: each isoform contributes one point per treatment, stacked vertically
+cts_shared <- intersect(colnames(cpm_dmso_mat), colnames(cpm_smg1i_mat))
+cpm_combined_mat <- rbind(cpm_dmso_mat[, cts_shared, drop = FALSE],
+                          cpm_smg1i_mat[, cts_shared, drop = FALSE])
+
+cat("All-samples matrix:", dim(cpm_ct_mat),    "\n")
+cat("DMSO matrix:       ", dim(cpm_dmso_mat),  "\n")
+cat("Smg1i matrix:      ", dim(cpm_smg1i_mat), "\n")
+cat("Combined matrix:   ", dim(cpm_combined_mat), "\n")
+```
+
+## Spearman And Pearson Across All Samples
+
+```{r corr-all}
+cor_pearson  <- cor(cpm_ct_mat, method = "pearson")
+cor_spearman <- cor(cpm_ct_mat, method = "spearman")
+
+cat("Pearson correlation:\n");  print(round(cor_pearson,  3))
+cat("\nSpearman correlation:\n"); print(round(cor_spearman, 3))
+
+# ── Claim 1.3.3 — pairwise Spearman between cell types ────────────────────────────────
+# The claim names ONE pair (FB-MV) and a RANGE for AT2/LAE against the others, so three
+# numbers, emitted separately. The range's endpoints are computed from the off-diagonal
+# entries involving AT2 or LAE -- taking them from the whole matrix would silently include
+# the FB-MV pair the sentence contrasts them WITH.
+CORR_POP <- paste("mean log-CPM per cell type over the DMSO samples of the four primary cell",
+                  "types (load-dgelist:101 restricts this report to DMSO), correlated across",
+                  "the isoform universe; Spearman on cell-type mean profiles, not on samples")
+.sp <- function(a, b) cor_spearman[a, b]
+claim_emit("1.3.3", "Spearman correlation, FB vs MV", .sp("FB", "MV"),
+           published = "0.80", n = nrow(cpm_ct_mat), population = CORR_POP)
+.focal <- intersect(c("AT2", "LAE"), rownames(cor_spearman))
+.pairs <- unlist(lapply(.focal, function(f)
+  lapply(setdiff(colnames(cor_spearman), f), function(o) cor_spearman[f, o])))
+claim_emit("1.3.3", "lowest Spearman of AT2 or LAE against another cell type",
+           min(.pairs), published = "0.51", n = nrow(cpm_ct_mat), population = CORR_POP)
+claim_emit("1.3.3", "highest Spearman of AT2 or LAE against another cell type",
+           max(.pairs), published = "0.64", n = nrow(cpm_ct_mat), population = CORR_POP)
+
+```
+
+## Jaccard Similarity Of Expressed Isoform Sets
+
+```{r jaccard}
+jaccard_mat <- matrix(NA, length(cts), length(cts), dimnames = list(cts, cts))
+for (i in seq_along(cts)) {
+  for (j in seq_along(cts)) {
+    a <- ct_isoforms[[cts[i]]]
+    b <- ct_isoforms[[cts[j]]]
+    jaccard_mat[i, j] <- length(intersect(a, b)) / length(union(a, b))
+  }
+}
+print(round(jaccard_mat, 3))
+
+# ── Claim 1.3.7 — pairwise Jaccard range ──────────────────────────────────────────────
+# OFF-DIAGONAL ONLY. The diagonal is 1 by construction (a set against itself), so including
+# it would put 1.00 in the range and make the published 0.78-0.85 look wrong for a reason
+# that has nothing to do with the data.
+.jac_off <- jaccard_mat[upper.tri(jaccard_mat)]
+JACCARD_POP <- paste("pairwise Jaccard index between the sets of isoforms detected (>=1 count)",
+                     "in each pair of the four primary cell types, DMSO samples only",
+                     "(load-dgelist:101); off-diagonal pairs only, since the diagonal is 1 by",
+                     "construction. Binary detection, not expression level")
+claim_emit("1.3.7", "lowest pairwise Jaccard index between cell types", min(.jac_off),
+           published = "0.78", n = length(.jac_off), population = JACCARD_POP)
+claim_emit("1.3.7", "highest pairwise Jaccard index between cell types", max(.jac_off),
+           published = "0.85", n = length(.jac_off), population = JACCARD_POP)
+```
+
+```{r corr-jaccard-heatmaps, fig.width=10, fig.height=8}
+# --- Spearman heatmap (all samples) ---
+cor_df <- melt(cor_spearman)
+colnames(cor_df) <- c("CT1", "CT2", "Correlation")
+
+p_cor <- ggplot(cor_df, aes(x = CT1, y = CT2, fill = Correlation)) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(aes(label = round(Correlation, 2)),
+            size = 4, fontface = "bold",
+            color = ifelse(cor_df$Correlation > 0.85, "white", "grey20")) +
+  scale_fill_gradient2(low = "#D73027", mid = "white", high = "#2166AC",
+                       midpoint = min(cor_spearman),
+                       limits   = c(min(cor_spearman), 1),
+                       name = "Spearman r") +
+  labs(title    = "Pairwise Expression Similarity Across Cell Types",
+       subtitle = "Spearman correlation of mean log-CPM per isoform",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x   = element_text(angle = 45, hjust = 1, face = "bold", size = 14),
+        axis.text.y   = element_text(face = "bold", size = 14),
+        panel.grid    = element_blank(),
+        plot.title    = element_text(face = "bold", size = 16),
+        plot.subtitle = element_text(color = "grey40", size = 13))
+
+print(p_cor)
+
+ggsave(file.path(OUTPUT_DIR, "pairwise_expression_similarity_spearman.png"),
+       p_cor, width = 10, height = 8, dpi = 300, bg = "white")
+
+# --- Jaccard heatmap ---
+jac_df <- melt(jaccard_mat)
+colnames(jac_df) <- c("CT1", "CT2", "Jaccard")
+
+p_jac <- ggplot(jac_df, aes(x = CT1, y = CT2, fill = Jaccard)) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(aes(label = round(Jaccard, 2)),
+            size = 6, fontface = "bold", color = "black") +
+  scale_fill_gradient(low = "white", high = "#185FA5",
+                      limits = c(min(jaccard_mat), 1), name = "Jaccard") +
+  labs(title    = "Pairwise Isoform Overlap Across Cell Types",
+       subtitle = "Jaccard index of expressed isoform sets",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x   = element_text(angle = 45, hjust = 1, face = "bold", size = 14),
+        axis.text.y   = element_text(face = "bold", size = 14),
+        panel.grid    = element_blank(),
+        plot.title    = element_text(face = "bold", size = 16),
+        plot.subtitle = element_text(color = "grey40", size = 13))
+
+print(p_jac)
+
+ggsave(file.path(OUTPUT_DIR, "pairwise_isoform_overlap_jaccard.png"),
+       p_jac, width = 10, height = 8, dpi = 300, bg = "white")
+
+```
+
+## Pairwise Scatterplots
+
+Helper makes a single 3-column patchwork of scatterplots for any CPM matrix.
+Called three times: all samples, DMSO only, Smg1i only, and combined-stacked.
+
+```{r scatter-helper}
+make_pairwise_scatter <- function(cpm_mat, title, subtitle) {
+  ct_pairs <- combn(colnames(cpm_mat), 2, simplify = FALSE)
+
+  scatter_list <- lapply(ct_pairs, function(pair) {
+    ct1 <- pair[1]; ct2 <- pair[2]
+
+    df_pair <- data.frame(x = cpm_mat[, ct1], y = cpm_mat[, ct2])
+
+    r_s <- round(cor(df_pair$x, df_pair$y, method = "spearman"), 3)
+    r_p <- round(cor(df_pair$x, df_pair$y, method = "pearson"),  3)
+
+    ggplot(df_pair, aes(x = x, y = y)) +
+      geom_point(alpha = 0.05, size = 0.3, color = "grey30") +
+      geom_abline(slope = 1, intercept = 0,
+                  linetype = "dashed", color = "red", linewidth = 0.5) +
+      annotate("text",
+               x = min(df_pair$x) + 0.5, y = max(df_pair$y) - 0.5,
+               label = paste0("r[s] == ", r_s),
+               parse = TRUE, size = 4.5, hjust = 0, color = "#2166AC") +
+      annotate("text",
+               x = min(df_pair$x) + 0.5, y = max(df_pair$y) - 1.5,
+               label = paste0("r[p] == ", r_p),
+               parse = TRUE, size = 4.5, hjust = 0, color = "#D73027") +
+      labs(x = paste0(ct1, " (Mean log-CPM)"),
+           y = paste0(ct2, " (Mean log-CPM)")) +
+      theme_minimal(base_size = 11) +
+      theme(plot.margin = margin(5, 5, 5, 5))
+  })
+
+  wrap_plots(scatter_list, ncol = 3) +
+    plot_annotation(
+      title    = title,
+      subtitle = subtitle,
+      theme    = theme(plot.title    = element_text(face = "bold", size = 16),
+                       plot.subtitle = element_text(color = "grey40", size = 12))
+    )
+}
+```
+
+```{r pairwise-scatter-dmso, fig.width=14, fig.height=14}
+p_scatter_dmso <- make_pairwise_scatter(
+  cpm_dmso_mat,
+  title    = "Pairwise Isoform Expression: DMSO Only",
+  subtitle = "Mean log-CPM per isoform across DMSO samples"
+)
+print(p_scatter_dmso)
+
+ggsave(file.path(OUTPUT_DIR, "pairwise_expression_scatterplots_dmso.png"),
+       p_scatter_dmso, width = 14, height = 14, dpi = 300, bg = "white")
+
+cat("Spearman (DMSO):\n");  print(round(cor(cpm_dmso_mat,  method = "spearman"), 3))
+cat("\nPearson (DMSO):\n"); print(round(cor(cpm_dmso_mat,  method = "pearson"),  3))
+
+```
+```{r long_read_summary}
+library(dplyr)
+library(readr)
+library(tibble)
+
+counts_path <- file.path(.P$DEPOSIT, "nmd_isocall_counts_4ct.csv")
+
+counts <- read_csv(counts_path, show_col_types = FALSE)
+
+id_col <- names(counts)[1]
+sample_cols <- setdiff(names(counts), id_col)
+
+per_sample <- tibble(
+  sample = sample_cols,
+  assigned_reads = colSums(counts[sample_cols])
+) %>%
+  mutate(
+    # DEPOSIT NAMING: <donor>_<treatment>_<celltype>, e.g. 001V_DMSO_AT2. The deposited
+    # columns ship ALREADY in display form.
+    #
+    # This block used to match the PRE-DEPOSIT tokens _AT_/_DD_/_FB_/_MV_ under a comment
+    # reading "sample names still carry the original tokens" -- true when it was written,
+    # false once the deposit was packaged. Measured over all 26 columns: cell_type resolved
+    # 0/26, treatment 0/26 (the old Smg1i$ anchor cannot match ..._Smg1i_LAE, so all 26 were
+    # labelled DMSO while 13 really are Smg1i) and donor 0/26. NOTHING FAILED -- the filter
+    # below emptied the table and the sentence rendered "Across 0 samples ... an average of
+    # NaN long reads per sample (median NA, range Inf--Inf) ... totaling 0 reads", exit 0.
+    # Found by the clean-room rerun, 2026-07-28. W79.
+    donor     = sub("^([^_]+)_.*$",       "\\1", sample),
+    treatment = sub("^[^_]+_([^_]+)_.*$", "\\1", sample),
+    cell_type = sub("^[^_]+_[^_]+_",      "",    sample)
+  )
+
+# FAIL LOUDLY ON A NAMING CHANGE.
+#
+# The defect above was not the wrong pattern; it was that a TOTAL parse failure was SILENT.
+# R's empty-vector semantics -- mean() -> NaN, range() -> Inf/-Inf, sum() -> 0 -- are all
+# documented return values and warn about nothing, so a methods paragraph of NaN and Inf
+# passed every gate an exit status can express. A rename must stop the run instead, which is
+# what productive_response.Rmd:86-92 argues for and what ct_de.Rmd already does with
+# stopifnot(file.exists(...)).
+stopifnot(
+  "sample columns do not parse as <donor>_<treatment>_<celltype>" =
+    all(lengths(strsplit(per_sample$sample, "_")) == 3L),
+  "no sample resolved to one of the four cell types -- has the deposit been renamed?" =
+    any(per_sample$cell_type %in% c("AT2", "LAE", "FB", "MV")),
+  "treatment did not resolve to Smg1i/DMSO" =
+    all(per_sample$treatment %in% c("Smg1i", "DMSO"))
+)
+
+per_sample_kept <- per_sample %>%
+  filter(cell_type %in% c("AT2", "LAE", "FB", "MV"))
+
+# Methods numbers
+n_samples    <- nrow(per_sample_kept)
+mean_reads   <- mean(per_sample_kept$assigned_reads)
+median_reads <- median(per_sample_kept$assigned_reads)
+total_reads  <- sum(per_sample_kept$assigned_reads)
+range_reads  <- range(per_sample_kept$assigned_reads)
+
+cat(sprintf(
+  "Across %d samples (4 cell types × Smg1i/DMSO, matched donors), an average of %s long reads per sample (median %s, range %s–%s) were assigned to annotated isoforms by Isocall, totaling %s reads.\n",
+  n_samples,
+  format(round(mean_reads), big.mark = ","),
+  format(round(median_reads), big.mark = ","),
+  format(range_reads[1], big.mark = ","),
+  format(range_reads[2], big.mark = ","),
+  format(total_reads, big.mark = ",")
+))
+
+# ── Claim 1.1.1 — the sequencing summary, three of its five values ────────────────────
+# THIS CHUNK READS THE DEPOSIT DIRECTLY (nmd_isocall_counts_4ct.csv), so unlike the rest of
+# this report it spans ALL 26 samples and BOTH treatments. The other two values of 1.1.1 --
+# 162,800 isoforms and 18,270 genes -- are computed in q1-total, from sq_filt, and are emitted
+# there. The ledger attributes 1.1.1 to this chunk alone; that attribution is incomplete, and
+# splitting the emissions is what makes it visible.
+READS_POP <- paste("the 26 deposited long-read samples -- four primary cell types x",
+                   "Smg1i/DMSO, matched donors -- counting reads assigned to annotated",
+                   "isoforms by Isocall. Both treatments, unlike the rest of this report")
+claim_emit("1.1.1", "sequenced samples", n_samples,
+           published = "26", n = n_samples, population = READS_POP)
+claim_emit("1.1.1", "total assigned long reads", total_reads,
+           published = "341,638,920", n = n_samples, population = READS_POP)
+# The paper says "an average depth of 13 million aligned FLNC reads" -- one significant figure,
+# so it is an approximation rather than a point estimate and is recorded as SUPPORTING. Its
+# exact value is total_reads / n_samples and a reader can check the rounding from these two.
+claim_emit("1.1.1", "mean assigned long reads per sample (paper states ~13 million)",
+           mean_reads, n = n_samples, population = READS_POP)
+
+per_sample_kept %>% arrange(cell_type, treatment, donor)
+```
+
+# Save Results
+
+```{r save-results}
+# Tables — structural and expression summaries
+fwrite(cat_table,      file.path(OUTPUT_DIR, "structural_categories.csv"))
+fwrite(kn_table,       file.path(OUTPUT_DIR, "known_vs_novel.csv"))
+fwrite(ct_summary,     file.path(OUTPUT_DIR, "expressed_isoforms_per_ct.csv"))
+fwrite(ct_treat_df,    file.path(OUTPUT_DIR, "expressed_isoforms_per_ct_treatment.csv"))
+fwrite(cat_by_ct_df,   file.path(OUTPUT_DIR, "structural_categories_by_ct.csv"))
+
+# Sharing / overlap
+fwrite(unique_sharing %>% pivot_wider(id_cols = c(ct, n_total),
+                                       names_from = category, values_from = n),
+       file.path(OUTPUT_DIR, "expressed_isoforms_sharing.csv"))
+
+# Length stats
+fwrite(length_data,
+       file.path(OUTPUT_DIR, "length_data_long.csv"))
+
+# Pairwise similarity matrices
+fwrite(as.data.frame(cor_pearson),  file.path(OUTPUT_DIR, "pairwise_pearson.csv"),  row.names = TRUE)
+fwrite(as.data.frame(cor_spearman), file.path(OUTPUT_DIR, "pairwise_spearman.csv"), row.names = TRUE)
+fwrite(as.data.frame(jaccard_mat),  file.path(OUTPUT_DIR, "pairwise_jaccard.csv"),  row.names = TRUE)
+
+cat("All saved to:", OUTPUT_DIR, "\n")
+print(list.files(OUTPUT_DIR, pattern = "\\.csv$"))
+
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
+

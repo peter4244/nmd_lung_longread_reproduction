@@ -1,0 +1,89 @@
+# Conda environment for the FIGURE-RENDERING and REPORT-RENDERING half of the pipeline.
+#
+# This is a SECOND environment on purpose, and the split is a fact about how the work ran
+# rather than a preference. The model ran on a cluster under Python 3.11 with a CUDA torch
+# build and no seaborn installed; the figures and the R reports were rendered on Pete's
+# laptop under a different Python entirely. Merging them would require choosing one Python
+# and one matplotlib, and matplotlib is exactly the package that must not be chosen freely
+# — see the note on byte-comparison below.
+#
+# REPINNED 2026-08-10 TO THE INTERPRETER THAT ACTUALLY RENDERED THE FIGURES, and the note below
+# is kept because it is the reasoning that produced the wrong set, not because it is still right.
+# This laptop has two Pythons: Homebrew python3.14, which matched every pin here exactly, and
+# miniforge python3 at 3.12.12, which is what `python3 figure_*.py` runs. 35 of the 36 tracked
+# matplotlib PNGs embed 3.10.8, the miniforge one. The 2026-07-20 capture was faithful — to the
+# wrong interpreter — so every version below moved: python 3.14.4 -> 3.12.12, matplotlib 3.11.0 ->
+# 3.10.8, numpy 2.4.6 -> 2.4.4, pandas 3.0.3 -> 2.3.3 (a MAJOR version), scipy 1.18.0 -> 1.17.1,
+# pillow 12.2.0 -> 12.1.1. seaborn and logomaker were already right.
+#
+# WHICH RETIRES THE AVAILABILITY ARGUMENT BELOW, and the retirement is the interesting part: that
+# note says conda-forge "goes 3.10.8 -> 3.11.1 for matplotlib and 2.4.3 -> 2.5.1 for numpy,
+# skipping both recorded versions" — and 3.10.8 is now exactly what is pinned, so conda-forge does
+# carry it. The conclusion (everything through pip, at exact versions) still holds and is still
+# right for the reason given about ABI-incompatible double installs; only its premise was specific
+# to the versions that turned out to be the wrong ones.
+#
+# PROVENANCE OF THESE VERSIONS. Taken from ENVIRONMENT.md, captured 2026-07-20 from the
+# machine that rendered the tracked figure PNGs. That document's corroboration argument is
+# the reason to prefer it over whatever is installed today: the committed PNGs embed
+# "Matplotlib version3.11.0", matching the pin below. The renderer named here is the one
+# that produced the committed figures.
+#
+# CAVEAT, STATED RATHER THAN HIDDEN. These versions were captured from a non-conda Python
+# installation, so conda-forge may not carry every one of them at exactly this patch level.
+# If the solver cannot satisfy a pin, take the nearest available patch — the analysis
+# results are not sensitive to it. The figure PNGs are: matplotlib patch releases change
+# rasterisation, so a byte-for-byte PNG comparison against the committed figures is only
+# meaningful under matplotlib 3.11.0. A mismatch there is a rendering difference, not a
+# result difference, and should not be read as a failure to reproduce.
+#
+# WHY pandoc IS HERE. The R reports are knitr/rmarkdown documents and cannot render without
+# pandoc. It is a system binary, so renv cannot see it and renv.lock does not mention it —
+# which is precisely why it was the first thing to break when this pipeline was first run on
+# a fresh machine. Conda is the least painful way to deliver it alongside everything else.
+# R itself is NOT installed from conda here: use system R 4.5.2 with renv.lock, because
+# conda-forge R and renv disagree about library paths in ways that cost more than they save.
+
+# WHY CONDA SUPPLIES ONLY THE INTERPRETER AND pandoc HERE. The first version of this file
+# pinned every package through conda, and it could not have solved: checked against
+# conda-forge on 2026-08-03, matplotlib 3.11.0 and numpy 2.4.6 ARE NOT THERE. conda-forge
+# goes 3.10.8 -> 3.11.1 for matplotlib and 2.4.3 -> 2.5.1 for numpy, skipping both recorded
+# versions. That is not a packaging accident — this environment was always a pip-based
+# Python, so pip is where its versions live and conda cannot reproduce it exactly.
+# Everything therefore goes through pip at exact versions, which also avoids conda and pip
+# installing two numpys and leaving the second one ABI-incompatible with the first. That
+# failure is not hypothetical: it is the state the model environment on this laptop is
+# currently in (torch 2.2.2 compiled against NumPy 1.x, sitting on NumPy 2.4.4, unusable).
+#
+# ONE PIN IS NOT FULLY VERIFIED, and it is flagged rather than quietly relaxed. scipy 1.18.0
+# was confirmed present on conda-forge but could NOT be confirmed on PyPI, because the only
+# interpreter available to check with was Python 3.11 and this environment is 3.14 — so the
+# check was answering a different question than the one that matters. If pip cannot find it,
+# take scipy from conda-forge instead, where it definitely exists.
+
+name: nmd_figures
+channels:
+  - conda-forge
+dependencies:
+  # r-proc IS REQUIRED to render the §5 model report: orf_model_report_v5.Rmd calls pROC for
+  # its ROC curves. It was in neither renv.lock nor this file, so the report could not render
+  # from any shipped environment.
+  - r-proc
+  - python=3.12.12
+  - pandoc=3.8.3
+  - pip
+  - pip:
+      - matplotlib==3.10.8
+      - numpy==2.4.4
+      - pandas==2.3.3
+      - scipy==1.17.1
+      - seaborn==0.13.2
+      - pillow==12.1.1
+      # MISSED BY THE 2026-07-20 CAPTURE, added 2026-08-10. figure5_panelE_atg_logo.py and
+      # figure5_panelF_stop_logo.py both `import logomaker`, and the clean room found it the
+      # only way an omission like this can be found -- by running: job 9049007, two
+      # ModuleNotFoundErrors. The capture enumerated the packages someone remembered, not the
+      # ones the code imports, which is why tools/check_python_imports.py now derives the
+      # question from the source instead. Version is the laptop's, the machine that rendered
+      # the committed panel PNGs -- same provenance rule as every pin above.
+      - logomaker==0.8.7
