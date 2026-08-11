@@ -1,0 +1,285 @@
+<!--
+================================================================================
+Rmd PATCH — `orf_model_report_v5.Rmd` in the `NMD_orf_model_v5_4ct` repo.
+
+Intent:   Add manuscript-Subset-2 subgroup-stratified analyses at n = 1,166 to
+          orf_model_report_v5.Rmd so the inline R values backing the
+          PTCSubclassBranchSHAP and PTCSubclassPerformance supplemental figures
+          live in the Rmd itself.
+
+Where:    Insert as new Section 8.5 — after the closing `---` of §8 (currently at
+          line ~1988) and before `# 9. Additional Analyses {#sec9-additional}`.
+
+Why a separate section instead of editing §7/§8:
+          The existing §7/§8 subgroup machinery uses a TD2-based reclassification
+          that pulls ~47% of ref-ATG-lost isoforms into PTC+. The manuscript
+          Subset 2 (n = 1,166) is explicitly constructed to be TD2-bias-independent
+          (Figure 3 / TD2BiasEvidence supplement). To preserve §7/§8 as-is and add
+          a TD2-bias-independent subgroup view at the manuscript scope, we add a
+          parallel subsection here rather than modifying the existing logic.
+
+Pre-req:  The n=1,166 isoform list lives in the `nmd` repo at
+              ~/claude_projects/nmd/figures/multipanel/figure5_dl_model/data/
+                subset2_refaug_isoforms.tsv
+          The chunk below reads it from `external/subset2_refaug_isoforms.tsv` by
+          default; symlink it into the model repo with:
+
+              mkdir -p external
+              ln -sf ~/claude_projects/nmd/figures/multipanel/figure5_dl_model/\
+                       data/subset2_refaug_isoforms.tsv \
+                     external/subset2_refaug_isoforms.tsv
+
+          (or point N1166_PATH at the source location directly).
+
+Inline R values produced (for find/replace into the manuscript Google Doc):
+          - n_subset2_ptcplus, n_subset2_ptcminus, n_subset2_control
+          - subset2_shap_atg_ptcplus, subset2_shap_atg_ptcminus
+          - subset2_shap_atg_share_ptcplus_pct, subset2_shap_atg_share_ptcminus_pct
+          - subset2_shap_atg_share_ratio  ("2.2-fold" replacement for "three times")
+          - subset2_auc_ptcplus_vs_ctrl,   subset2_auprc_ptcplus_vs_ctrl
+          - subset2_auc_ptcminus_vs_ctrl,  subset2_auprc_ptcminus_vs_ctrl
+
+Side-effects: writes two TSVs to results_dir for downstream re-use, parallel
+              to the figure-side TSVs in the nmd repo:
+                  subset2_refaug_branch_shap_descriptives.tsv
+                  subset2_refaug_predprob_by_subclass.tsv
+              These are not strictly required (the upstream R script in the
+              nmd repo already produces equivalents) but having an in-Rmd copy
+              keeps this report self-contained.
+================================================================================
+-->
+
+## 8.5 Manuscript Subset 2 (n = 1,166) — Subgroup-Stratified Interpretability {#sec8-5-subset2-refaug}
+
+The §5 deep-learning narrative makes two claims that are stratified by isoform PTC subclass *within* the manuscript's ref-AUG-traceable subset (Subset 2, n = 1,166; same scope as Figure 4 C/D and Figure 5 Panel G). This subsection reproduces those analyses inline so the inline R values backing them live in the report.
+
+Subset 2 was constructed in the upstream Isopair pipeline to be TD2-bias-independent: ref-AUG-traceable gene-matched NMD vs Control pairs only, no isoforms whose CDS calls depend on TransDecoder2 conventions. Subgroup definitions used here come from Isopair's `category` field as carried through to the figure-side TSV.
+
+```{r sec8-5-load-subset2-list}
+# ── Data provenance ──
+# Source: subset2_refaug_isoforms.tsv (from ~/claude_projects/nmd, manuscript
+#   Subset 2 ref-AUG-traceable gene-matched pairs)
+# Population: 2 × 1,166 = 2,332 isoform rows (1,166 NMD arm + 1,166 Control arm),
+#   stratified into NMD+/PTC+, NMD+/PTC- retained, Control via the `group` column.
+# Method: gene-matched 1:1 pair sampling; see paper/results_to_code_map.md §5.
+
+N1166_PATH <- "external/subset2_refaug_isoforms.tsv"
+have_subset2 <- file.exists(N1166_PATH)
+if (have_subset2) {
+  subset2 <- fread(N1166_PATH)
+  # Sanity: required columns
+  required_cols <- c("arm", "group", "gene_id",
+                     "reference_isoform_id", "comparator_isoform_id", "category")
+  missing_cols  <- setdiff(required_cols, names(subset2))
+  if (length(missing_cols) > 0) {
+    stop(sprintf("Subset 2 list missing columns: %s",
+                 paste(missing_cols, collapse = ", ")))
+  }
+}
+```
+
+```{r sec8-5-warn-missing, results='asis', eval=!have_subset2}
+cat(sprintf("> **Note.** Subset 2 isoform list not found at `%s`. Symlink it from the `nmd` repo (see PATCH header) and re-render to populate §8.5.\n", N1166_PATH))
+```
+
+```{r sec8-5-join, eval=have_subset2}
+# Join Subset 2 list onto the model-side full-cohort KernelSHAP table.
+# IMPORTANT: use the full-cohort table (`kernel_shap_branch_atg1000_stop1000_seed42_all.tsv`,
+# 39,938 isoforms; loaded as `kernel_shap_branch_all`), NOT the test-set-only
+# `kernel_shap_branch` object used by §7. Branch attribution at the manuscript
+# Subset 2 scope is not restricted to the test split.
+#
+# Predicted probability (used only by 8.5.2 below) DOES stay test-set scoped —
+# AUC / AUPRC are the only analyses limited to the test split per the
+# test-only-for-performance-metrics policy.
+
+if (!exists("kernel_shap_branch_all")) {
+  kshap_all_path <- file.path(results_dir,
+                              paste0("kernel_shap_branch_", best_tag, "_all.tsv"))
+  if (file.exists(kshap_all_path)) {
+    kernel_shap_branch_all <- fread(kshap_all_path)
+  } else {
+    stop(sprintf("Full-cohort KernelSHAP file not found at: %s", kshap_all_path))
+  }
+}
+
+subset2_ks <- subset2 %>%
+  inner_join(kernel_shap_branch_all %>%
+               select(isoform_id, label, prediction,
+                      shap_atg, shap_stop, shap_structural),
+             by = c("comparator_isoform_id" = "isoform_id"))
+
+# Test-set predictions — separate join, kept ONLY for the discrimination
+# section below.
+subset2_perf <- subset2 %>%
+  inner_join(preds %>% select(isoform_id, prob),
+             by = c("comparator_isoform_id" = "isoform_id"))
+
+# Coverage diagnostics
+n_subset2_listed         <- nrow(subset2)
+n_subset2_joined_shap    <- nrow(subset2_ks)
+n_subset2_joined_predprob <- nrow(subset2_perf)
+subset2_coverage_pct_shap     <- 100 * n_subset2_joined_shap     / n_subset2_listed
+subset2_coverage_pct_predprob <- 100 * n_subset2_joined_predprob / n_subset2_listed
+```
+
+Branch SHAP is reported at the **full Subset 2 scope** (`r format(n_subset2_joined_shap, big.mark = ",")` of `r format(n_subset2_listed, big.mark = ",")` isoforms, `r sprintf("%.1f", subset2_coverage_pct_shap)`% coverage; minor drop reflects isoforms not retained in the model's evaluable set). Predicted-probability metrics (§8.5.2) remain test-set scoped (`r format(n_subset2_joined_predprob, big.mark = ",")` isoforms, `r sprintf("%.1f", subset2_coverage_pct_predprob)`% of Subset 2) per the test-only-for-performance-metrics policy.
+
+```{r sec8-5-subgroup-counts, eval=have_subset2}
+subset2_group_levels <- c("NMD+/PTC+", "NMD+/PTC- retained", "Control")
+subset2_ks <- subset2_ks %>%
+  mutate(group = factor(group, levels = subset2_group_levels))
+
+subset2_ks_counts <- subset2_ks %>%
+  count(group, .drop = FALSE) %>%
+  arrange(group)
+
+n_subset2_ptcplus  <- subset2_ks_counts$n[subset2_ks_counts$group == "NMD+/PTC+"]
+n_subset2_ptcminus <- subset2_ks_counts$n[subset2_ks_counts$group == "NMD+/PTC- retained"]
+n_subset2_control  <- subset2_ks_counts$n[subset2_ks_counts$group == "Control"]
+```
+
+Subgroup counts (full Subset 2 scope): **NMD+/PTC+ n = `r n_subset2_ptcplus`, NMD+/PTC- retained n = `r n_subset2_ptcminus`, Control n = `r n_subset2_control`**. The n = 95 NMD+/PTC- count matches the value quoted in the Figure 5 Panel G legend at the same scope.
+
+### 8.5.1 Branch-level SHAP by Subgroup
+
+```{r sec8-5-branch-shap, eval=have_subset2}
+# Mean |SHAP| and within-isoform branch share (per-isoform: |b| / Σ |b|).
+subset2_branch_long <- subset2_ks %>%
+  mutate(abs_atg        = abs(shap_atg),
+         abs_stop       = abs(shap_stop),
+         abs_structural = abs(shap_structural),
+         total          = abs_atg + abs_stop + abs_structural,
+         share_atg      = abs_atg        / total,
+         share_stop     = abs_stop       / total,
+         share_struct   = abs_structural / total) %>%
+  select(comparator_isoform_id, group,
+         abs_atg, abs_stop, abs_structural,
+         share_atg, share_stop, share_struct)
+
+subset2_branch_desc <- subset2_branch_long %>%
+  group_by(group) %>%
+  summarise(n_isoforms          = n(),
+            mean_abs_atg        = mean(abs_atg),
+            mean_abs_stop       = mean(abs_stop),
+            mean_abs_structural = mean(abs_structural),
+            mean_share_atg      = mean(share_atg),
+            mean_share_stop     = mean(share_stop),
+            mean_share_struct   = mean(share_struct),
+            .groups = "drop") %>%
+  arrange(group)
+
+fwrite(subset2_branch_desc,
+       file.path(results_dir, "subset2_refaug_branch_shap_descriptives.tsv"),
+       sep = "\t")
+
+# Pull inline values
+subset2_shap_atg_ptcplus  <-
+  subset2_branch_desc$mean_abs_atg[subset2_branch_desc$group == "NMD+/PTC+"]
+subset2_shap_atg_ptcminus <-
+  subset2_branch_desc$mean_abs_atg[subset2_branch_desc$group == "NMD+/PTC- retained"]
+
+subset2_shap_atg_share_ptcplus_pct  <- 100 *
+  subset2_branch_desc$mean_share_atg[subset2_branch_desc$group == "NMD+/PTC+"]
+subset2_shap_atg_share_ptcminus_pct <- 100 *
+  subset2_branch_desc$mean_share_atg[subset2_branch_desc$group == "NMD+/PTC- retained"]
+subset2_shap_atg_share_ratio <-
+  subset2_shap_atg_share_ptcminus_pct / subset2_shap_atg_share_ptcplus_pct
+
+# Wilcoxon test on per-isoform ATG share, NMD+/PTC+ vs NMD+/PTC-
+ws_pos <- subset2_branch_long$share_atg[
+  subset2_branch_long$group == "NMD+/PTC+"]
+ws_neg <- subset2_branch_long$share_atg[
+  subset2_branch_long$group == "NMD+/PTC- retained"]
+subset2_shap_atg_share_wilcox_p <- suppressWarnings(
+  wilcox.test(ws_neg, ws_pos, exact = FALSE)$p.value)
+```
+
+**Observations:**
+
+- **(Data)** Mean |SHAP| at the AUG branch is `r sprintf("%.3f", subset2_shap_atg_ptcplus)` in NMD+/PTC+ and `r sprintf("%.3f", subset2_shap_atg_ptcminus)` in NMD+/PTC- retained. The Stop and Structural branches drop more sharply in PTC- (no PTC ⇒ no downstream-EJC signal), so although **absolute** ATG attribution is roughly equivalent across the two NMD subgroups, the **share** of total branch attribution coming from the AUG branch is substantially larger in PTC-.
+
+- **(Data)** Mean within-isoform AUG-branch share is **`r sprintf("%.1f", subset2_shap_atg_share_ptcplus_pct)`%** in NMD+/PTC+ and **`r sprintf("%.1f", subset2_shap_atg_share_ptcminus_pct)`%** in NMD+/PTC- retained — a **`r sprintf("%.2f", subset2_shap_atg_share_ratio)`-fold** increase (Mann–Whitney U `p = `r format.pval(subset2_shap_atg_share_wilcox_p, digits = 2, eps = 1e-4)``). The manuscript text reading "roughly three times more important" is **not** supported at the Subset 2 scope; the actual ratio is `r sprintf("%.2f", subset2_shap_atg_share_ratio)`-fold, and the manuscript prose should be revised to "approximately two-fold higher" (find/replace pair logged in `nmd/figures/SupplementalFigures/PTCSubclassBranchSHAP/README.md`).
+
+<details><summary>Table 8.5a: Branch-SHAP descriptives by Subset 2 subgroup</summary>
+```{r sec8-5-table-branch-desc, eval=have_subset2}
+render_dt(subset2_branch_desc %>%
+            mutate(across(starts_with("mean_abs"),   ~round(., 3)),
+                   across(starts_with("mean_share"), ~round(100 * ., 1))),
+          caption = "Table 8.5a: Branch-level KernelSHAP by Subset 2 subgroup.")
+```
+</details>
+
+### 8.5.2 Discrimination by Subgroup
+
+```{r sec8-5-perf, eval=have_subset2}
+ctrl_subset2  <- subset2_perf %>% filter(group == "Control")
+ptcp_subset2  <- subset2_perf %>% filter(group == "NMD+/PTC+")
+ptcn_subset2  <- subset2_perf %>% filter(group == "NMD+/PTC- retained")
+
+auc_pair <- function(pos, neg) {
+  if (nrow(pos) < 5 || nrow(neg) < 5)
+    return(tibble(auc = NA_real_, auprc = NA_real_))
+  combined <- bind_rows(pos %>% mutate(.y = 1),
+                        neg %>% mutate(.y = 0))
+  roc_obj <- pROC::roc(combined$.y, combined$prob,
+                       levels = c(0, 1), quiet = TRUE)
+  auc_val <- as.numeric(pROC::auc(roc_obj))
+  pr      <- pROC::coords(roc_obj, x = "all",
+                          ret = c("threshold", "recall", "precision"),
+                          transpose = FALSE) %>%
+    filter(!is.na(precision) & !is.na(recall)) %>% arrange(recall)
+  auprc_val <- sum(diff(pr$recall) *
+                   (pr$precision[-1] + pr$precision[-nrow(pr)]) / 2)
+  tibble(auc = auc_val, auprc = auprc_val)
+}
+
+m_pos <- auc_pair(ptcp_subset2, ctrl_subset2)
+m_neg <- auc_pair(ptcn_subset2, ctrl_subset2)
+
+subset2_auc_ptcplus_vs_ctrl    <- m_pos$auc
+subset2_auprc_ptcplus_vs_ctrl  <- m_pos$auprc
+subset2_auc_ptcminus_vs_ctrl   <- m_neg$auc
+subset2_auprc_ptcminus_vs_ctrl <- m_neg$auprc
+
+# Per-isoform prediction summary
+subset2_perf_desc <- subset2_perf %>%
+  group_by(group) %>%
+  summarise(n           = n(),
+            mean_prob   = mean(prob),
+            median_prob = median(prob),
+            frac_above_threshold = mean(prob >= 0.5),
+            .groups = "drop") %>%
+  arrange(group)
+
+fwrite(subset2_perf %>%
+         select(arm, group, comparator_isoform_id, prob),
+       file.path(results_dir, "subset2_refaug_predprob_by_subclass.tsv"),
+       sep = "\t")
+```
+
+**Observations:**
+
+- **(Data)** NMD+/PTC+ vs Control discrimination is strong: AUC = `r sprintf("%.3f", subset2_auc_ptcplus_vs_ctrl)`, AUPRC = `r sprintf("%.3f", subset2_auprc_ptcplus_vs_ctrl)` (n = `r n_subset2_ptcplus` PTC+ vs `r n_subset2_control` Control).
+- **(Data)** NMD+/PTC- retained vs Control discrimination is substantially lower: AUC = `r sprintf("%.3f", subset2_auc_ptcminus_vs_ctrl)`, AUPRC = `r sprintf("%.3f", subset2_auprc_ptcminus_vs_ctrl)` (n = `r n_subset2_ptcminus` PTC- vs `r n_subset2_control` Control).
+- **(Data)** The AUC drop (`r sprintf("%.2f", subset2_auc_ptcplus_vs_ctrl)` → `r sprintf("%.2f", subset2_auc_ptcminus_vs_ctrl)`) supports the manuscript's claim that "overall predictive performance was substantially lower in NMD+/PTC- isoforms."
+
+<details><summary>Table 8.5b: Subset 2 predicted-probability descriptives</summary>
+```{r sec8-5-table-perf-desc, eval=have_subset2}
+render_dt(subset2_perf_desc %>%
+            mutate(across(c(mean_prob, median_prob, frac_above_threshold),
+                          ~round(., 3))),
+          caption = "Table 8.5b: Predicted P(NMD) by Subset 2 subgroup.")
+```
+</details>
+
+### 8.5.3 Cross-references to figure-side artifacts
+
+The figure-side companion files (in the `nmd` repo) carry the same numbers as plotted SFs:
+
+- `figures/SupplementalFigures/PTCSubclassBranchSHAP/figure_s_branch_shap_by_subclass.{pdf,png}`
+  — Two-panel SF: (A) mean |SHAP| per branch; (B) mean within-isoform share. Built from `data/branch_shap_by_subclass_refaug.tsv` + `.._descriptives.tsv` + `.._pairwise.tsv`.
+- `figures/SupplementalFigures/SF41_PTCSubclassPerformance/figure_s_performance_by_subclass.{pdf,png}`
+  — Two-panel SF: (A) ROC curves; (B) predicted-prob per subgroup. Built from `data/predprob_by_subclass_refaug.tsv`.
+
+These figure-side TSVs are produced by `figures/SupplementalFigures/PTCSubclassBranchSHAP/data_export.R` in the `nmd` repo; the two Rmd-side TSVs above (`subset2_refaug_branch_shap_descriptives.tsv`, `subset2_refaug_predprob_by_subclass.tsv`) are independent re-renders for self-containment of this report.

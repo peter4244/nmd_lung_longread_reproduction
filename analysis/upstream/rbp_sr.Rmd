@@ -1,0 +1,963 @@
+---
+title: "NMD-target genes are enriched for RNA-binding proteins"
+subtitle: "Long-read DIE isoform results (mashr NMD calls) intersected with the Gerstberger 2014 RBP census"
+author: "Yul Leshem"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document: { toc: true, toc_float: true, df_print: paged, code_folding: hide, number_sections: true }
+---
+
+Code location: `/udd/reyle/nmd_lungcells_2026/code/final/rbp_sr.Rmd`
+
+```{r setup, include=FALSE}
+.nmd_root <- local({ d <- getwd(); while (!file.exists(file.path(d, "config", "paths.yml"))) {
+  p <- dirname(d); if (identical(p, d)) stop("repo root not found"); d <- p }; d })
+source(file.path(.nmd_root, "R", "load_config.R")); .P <- nmd_paths(.nmd_root)
+source(file.path(.nmd_root, "R", "claim_emit.R"))  # Phase 2 claim-value emission
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE, fig.width=10, fig.height=5, dpi=110)
+options(bitmapType="cairo")  # (dropped a Channing-only .libPaths prepend)
+
+```
+
+```{r libs}
+suppressPackageStartupMessages({
+  library(data.table); library(dplyr); library(tidyr); library(tibble)
+  library(ggplot2); library(knitr); library(readxl)
+})
+select <- dplyr::select; filter <- dplyr::filter; rename <- dplyr::rename
+count  <- dplyr::count;  slice  <- dplyr::slice
+```
+
+# Overview
+
+Self-contained analysis: load the **long-read differential-isoform-expression (DIE) results**
+(mashr per-cell-type isoform posterior means + lfsr), define **NMD-target genes** (any gene with
+a confident NMD isoform), and test whether they are enriched for **RNA-binding proteins** using
+the **Gerstberger, Hafner & Tuschl 2014** census of 1,542 human RBPs.
+
+- "NMD isoform" = `lfsr < 0.05 & posterior mean > 0` in a cell type (NMD up-call).
+- "NMD-target gene" = a gene with ≥1 NMD isoform in ≥1 cell type.
+- Background = all genes with an isoform tested in the DIE/mashr set.
+
+Naming: the DGEList stores the original ct codes `AT` (= AT2) and `DD` (= LAE). The mashr result
+columns already use the display names (AT2/LAE), so `CELL_TYPES` is set to those; where we read the
+DGEList's `ct` column directly (the expression heatmaps) we relabel AT→AT2, DD→LAE after loading.
+
+```{r params}
+OUT_DIR <- file.path(.P$OUT, "nmd_rbp_enrichment")
+dir.create(OUT_DIR, recursive=TRUE, showWarnings=FALSE)
+DATE_STAMP   <- format(Sys.Date(), "%Y.%m.%d")
+CELL_TYPES   <- c("AT2","LAE","FB","MV")
+LFSR_NMD_THR <- 0.05
+
+# long-read isoform DGEList (for the isoform -> gene/symbol mapping)
+DGE_ISO_PATH  <- file.path(.P$OUT, "dge_isoform_longread_filtered_2026.3.3.rds")
+# long-read DIE isoform mashr results
+PM_ISO_PATH   <- file.path(file.path(.P$OUT, "mashr_isoform"), "mashr_isoform_posterior_means_2026.3.10.csv")
+LFSR_ISO_PATH <- file.path(file.path(.P$OUT, "mashr_isoform"), "mashr_isoform_lfsr_2026.3.10.csv")
+# Gerstberger 2014 RBP census (Supplementary Table S3).
+#
+# READ FROM THE DEPOSIT, NOT FROM metadata/reference/ (Pete, 2026-07-29). Both RBP tables are now
+# deposited rather than declared external, which is what makes claims 2.6.2 and 2.6.3 rebuildable
+# by a reader who has the archive -- previously they terminated outside it and could not be
+# reproduced at all. The copies under metadata/reference/ are the STAGING SOURCE that gets copied
+# into the deposit; they are deliberately not the read path, because two readable copies of one
+# table is the two-writers problem in a different coat.
+RBP_CSV <- file.path(.P$DEPOSIT, "gerstberger_2014_rbp_census.csv")
+
+```
+
+# Load long-read DIE isoform results
+
+```{r load}
+dge_iso  <- readRDS(DGE_ISO_PATH)
+pm_iso   <- read.csv(PM_ISO_PATH,   check.names=FALSE, stringsAsFactors=FALSE)
+lfsr_iso <- read.csv(LFSR_ISO_PATH, check.names=FALSE, stringsAsFactors=FALSE)
+colnames(pm_iso)[1] <- "isoform_id"; colnames(lfsr_iso)[1] <- "isoform_id"
+
+# isoform -> gene / symbol map from the DGEList
+iso_col  <- intersect(c("isoform_id","isoform","txid","transcript_id"), colnames(dge_iso$genes))[1]
+gene_col <- intersect(c("gene_id","associated_gene","ensembl_gene_id","gene_id_ens115_sqanti"), colnames(dge_iso$genes))[1]
+sym_col  <- intersect(c("hgnc_symbol","gene_name","external_gene_name","symbol"), colnames(dge_iso$genes))[1]
+iso2gene <- data.frame(isoform_id=dge_iso$genes[[iso_col]], gene_id=dge_iso$genes[[gene_col]],
+                       hgnc_symbol=dge_iso$genes[[sym_col]], stringsAsFactors=FALSE)
+
+resolve_mash_col <- function(df, ct){ cn<-colnames(df); if (ct %in% cn) return(ct)
+  h<-cn[grepl(paste0("_in_",ct,"$"),cn)]; if(length(h)==1) return(h)
+  h<-cn[grepl(paste0("^",ct,"[._:-]"),cn)]; if(length(h)==1) return(h); stop("no mash col ",ct) }
+
+cat(sprintf("DIE isoforms loaded: %d; mapped to %d genes\n",
+            nrow(lfsr_iso), length(unique(iso2gene$gene_id))))
+```
+
+# Load Gerstberger 2014 RBP census
+
+```{r load-rbp}
+sv <- function(x) sub("\\..*$","",x)   # strip Ensembl version
+if (file.exists(RBP_CSV)) {
+  rbp <- fread(RBP_CSV)                                   # gene_symbol, ensembl_gene_id, consensus_rna_target, domains
+} else {
+  rr  <- read_excel(RBP_XLS, sheet="RBP table")
+  rbp <- data.frame(gene_symbol          = rr[["gene name"]],
+                    ensembl_gene_id      = rr[["gene id"]],
+                    consensus_rna_target = rr[["consensus RNA target"]],
+                    stringsAsFactors=FALSE)
+}
+rbp_ens   <- unique(sv(rbp$ensembl_gene_id))
+rbp_sym   <- unique(rbp$gene_symbol)
+sr_family <- paste0("SRSF", 1:12)   # canonical 12 human SR proteins (Manley & Krainer 2010)
+
+cat(sprintf("RBP census: %d RBPs (%d with Ensembl IDs)\n", length(rbp_sym), length(rbp_ens)))
+
+```
+
+# NMD-target genes from the DIE results
+
+```{r nmd-genes}
+nmd_gene_ct <- bind_rows(lapply(CELL_TYPES, function(ct){
+  l <- lfsr_iso[[resolve_mash_col(lfsr_iso, ct)]]; p <- pm_iso[[resolve_mash_col(pm_iso, ct)]]
+  iso <- lfsr_iso$isoform_id[!is.na(l) & !is.na(p) & l < LFSR_NMD_THR & p > 0]
+  data.frame(ct=ct, gene_id=unique(iso2gene$gene_id[iso2gene$isoform_id %in% iso]))
+}))
+nmd_genes <- unique(nmd_gene_ct$gene_id)
+bg_genes  <- unique(iso2gene$gene_id[iso2gene$isoform_id %in% lfsr_iso$isoform_id])  # all DIE-tested genes
+
+cat("NMD-target genes per cell type:\n")
+print(nmd_gene_ct %>% count(ct, name="n_nmd_genes"))
+cat(sprintf("\nUnion NMD-target genes (>=1 NMD isoform, any CT): %d of %d tested\n",
+            length(nmd_genes), length(bg_genes)))
+```
+
+# RBP enrichment among NMD-target genes
+
+```{r rbp-enrichment}
+g2sym  <- iso2gene %>% distinct(gene_id, hgnc_symbol)
+sym_of <- function(gid) g2sym$hgnc_symbol[match(gid, g2sym$gene_id)]
+is_rbp <- function(gid) (sv(gid) %in% rbp_ens) | (sym_of(gid) %in% rbp_sym)
+
+cat(sprintf("NMD-target genes that are RBPs (of 1,542): %d (%.1f%%)\n",
+            sum(is_rbp(nmd_genes)), 100*mean(is_rbp(nmd_genes))))
+
+# enrichment vs all DIE-tested genes (one-sided Fisher)
+tab <- table(NMD_target = bg_genes %in% nmd_genes, RBP = is_rbp(bg_genes))
+print(tab)
+ft <- fisher.test(tab, alternative="greater")
+cat(sprintf("\nRBP enrichment among NMD targets: OR=%.2f (95%% CI %.2f-%.2f), p=%.2e\n",
+            ft$estimate, ft$conf.int[1], ft$conf.int[2], ft$p.value))
+
+# ── Claim 2.6.2, Gerstberger half — AND A THREE-POPULATION PROBLEM IN ONE PHRASE ───────
+# The paper says "984 of 1542 were NMD targets". Those two numbers are not a numerator and a
+# denominator of the same set:
+#   984  = sum(is_rbp(nmd_genes)) -- census RBPs among our NMD-target GENE IDS.
+#   1542 = the census SIZE, a hard-coded literal in the cat() above; nothing computes it here.
+#   The percentage printed beside the 984 uses length(nmd_genes) = 7,156 as its denominator.
+# So the sentence pairs a count over gene ids with the size of the source census, and the
+# printed percentage is over a third set. Both are emitted, each against the number the paper
+# prints for it, with their populations stated so the mismatch is on the record.
+RBP_POP_NMD <- paste("our NMD-target gene ids (posterior mean logFC > 0 and lfsr < 0.05 in at",
+                     "least one of the four primary cell types, pooled) that match the",
+                     "Gerstberger census by hgnc symbol OR versionless Ensembl gene id.",
+                     "Gene ids, not census rows: SQANTI fusion ids of the form A::B truncate to",
+                     "A, so one census RBP can be counted twice")
+claim_emit("2.6.2", "NMD-target genes that are Gerstberger-census RBPs",
+           sum(is_rbp(nmd_genes)), published = "984", n = length(nmd_genes),
+           population = RBP_POP_NMD)
+claim_emit("2.6.2", "size of the Gerstberger RBP census", length(rbp_sym),
+           published = "1542", n = length(rbp_sym),
+           population = "all RBPs in the published Gerstberger 2014 census file, one row each")
+claim_emit("2.6.2", "odds ratio, Gerstberger-RBP enrichment among NMD targets",
+           unname(ft$estimate), published = "3.3", n = length(bg_genes),
+           population = paste("one-sided Fisher exact test on NMD-target vs not, crossed with",
+                              "census-RBP vs not, over the DIE-tested background gene ids"))
+# The paper states this p as an INEQUALITY (p < 10^-3), so it is a supporting number with the
+# threshold named -- comparing it to a point value would fail a claim any smaller p satisfies.
+claim_emit("2.6.2", "Fisher p, Gerstberger-RBP enrichment (paper states p < 1e-3)",
+           ft$p.value, n = length(bg_genes),
+           population = "same test as the odds ratio above")
+
+kable(data.frame(
+  set            = c("NMD-target genes","background (DIE-tested)"),
+  n_genes        = c(length(nmd_genes), length(bg_genes)),
+  n_RBP          = c(sum(is_rbp(nmd_genes)), sum(is_rbp(bg_genes))),
+  pct_RBP        = round(100*c(mean(is_rbp(nmd_genes)), mean(is_rbp(bg_genes))),1)),
+  caption="RBP fraction among NMD-target genes vs all DIE-tested genes (Gerstberger 2014 census).")
+
+```
+
+# Per-cell-type RBP enrichment
+
+```{r rbp-enrichment-by-ct}
+kable(bind_rows(lapply(CELL_TYPES, function(ct){
+  gset <- unique(nmd_gene_ct$gene_id[nmd_gene_ct$ct==ct])
+  tb   <- table(NMD = bg_genes %in% gset, RBP = is_rbp(bg_genes))
+  f    <- fisher.test(tb, alternative="greater")
+  data.frame(ct=ct, n_nmd=length(gset), n_rbp=sum(is_rbp(gset)),
+             pct_rbp=round(100*mean(is_rbp(gset)),1),
+             OR=round(f$estimate,2), p=signif(f$p.value,3))
+})), caption="RBP enrichment among NMD-target genes, per cell type.")
+```
+
+# SR proteins (SRSF1-12): which are NMD targets, by cell type
+
+```{r sr-distribution}
+sr_tab <- nmd_gene_ct %>% mutate(sym=sym_of(gene_id)) %>% filter(sym %in% sr_family) %>%
+  distinct(sym, ct) %>% mutate(present=1L) %>%
+  pivot_wider(names_from=ct, values_from=present, values_fill=0) %>%
+  mutate(n_celltypes = rowSums(across(all_of(intersect(CELL_TYPES, colnames(.)))))) %>%
+  arrange(desc(n_celltypes))
+kable(sr_tab, caption="Canonical SR proteins (SRSF1-12) that are NMD targets, by cell type (1 = NMD isoform present).")
+
+```
+
+# SR proteins: poison-exon / PTC architecture (Isopair)
+
+## Pair construction and poison-exon (SE-GAIN) test
+
+```{r isopair-sr-simple}
+library(Isopair)
+need <- c("parseIsoformStructures","buildUnionExons","buildProfiles","plotIsoformPair",
+          "extractCdsAnnotations","enumerateOrfs","selectPrimaryOrf")
+miss <- need[!need %in% getNamespaceExports("Isopair")]
+if (length(miss)) stop("Installed Isopair missing: ", paste(miss, collapse=", "))
+
+GTF_FULL <- file.path(.P$SQANTI, "nmd_lungcells_filtered.gtf")
+sr_num   <- function(x) as.integer(sub("^SRSF", "", x))
+
+samp     <- dge_iso$samples
+trt_col  <- intersect(c("trt","treatment","condition","group"), colnames(samp))[1]
+is_dmso  <- grepl("DMSO", samp[[trt_col]], ignore.case=TRUE)
+is_smg   <- grepl("SMG|SMG1i", samp[[trt_col]], ignore.case=TRUE)
+cpm_iso  <- edgeR::cpm(dge_iso)
+mean_dmso <- rowMeans(cpm_iso[, is_dmso, drop=FALSE])
+mean_smg  <- rowMeans(cpm_iso[, is_smg , drop=FALSE])
+ov <- pmax(mean_dmso, mean_smg, na.rm=TRUE)
+
+nmd_iso_all <- unique(unlist(lapply(CELL_TYPES, function(ct){
+  l <- lfsr_iso[[resolve_mash_col(lfsr_iso, ct)]]; p <- pm_iso[[resolve_mash_col(pm_iso, ct)]]
+  lfsr_iso$isoform_id[!is.na(l) & !is.na(p) & l < LFSR_NMD_THR & p > 0]
+})))
+sr_gene_ids <- iso2gene %>% mutate(sym=hgnc_symbol) %>% filter(sym %in% sr_family) %>% pull(gene_id) %>% unique()
+
+pick_top <- function(ids, score){
+  ids <- ids[ids %in% names(score)]; ids <- ids[!is.na(score[ids])]
+  if (length(ids) == 0) return(NA_character_); ids[which.max(score[ids])]
+}
+
+sr_pairs <- bind_rows(lapply(sr_gene_ids, function(g){
+  iso <- intersect(iso2gene$isoform_id[iso2gene$gene_id == g], lfsr_iso$isoform_id)
+  nmd <- iso[iso %in% nmd_iso_all]; non <- iso[!(iso %in% nmd_iso_all)]
+  if (length(nmd) == 0 || length(non) == 0) return(NULL)
+  ref  <- pick_top(non, mean_dmso)          # most-expressed non-NMD at DMSO
+  cnmd <- pick_top(nmd, mean_smg)           # most-expressed NMD at SMG1i
+  non2 <- setdiff(non, ref)
+  cctl <- if (length(non2)) pick_top(non2, mean_dmso) else NA_character_
+  out  <- data.frame(gene_id=g, reference_isoform_id=ref, comparator_isoform_id=cnmd, pair_class="NMD")
+  if (!is.na(cctl)) out <- bind_rows(out,
+        data.frame(gene_id=g, reference_isoform_id=ref, comparator_isoform_id=cctl, pair_class="Control"))
+  out
+})) %>% mutate(sym = sym_of(gene_id))
+
+cat(sprintf("SR genes paired: %d of %d; %d NMD, %d Control\n",
+            n_distinct(sr_pairs$gene_id), length(sr_gene_ids),
+            sum(sr_pairs$pair_class=="NMD"), sum(sr_pairs$pair_class=="Control")))
+
+# ── Claims 2.6.4 and 2.6.5 — the SR family ────────────────────────────────────────────
+# "11 of 12 SRSF genes carried an NMD susceptible isoform." All 12 are PRESENT in the isoform
+# universe, so this is a statement about NMD susceptibility rather than about detection --
+# SRSF12 is the exception. Both claims share these two numbers.
+SR_POP <- paste("the canonical SRSF gene family; numerator is those with a pairable NMD",
+                "susceptible isoform, denominator is the family as enumerated from the",
+                "annotation. All 12 are detected, so the shortfall is susceptibility, not",
+                "detection")
+claim_emit("2.6.4", "SRSF genes with an NMD susceptible isoform",
+           n_distinct(sr_pairs$gene_id), published = "11",
+           n = length(sr_gene_ids), population = SR_POP)
+claim_emit("2.6.4", "SRSF genes examined", length(sr_gene_ids), published = "12",
+           n = length(sr_gene_ids), population = SR_POP)
+claim_emit("2.6.5", "SR-protein genes across which the mechanism is split",
+           n_distinct(sr_pairs$gene_id), published = "11",
+           n = length(sr_gene_ids), population = SR_POP)
+
+wanted   <- unique(c(sr_pairs$reference_isoform_id, sr_pairs$comparator_isoform_id))
+GTF_SUB  <- file.path(OUT_DIR, "sr_simple_subset.gtf")
+pf <- tempfile(); writeLines(sprintf('transcript_id "%s"', wanted), pf)
+system2("grep", c("-F","-f", shQuote(pf), shQuote(GTF_FULL)), stdout = GTF_SUB)
+structures <- Isopair::parseIsoformStructures(GTF_SUB)
+ue         <- Isopair::buildUnionExons(structures)
+
+sr_prof <- Isopair::buildProfiles(sr_pairs, structures, ue$union_exons, ue$isoform_union_mapping,
+                                  verify=TRUE, verbose=FALSE) %>%
+  left_join(sr_pairs %>% select(reference_isoform_id, comparator_isoform_id, sym, pair_class),
+            by = c("reference_isoform_id","comparator_isoform_id"))
+
+poison_comp <- sr_prof %>% select(detailed_events) %>% tidyr::unnest(detailed_events) %>%
+  filter(event_type=="SE", direction=="GAIN") %>% distinct(comparator_isoform_id) %>% pull(comparator_isoform_id)
+sr_prof <- sr_prof %>% mutate(has_poison = comparator_isoform_id %in% poison_comp)
+
+kable(sr_prof %>% filter(pair_class=="NMD") %>% arrange(sr_num(sym)) %>%
+        select(sym, comparator_isoform_id, n_se, n_exons_comp_only, has_poison),
+      caption="SR genes: does the most-expressed NMD isoform carry a poison (gained cassette) exon?")
+
+tab <- table(class = factor(sr_prof$pair_class, c("NMD","Control")),
+             poison = factor(sr_prof$has_poison, c(TRUE, FALSE)))
+print(tab); ft <- fisher.test(tab)
+cat(sprintf("\nPoison (SE-GAIN): NMD %d/%d vs Control %d/%d; p=%.3g\n",
+            sum(sr_prof$has_poison & sr_prof$pair_class=="NMD"), sum(sr_prof$pair_class=="NMD"),
+            sum(sr_prof$has_poison & sr_prof$pair_class=="Control"), sum(sr_prof$pair_class=="Control"),
+            ft$p.value))
+```
+
+## PTC calling via reference-AUG tracing
+
+```{r ptc-reftrace}
+library(Biostrings)
+CDS_GFF <- file.path(.P$SQANTI, "nmd_lungcells_corrected.cds.gff3")
+FASTA   <- file.path(.P$SQANTI, "nmd_lungcells_corrected.fasta")
+
+CDS_SUB <- file.path(OUT_DIR, "sr_simple_cds.gtf")
+pfc <- tempfile(); writeLines(wanted, pfc)
+system2("grep", c("-F","-f", shQuote(pfc), shQuote(CDS_GFF)), stdout = CDS_SUB)
+cds_meta <- Isopair::extractCdsAnnotations(CDS_SUB, isoform_ids = wanted, verbose = FALSE)
+
+fai <- fasta.index(FASTA, seqtype="DNA"); fai$id <- sub("\\s.*","", fai$desc)
+seqs <- readDNAStringSet(fai[fai$id %in% wanted, ])
+sequences <- setNames(toupper(as.character(seqs)), sub("\\s.*","", names(seqs)))
+orfs <- Isopair::enumerateOrfs(structures, cds_meta, sequences)
+
+ref_by_gene <- sr_pairs %>% distinct(gene_id, reference_isoform_id)
+prim <- bind_rows(lapply(seq_len(nrow(ref_by_gene)), function(i){
+  g <- ref_by_gene$gene_id[i]; ref <- ref_by_gene$reference_isoform_id[i]
+  ids <- sr_pairs %>% filter(gene_id==g) %>% { unique(c(.$reference_isoform_id, .$comparator_isoform_id)) }
+  Isopair::selectPrimaryOrf(orfs %>% filter(isoform_id %in% ids),
+                            structures %>% filter(isoform_id %in% ids),
+                            cds_meta   %>% filter(isoform_id %in% ids),
+                            dominant_isoform_id = ref)
+}))
+
+tx2genomic <- function(id, tx_pos){
+  r <- structures[structures$isoform_id == id, ]
+  if (nrow(r)==0 || is.na(tx_pos)) return(NA_integer_)
+  s <- r$exon_starts[[1]]; e <- r$exon_ends[[1]]; strand <- r$strand
+  o <- order(s); s <- s[o]; e <- e[o]; lens <- e - s + 1
+  if (strand=="-") { s <- rev(s); e <- rev(e); lens <- rev(lens) }
+  cum <- cumsum(lens); prev <- c(0, head(cum,-1))
+  ex <- which(tx_pos <= cum)[1]; if (is.na(ex)) return(NA_integer_)
+  into <- tx_pos - prev[ex] - 1
+  if (strand=="-") e[ex] - into else s[ex] + into
+}
+
+ptc_x <- prim %>%
+  left_join(orfs %>% select(isoform_id, atg_tx_pos, stop_tx_pos),
+            by = c("isoform_id", "primary_atg_tx_pos" = "atg_tx_pos")) %>%
+  rowwise() %>%
+  mutate(stop_x  = tx2genomic(isoform_id, stop_tx_pos),
+         atg_x   = tx2genomic(isoform_id, primary_atg_tx_pos),
+         has_ptc = primary_n_downstream_ejc >= 1) %>%
+  ungroup()
+
+ref_cds <- cds_meta %>% filter(isoform_id %in% sr_pairs$reference_isoform_id) %>%
+  transmute(isoform_id, cds_start, cds_end = cds_stop, strand)
+comp_cds <- ptc_x %>% filter(isoform_id %in% sr_pairs$comparator_isoform_id, !is.na(atg_x), !is.na(stop_x)) %>%
+  mutate(strand = structures$strand[match(isoform_id, structures$isoform_id)]) %>%
+  transmute(isoform_id, cds_start = pmin(atg_x, stop_x), cds_end = pmax(atg_x, stop_x), strand)
+cds_for_plot <- bind_rows(ref_cds, comp_cds)
+
+cat("ref-AUG PTC by comparator:\n")
+print(sr_pairs %>% filter(pair_class=="NMD") %>%
+        left_join(ptc_x, by=c("comparator_isoform_id"="isoform_id")) %>%
+        select(sym, primary_source, has_ptc, stop_x) %>% arrange(sr_num(sym)))
+
+```
+
+## Per-SR-gene structure figures (non-NMD vs NMD)
+
+```{r isopair-sr-simple-figs}
+library(patchwork)
+get_exons  <- function(id){ r <- structures[structures$isoform_id == id, ]
+                            data.frame(exon_start = r$exon_starts[[1]], exon_end = r$exon_ends[[1]]) }
+get_strand <- function(id) structures$strand[match(id, structures$isoform_id)]
+
+relabel_tracks <- function(p){
+  for (i in seq_along(p$layers)) { d <- p$layers[[i]]$data
+    if (is.data.frame(d) && "label" %in% names(d)) {
+      d$label <- sub("^Reference","non-NMD", sub("^Comparator","NMD", d$label)); p$layers[[i]]$data <- d } }; p
+}
+
+strip_intron_arrows <- function(p){
+  for (i in seq_along(p$layers))
+    if (!is.null(p$layers[[i]]$geom_params$arrow)) p$layers[[i]]$geom_params$arrow <- NULL
+  p
+}
+
+shrink_utr <- function(p, utr_h = 0.10, cds_h = 0.25){
+  k <- which(vapply(p$layers, function(L)
+        is.data.frame(L$data) && all(c("region","y_pos","exon_start","exon_end") %in% names(L$data)),
+        logical(1)))
+  if (!length(k)) return(p)
+  k <- k[1]; d <- p$layers[[k]]$data
+  h <- ifelse(d$region %in% c("5UTR","3UTR"), utr_h, cds_h)
+  d$.ymin <- d$y_pos - h; d$.ymax <- d$y_pos + h
+  p$layers[[k]] <- ggplot2::geom_rect(
+    data = d, inherit.aes = FALSE, colour = NA,
+    mapping = ggplot2::aes(xmin = exon_start, xmax = exon_end,
+                           ymin = .data$.ymin, ymax = .data$.ymax, fill = region))
+  p
+}
+
+chevrons <- function(ex, y, strand, step){
+  e <- ex[order(ex$exon_start), ]; if (nrow(e) < 2) return(NULL)
+  intr <- data.frame(s = head(e$exon_end,-1), en = tail(e$exon_start,-1))
+  intr <- intr[intr$en > intr$s, , drop = FALSE]; if (!nrow(intr)) return(NULL)
+  do.call(rbind, lapply(seq_len(nrow(intr)), function(i){
+    xs <- seq(intr$s[i], intr$en[i], by = step); if (!length(xs)) return(NULL)
+    data.frame(x = xs, y = y, lab = if (strand == "-") "‹" else "›")
+  }))
+}
+
+ct_col  <- intersect(c("ct","cell_type"), colnames(dge_iso$samples))[1]
+samp_ct <- as.character(dge_iso$samples[[ct_col]])
+# relabel internal codes to display names AFTER reading the DGEList column
+samp_ct[samp_ct=="AT"] <- "AT2"; samp_ct[samp_ct=="DD"] <- "LAE"
+# per-isoform mean CPM in each cell type, SMG1i samples only
+expr_ct <- sapply(CELL_TYPES, function(c) rowMeans(cpm_iso[, samp_ct == c & is_smg, drop = FALSE]))
+ct_disp <- c(AT2="AT2", LAE="LAE", FB="FB", MV="MV")
+
+mk_side <- function(r){
+  ids <- c("non-NMD"=r$reference_isoform_id, "NMD"=r$comparator_isoform_id)
+  d <- do.call(rbind, lapply(names(ids), function(lab)
+    data.frame(track=lab, ct=CELL_TYPES, cpm=expr_ct[match(ids[[lab]], rownames(expr_ct)), CELL_TYPES])))
+  d$ctd   <- factor(unname(ct_disp[d$ct]), levels=c("AT2","LAE","FB","MV"))
+  d$track <- factor(d$track, levels=c("NMD","non-NMD"))
+  ggplot2::ggplot(d, ggplot2::aes(ctd, track, fill=log10(cpm+1))) +
+    ggplot2::geom_tile(colour="white") +
+    ggplot2::geom_text(ggplot2::aes(label=round(cpm)), size=4.2) +
+    ggplot2::scale_fill_gradient(low="#f7fbff", high="#08519c", guide="none") +
+    ggplot2::scale_x_discrete(position="top") +
+    ggplot2::labs(x=NULL, y=NULL, subtitle="mean CPM (SMG1i)") +
+    ggplot2::theme_minimal(base_size=13) +
+    ggplot2::theme(panel.grid    = ggplot2::element_blank(),
+                   axis.text.x   = ggplot2::element_text(size=12, face="bold"),
+                   axis.text.y   = ggplot2::element_text(size=12, face="bold"),
+                   plot.subtitle = ggplot2::element_text(size=13, hjust=0.5, face="bold"))
+}
+
+build_one <- function(r){
+  refx <- get_exons(r$reference_isoform_id); compx <- get_exons(r$comparator_isoform_id)
+  strand <- get_strand(r$reference_isoform_id)
+  p <- Isopair::plotIsoformPair(
+        reference_exons=refx, comparator_exons=compx,
+        events= if ("detailed_events" %in% colnames(sr_prof)) r$detailed_events[[1]] else NULL,
+        gene_id=r$gene_id, reference_id=r$reference_isoform_id,
+        comparator_id=r$comparator_isoform_id, strand=strand,
+        cds_metadata=cds_for_plot, show_events=TRUE, pair_label=r$sym)
+  p <- shrink_utr(relabel_tracks(p))
+  px <- ptc_x %>% filter(isoform_id == r$comparator_isoform_id, has_ptc %in% TRUE)
+  if (nrow(px))
+    p <- p + ggplot2::annotate("text", x=px$stop_x, y=1.45, label="*", size=7, colour="red", fontface="bold")
+  patchwork::wrap_plots(p, mk_side(r), widths=c(5, 1.3))
+}
+nmd_prof <- sr_prof %>% filter(pair_class=="NMD") %>% arrange(sr_num(sym))
+for (i in seq_len(nrow(nmd_prof))) {
+  r <- nmd_prof[i, ]
+  if (!(r$reference_isoform_id %in% structures$isoform_id) ||
+      !(r$comparator_isoform_id %in% structures$isoform_id)) {
+    cat(sprintf("\n\n### %s — isoform not in GTF subset, skipped\n\n", r$sym)); next }
+  cat(sprintf("\n\n### %s — top non-NMD vs top NMD (n_se = %d, poison = %s, PTC = %s)\n\n",
+              r$sym, r$n_se, r$has_poison,
+              ptc_x$has_ptc[match(r$comparator_isoform_id, ptc_x$isoform_id)]))
+  print(build_one(r))
+}
+```
+
+## SE / IR event coordinates relative to the stop (poison-causality check)
+
+```{r isopair-sr-simple-grid}
+poison_causal <- function(stop_x, lo, hi, strand) if (strand=="+") stop_x >= lo else stop_x <= hi
+
+se_tab <- sr_prof %>% filter(pair_class=="NMD") %>%
+  select(sym, detailed_events) %>%
+  tidyr::unnest(detailed_events) %>% filter(event_type=="SE") %>%
+  group_by(sym, comparator_isoform_id) %>%
+  summarise(lo = min(c(five_prime, three_prime)),
+            hi = max(c(five_prime, three_prime)),
+            strand = dplyr::first(strand), .groups="drop") %>%
+  left_join(ptc_x %>% select(isoform_id, stop_x), by = c("comparator_isoform_id"="isoform_id")) %>%
+  mutate(poison_causal = mapply(poison_causal, stop_x, lo, hi, strand)) %>%
+  arrange(sr_num(sym))
+print(se_tab)
+
+# ── Claim 2.6.5, the computable half ──────────────────────────────────────────────────
+# The paper splits the 11 genes as poison cassette exon 6 / intron retention 3 / 3' UTR splicing
+# 1 / internal exon gain 1. ONLY THE 6 IS COMPUTABLE. poison_causal is the strand-aware test that
+# the gained SE actually contains the traced stop, and it is TRUE for exactly the six genes the
+# manuscript names. The coarser structural SE-GAIN flag is TRUE for EIGHT, adding SRSF2 and
+# SRSF10 -- which the manuscript assigns to intron retention instead. Both are emitted, the 6
+# against the published value and the 8 as the witness, so the disagreement is machine-visible.
+# The remaining 3 / 1 / 1 are hand curation and are deliberately NOT emitted (see W117).
+POISON_POP <- paste("SR-protein NMD pairs carrying at least one gained cassette-exon event",
+                    "(Control pairs excluded); the 3 genes with no such event never appear, so",
+                    "the immediate denominator is the 8 SE-carrying genes, not 11. `poison_causal`",
+                    "additionally requires the reference-AUG-traced stop to fall within the",
+                    "gained exon, strand-aware")
+claim_emit("2.6.5", "SR genes whose gained cassette exon contains the traced stop",
+           sum(se_tab$poison_causal), published = "6", n = nrow(se_tab),
+           population = POISON_POP)
+
+ir <- sr_prof %>% filter(pair_class=="NMD") %>%
+  select(sym, detailed_events) %>% tidyr::unnest(detailed_events) %>%
+  filter(grepl("IR", event_type)) %>%
+  group_by(sym, comparator_isoform_id) %>%
+  summarise(ir_lo = min(c(five_prime, three_prime)),
+            ir_hi = max(c(five_prime, three_prime)),
+            strand = dplyr::first(strand),
+            event  = paste(unique(event_type), collapse=","), .groups="drop") %>%
+  left_join(ptc_x %>% select(isoform_id, stop_x), by = c("comparator_isoform_id"="isoform_id")) %>%
+  mutate(in_3UTR = ifelse(strand == "+", ir_lo > stop_x, ir_hi < stop_x))  # intron entirely 3' of stop
+print(ir)
+
+# 2.6.5's intron-retention witness. The manuscript says 3; the automated listing covers 5.
+# Supporting only -- there is no expression that yields 3 without hard-coding a gene name.
+claim_emit("2.6.5", "SR genes with any intron-retention event (paper states 3)",
+           n_distinct(ir$sym), n = n_distinct(ir$sym),
+           population = paste("SR-protein NMD pairs with at least one event whose type matches",
+                              "IR, which includes the partial-IR types as well as full intron",
+                              "retention; Control pairs excluded. Broader than strict intron",
+                              "retention, and broader than the manuscript's trio"))
+
+```
+
+# SRSF2 3'UTR-intron geometry (deep dive)
+
+```{r srsf2-3utr-intron}
+G <- "SRSF2"
+nmd_id <- sr_pairs %>% filter(sym==G, pair_class=="NMD") %>% pull(comparator_isoform_id) %>% .[1]
+strand <- get_strand(nmd_id)
+stop_x <- ptc_x$stop_x[match(nmd_id, ptc_x$isoform_id)]
+
+ex <- get_exons(nmd_id)                       # exon_start / exon_end (genomic)
+ex <- ex[order(ex$exon_start), ]
+if (strand=="-") ex <- ex[order(-ex$exon_start), ]   # put in transcript 5'->3' order
+ex$len <- ex$exon_end - ex$exon_start + 1
+ex$idx <- seq_len(nrow(ex))
+
+## classify each exon relative to the stop (3'UTR = wholly downstream of stop)
+ex$class <- if (strand=="-") {
+  ifelse(ex$exon_end   < stop_x, "3UTR",
+  ifelse(ex$exon_start > stop_x, "CDS/5'", "stop-exon"))
+} else {
+  ifelse(ex$exon_start > stop_x, "3UTR",
+  ifelse(ex$exon_end   < stop_x, "CDS/5'", "stop-exon"))
+}
+
+stop_exon <- ex[ex$class=="stop-exon", ]
+utr_in_stop_exon <- if (nrow(stop_exon)) {
+  if (strand=="-") (stop_x - stop_exon$exon_start[1])      # stop -> 3' (downstream = lower coord)
+  else             (stop_exon$exon_end[1] - stop_x)
+} else NA
+
+cat(sprintf("SRSF2 NMD isoform = %s  (strand %s)  stop_x=%d\n", nmd_id, strand, stop_x))
+cat("\nExons in transcript order (5'->3'):\n"); print(ex[, c("idx","exon_start","exon_end","len","class")])
+
+first_utr <- ex[ex$class=="3UTR", ][1, ]
+cat(sprintf("\n3'UTR portion of the stop-containing exon: %s nt\n", utr_in_stop_exon))
+cat(sprintf("First fully-3'UTR exon: idx=%s  coords=%s-%s  length=%s nt\n",
+            first_utr$idx, first_utr$exon_start, first_utr$exon_end, first_utr$len))
+```
+
+# SRSF8 start-codon architecture (deep dive)
+
+## Is ENST00000638426 the dominant DMSO isoform?
+
+```{r srsf8-dominance}
+G <- "SRSF8"
+g_id <- iso2gene %>% filter(hgnc_symbol == G) %>% pull(gene_id) %>% unique()
+iso  <- intersect(iso2gene$isoform_id[iso2gene$gene_id %in% g_id], names(mean_dmso))
+
+srsf8 <- data.frame(isoform_id = iso,
+                    mean_dmso  = mean_dmso[iso],
+                    mean_smg   = mean_smg[iso],
+                    is_nmd     = iso %in% nmd_iso_all) %>%
+  arrange(desc(mean_dmso)) %>%
+  mutate(dmso_frac = round(100*mean_dmso/sum(mean_dmso),1),
+         rank_dmso = row_number())
+print(srsf8)
+
+target <- grep("^ENST00000638426", srsf8$isoform_id, value = TRUE)
+cat(sprintf("\nENST00000638426 present: %s\n", length(target) > 0))
+if (length(target))
+  cat(sprintf("  DMSO rank = %d of %d | DMSO CPM = %.1f (%.1f%% of gene) | NMD-susceptible = %s\n",
+              srsf8$rank_dmso[srsf8$isoform_id==target], nrow(srsf8),
+              srsf8$mean_dmso[srsf8$isoform_id==target],
+              srsf8$dmso_frac[srsf8$isoform_id==target],
+              srsf8$is_nmd[srsf8$isoform_id==target]))
+
+```
+
+## All AUGs, ORFs, Kozak context and PTC status (Ensembl REST)
+
+```{r srsf8-aug-table}
+suppressPackageStartupMessages({library(jsonlite); library(Biostrings); library(dplyr)})
+TX <- "ENST00000638426"
+
+## --- 1. cDNA + exon structure, FROM THE DEPOSIT (2026-08-03) ----------------
+# This was two live GET calls to https://rest.ensembl.org -- no eval= guard, no tryCatch -- so a
+# reader without internet could not render this section at all; the clean-room run had to except
+# the whole file on those two lines. The data is DEPOSITED rather than recomputed because Ensembl
+# sequence and structure are not derivable from the GTFs in the record: a GTF says where exons
+# are, not what the reference cDNA reads.
+#
+# Only what this chunk consumes was captured: the cDNA (to enumerate AUGs, ORFs and Kozak
+# context) and the exon spans and strand (to place the junctions the 50-nt PTC rule needs).
+# Provenance -- both request URLs, the assembly and the capture time -- travels inside the file.
+ref  <- fromJSON(file.path(.P$ANNOT, "srsf8_ENST00000638426_reference.json"))
+stopifnot(sub("\\..*$", "", ref$transcript_id) == TX)   # the file is ABOUT the transcript we mean
+cdna <- DNAString(ref$cdna); L <- length(cdna)
+ex   <- ref$exons[order(ref$exons$start), c("start","end")]; strand <- ref$strand
+exo  <- if (strand==1) ex else ex[order(-ex$start),]
+exlen <- exo$end - exo$start + 1
+junc_cdna <- head(cumsum(exlen), -1)                       # last base of each non-terminal exon
+gc_cds_start_g <- ref$translation$start; gc_cds_end_g <- ref$translation$end
+
+## --- 2. all AUGs, their ORFs, Kozak context, length, PTC --------------------
+s <- as.character(cdna)
+atg <- gregexpr("ATG", s)[[1]]; atg <- atg[atg>0]
+kozak <- function(p){
+  m3 <- if (p-3 >= 1) substr(s, p-3, p-3) else "N"
+  p4 <- if (p+3 <= L) substr(s, p+3, p+3) else "N"
+  strong <- (m3 %in% c("A","G")) & (p4=="G")
+  adeq   <- (m3 %in% c("A","G")) | (p4=="G")
+  data.frame(minus3=m3, plus4=p4,
+             kozak=ifelse(strong,"strong",ifelse(adeq,"adequate","weak")))
+}
+orf_of <- function(p){
+  codons <- substring(s, seq(p, L-2, 3), seq(p+2, L, 3))
+  st <- which(codons %in% c("TAA","TAG","TGA"))[1]
+  stop_cdna <- if (is.na(st)) NA else p + 3*st - 1
+  data.frame(stop_cdna=stop_cdna,
+             aa_len = if (is.na(st)) NA else st-1)
+}
+ptc_call <- function(stop_cdna){
+  if (is.na(stop_cdna)) return(c(n_down_ejc=NA, ptc=NA, dist=NA))
+  d <- max(junc_cdna) - stop_cdna
+  n <- sum(junc_cdna > stop_cdna + 50)
+  c(n_down_ejc=n, ptc=as.integer(d>50), dist=d)
+}
+tab <- bind_rows(lapply(atg, function(p){
+  o <- orf_of(p); pt <- ptc_call(o$stop_cdna)
+  cbind(data.frame(atg_cdna=p), kozak(p), o,
+        n_down_ejc=pt["n_down_ejc"], ptc=pt["ptc"], dist_stop_to_lastEJ=pt["dist"])
+})) %>% arrange(atg_cdna)
+tab$is_gencode_cds <- tab$atg_cdna == 7            # GENCODE micro-ORF start (pos 7)
+tab$main_orf <- tab$aa_len == max(tab$aa_len, na.rm=TRUE)
+
+## --- 3. uORF logic + competing-AUG spacing -----------------------------------
+main_start <- tab$atg_cdna[which.max(tab$aa_len)]
+tab$class <- ifelse(tab$stop_cdna < main_start & !is.na(tab$stop_cdna), "uORF",
+              ifelse(tab$atg_cdna==main_start, "main-ORF","downstream/internal"))
+tab$gap_to_next_atg <- c(diff(tab$atg_cdna), NA)
+
+cat(sprintf("Transcript %s | length %d nt | exon-junctions(cDNA): %s | strand %s\n",
+            TX, L, paste(junc_cdna, collapse=","), ifelse(strand==1,"+","-")))
+cat(sprintf("Longest ORF (candidate main): ATG@%d, %d aa, PTC=%s\n",
+            main_start, max(tab$aa_len,na.rm=TRUE),
+            tab$ptc[which.max(tab$aa_len)]))
+print(tab %>% select(atg_cdna, kozak, minus3, plus4, aa_len, stop_cdna,
+                     n_down_ejc, ptc, class, is_gencode_cds, main_orf, gap_to_next_atg))
+
+```
+
+## uORF / start-codon map of the NMD isoform
+
+```{r srsf8-uorf-map}
+library(ggplot2); library(dplyr)
+
+ISO <- grep("ENST00000638426", structures$isoform_id, value=TRUE)[1]
+strand <- get_strand(ISO)
+g2  <- function(p) tx2genomic(ISO,p)
+s   <- sequences[[ISO]]
+
+KZ <- list(c(A=.22,C=.28,G=.30,T=.20), c(A=.20,C=.30,G=.30,T=.20),
+           c(A=.23,C=.33,G=.27,T=.17), c(A=.45,C=.10,G=.37,T=.08),
+           c(A=.25,C=.40,G=.20,T=.15), c(A=.20,C=.42,G=.23,T=.15),
+           c(A=.18,C=.22,G=.46,T=.14))
+kz_seq <- function(p){ pos<-c(p-6,p-5,p-4,p-3,p-2,p-1,p+3)
+  if (p-6<1 || p+3>nchar(s)) return(NA_real_)
+  sum(vapply(seq_along(pos),function(i) log2(KZ[[i]][[substr(s,pos[i],pos[i])]]/0.25),numeric(1))) }
+ostop <- function(p){ L<-nchar(s); cod<-substring(s,seq(p,L-2,3),seq(p+2,L,3))
+  st<-which(cod %in% c("TAA","TAG","TGA"))[1]; if (is.na(st)) NA else p+3*st-1 }
+
+cds <- cds_for_plot %>% filter(isoform_id==ISO)
+cds_s <- min(cds$cds_start); cds_e <- max(cds$cds_end)
+cds_atg_g <- if (strand == "+") cds_s else cds_e
+
+ex <- get_exons(ISO)[order(get_exons(ISO)$exon_start),]
+cls_bnds <- (if (strand == "+")
+  list(c(-Inf,cds_s-1,"5UTR"), c(cds_s,cds_e,"CDS"), c(cds_e+1,Inf,"3UTR"))
+else
+  list(c(cds_e+1,Inf,"5UTR"), c(cds_s,cds_e,"CDS"), c(-Inf,cds_s-1,"3UTR")))
+h <- c("5UTR"=0.11,"CDS"=0.26,"3UTR"=0.11)
+rects <- bind_rows(lapply(seq_len(nrow(ex)),function(i)
+  bind_rows(lapply(cls_bnds,function(z){
+    a<-max(ex$exon_start[i],as.numeric(z[1])); b<-min(ex$exon_end[i],as.numeric(z[2]))
+    if (a>b) NULL else data.frame(region=z[3],xmin=a,xmax=b) })))) %>%
+  mutate(ymin=-h[region], ymax=h[region])
+intr <- if (nrow(ex)>1) data.frame(s=head(ex$exon_end,-1),e=tail(ex$exon_start,-1)) else NULL
+chev <- if (!is.null(intr)) bind_rows(lapply(seq_len(nrow(intr)),function(i){
+  xs<-seq(intr$s[i],intr$e[i],length.out=5); xs<-xs[-c(1,length(xs))]
+  data.frame(x=xs,lab=if(strand=="-")"‹" else "›") })) else NULL
+
+atgs <- { g<-gregexpr("ATG",s)[[1]]; g[g>0] }
+u <- bind_rows(lapply(atgs,function(p){ sp<-ostop(p); if (is.na(sp)) return(NULL)
+  ag<-g2(p); stg<-g2(sp)
+  is_up <- if (strand=="+") ag<cds_atg_g else ag>cds_atg_g; if (!is_up) return(NULL)
+  ov <- if (strand=="+") stg>=cds_atg_g else stg<=cds_atg_g
+  data.frame(atg_g=ag,stop_g=stg,kz=round(kz_seq(p),2),aa=(sp-p)/3,
+             cls=ifelse(ov,"uORF2 (CDS-overlapping)","uORF1 (canonical)")) })) %>%
+  arrange(atg_g) %>%
+  mutate(lane = row_number(),
+         yb   = -0.42 - 0.22*(lane-1),
+         ytick= yb + 0.10)
+
+reg_cols <- c("5UTR"="#6baed6","CDS"="#238b45","3UTR"="#e6850e")
+u_cols   <- c("uORF1 (canonical)"="#6a3d9a","uORF2 (CDS-overlapping)"="#d6371f")
+xr <- range(c(rects$xmin,rects$xmax)); pad <- diff(xr)*0.02
+
+p <- ggplot() +
+  { if (!is.null(intr)) geom_segment(data=intr, aes(x=s,xend=e,y=0,yend=0), colour="#9aa0a6", linewidth=.4) } +
+  { if (!is.null(chev)) geom_text(data=chev, aes(x=x,y=0,label=lab), colour="#9aa0a6", size=3.5) } +
+  geom_rect(data=rects, aes(xmin=xmin,xmax=xmax,ymin=ymin,ymax=ymax,fill=region), colour=NA) +
+  scale_fill_manual(values=reg_cols, name="Region", breaks=c("5UTR","CDS","3UTR")) +
+  ggnewscale::new_scale_colour() +
+  geom_segment(data=u, aes(x=atg_g,xend=stop_g,y=yb,yend=yb,colour=cls), linewidth=.8) +
+  geom_segment(data=u, aes(x=atg_g,xend=atg_g,y=ytick,yend=yb,colour=cls), linewidth=.8) +
+    geom_text(data=u, aes(x=pmax(atg_g,stop_g)+pad, y=yb,
+                        label=sprintf("%s  ATG Kz %+.2f  (%.0f aa)",
+                                      sub(" .*","",cls), kz, aa), colour=cls),
+            size=2.8, hjust=0, vjust=0.5, show.legend=FALSE) +
+  scale_colour_manual(values=u_cols, name=NULL) +
+  annotate("text", x=cds_atg_g, y=0.42,
+           label=sprintf("CDS  ATG Kz %+.2f", round(kz_seq(atgs[which(vapply(atgs,g2,numeric(1))==cds_atg_g)][1]),2)),
+           colour="#238b45", size=2.9, fontface="bold", hjust=0) +
+  coord_cartesian(xlim=c(xr[1]-diff(xr)*0.05, xr[2]+diff(xr)*0.25),
+                  ylim=c(min(u$yb)-0.2, 0.7), clip="off") +
+  labs(title="SRSF8 NMD isoform (ENST00000638426.1) — uORF / start-codon architecture",
+       x=sprintf("Genomic position (%s strand)", ifelse(strand=="-","−","+")), y=NULL) +
+  theme_minimal(base_size=12) +
+  theme(axis.text.y=element_blank(), panel.grid.major.y=element_blank(),
+        panel.grid.minor=element_blank(), legend.position="bottom")
+print(p)
+```
+
+## Competing CDS interpretations: GENCODE micro-ORF (PTC+) vs strong internal start ATG@46 (PTC−)
+
+```{r srsf8-competing-cds}
+library(ggplot2); library(dplyr)
+
+## 5-point star polygon, with independent x (genomic) and y (lane) radii
+star_pts <- function(cx, cy, rx, ry, npoint=5, rot=pi/2){
+  ang <- rot + seq(0, 2*pi, length.out = 2*npoint + 1)[-(2*npoint + 1)]
+  rad <- rep(c(1, 0.4), npoint)            # outer, inner vertices
+  data.frame(x = cx + rx*rad*cos(ang), y = cy + ry*rad*sin(ang))
+}
+
+ISO <- grep("ENST00000638426", structures$isoform_id, value=TRUE)[1]
+strand <- get_strand(ISO); s <- sequences[[ISO]]; g2 <- function(p) tx2genomic(ISO,p)
+ex <- get_exons(ISO)[order(get_exons(ISO)$exon_start),]
+exlen <- ex$exon_end-ex$exon_start+1; cum0 <- c(0,head(cumsum(exlen),-1))
+junc  <- head(cumsum(exlen),-1); Ltx <- sum(exlen)
+
+KZ <- list(c(A=.22,C=.28,G=.30,T=.20),c(A=.20,C=.30,G=.30,T=.20),c(A=.23,C=.33,G=.27,T=.17),
+           c(A=.45,C=.10,G=.37,T=.08),c(A=.25,C=.40,G=.20,T=.15),c(A=.20,C=.42,G=.23,T=.15),
+           c(A=.18,C=.22,G=.46,T=.14))
+kz_seq<-function(p){pos<-c(p-6,p-5,p-4,p-3,p-2,p-1,p+3); if(p-6<1||p+3>nchar(s)) return(NA)
+  sum(vapply(seq_along(pos),function(i) log2(KZ[[i]][[substr(s,pos[i],pos[i])]]/0.25),numeric(1)))}
+ostop<-function(p){L<-nchar(s);cod<-substring(s,seq(p,L-2,3),seq(p+2,L,3));st<-which(cod%in%c("TAA","TAG","TGA"))[1];if(is.na(st))NA else p+3*st-1}
+ptc_of<-function(sp) !is.na(sp)&&(max(junc)-sp)>50&&any(junc>sp+50)
+
+## the two candidates: GENCODE start (first AUG) vs the strong internal start ATG@46
+atgs<-{g<-gregexpr("ATG",s)[[1]];g[g>0]}
+gen    <- list(atg=min(atgs)); gen$stop<-ostop(gen$atg); gen$kz<-kz_seq(gen$atg)
+strong <- { p<-46; list(atg=p, stop=ostop(p), kz=kz_seq(p)) }   # main ORF, not the global Kozak max
+
+## cDNA interval -> genomic rects (clipped to exons), at a given lane
+rr<-function(c1,c2,region,yl,hh){bind_rows(lapply(seq_along(exlen),function(i){
+  es<-cum0[i]+1;ee<-cum0[i]+exlen[i];a<-max(c1,es);b<-min(c2,ee); if(a>b)return(NULL)
+  data.frame(region=region,xmin=min(g2(a),g2(b)),xmax=max(g2(a),g2(b)),ymin=yl-hh,ymax=yl+hh)}))}
+lane<-function(cand,yl){bind_rows(
+  rr(1,cand$atg-1,"5UTR",yl,.07), rr(cand$atg,cand$stop,"CDS",yl,.20), rr(cand$stop+1,Ltx,"3UTR",yl,.07))}
+
+Yg<-1; Ys<-0
+rects<-bind_rows(lane(gen,Yg), lane(strong,Ys))
+intr<-data.frame(s=head(ex$exon_end,-1),e=tail(ex$exon_start,-1))
+intr2<-bind_rows(transform(intr,y=Yg),transform(intr,y=Ys))
+ejc_g<-g2(max(junc))
+
+reg_cols<-c("5UTR"="#6baed6","CDS"="#238b45","3UTR"="#e6850e")
+xr<-range(c(rects$xmin,rects$xmax))
+
+ggplot()+
+  geom_segment(data=intr2,aes(x=s,xend=e,y=y,yend=y),colour="#9aa0a6",linewidth=.4)+
+  geom_rect(data=rects,aes(xmin=xmin,xmax=xmax,ymin=ymin,ymax=ymax,fill=region),colour=NA)+
+  scale_fill_manual(values=reg_cols,name="Region",breaks=c("5UTR","CDS","3UTR"))+
+  geom_segment(aes(x=ejc_g,xend=ejc_g,y=Ys-0.35,yend=Yg+0.35),linetype="dashed",colour="#3b6fb0")+
+  annotate("text",x=ejc_g,y=Yg+0.45,label="EJC",colour="#3b6fb0",size=3,fontface="bold")+
+  geom_polygon(data = star_pts(g2(gen$stop), Yg+0.33, rx=diff(xr)*0.016, ry=0.11),
+               aes(x=x, y=y), fill="#d6371f", colour="#d6371f", inherit.aes=FALSE)+
+  geom_segment(aes(x=g2(gen$stop), xend=g2(gen$stop), y=Yg+0.20, yend=Yg+0.24),
+               colour="#d6371f", linewidth=.5)+
+  annotate("text", x=g2(gen$stop), y=Yg+0.50, label="PTC",
+           colour="#d6371f", size=2.9, fontface="bold")+
+  annotate("text",x=xr[1],y=Yg,hjust=1.05,size=3.2,fontface="bold",colour="#d6371f",
+           label=sprintf("GENCODE start\nATG Kz %+.2f\nPTC+ (NMD)",gen$kz))+
+  annotate("text",x=xr[1],y=Ys,hjust=1.05,size=3.2,fontface="bold",colour="#238b45",
+           label=sprintf("ATG@%d\nATG Kz %+.2f\nPTC− (escapes)",strong$atg,strong$kz))+
+  coord_cartesian(xlim=c(xr[1]-diff(xr)*0.18,xr[2]+diff(xr)*0.03),ylim=c(-0.6,1.6),clip="off")+
+  labs(title="SRSF8 NMD isoform (ENST00000638426.1): two competing CDS interpretations",
+       subtitle="Same transcript — weak GENCODE start → PTC/NMD vs strong internal start → escapes",
+       x=sprintf("Genomic position (%s strand)",ifelse(strand=="-","−","+")),y=NULL)+
+  theme_minimal(base_size=12)+
+  theme(axis.text.y=element_blank(),panel.grid.major.y=element_blank(),
+        panel.grid.minor=element_blank(),legend.position="bottom",plot.margin=margin(10,20,10,80))
+```
+
+# Full list of NMD-target RBPs (supplement)
+
+```{r nmd-rbp-list}
+nmd_rbp <- data.frame(gene_id = nmd_genes[is_rbp(nmd_genes)]) %>%
+  mutate(gene_symbol = sym_of(gene_id),
+         consensus_rna_target = rbp$consensus_rna_target[match(gene_symbol, rbp$gene_symbol)]) %>%
+  arrange(gene_symbol)
+cat(sprintf("NMD-target RBPs: %d\n", nrow(nmd_rbp)))
+print(nmd_rbp %>% count(consensus_rna_target, name="n") %>% arrange(desc(n)))
+fwrite(nmd_rbp, file.path(OUT_DIR, paste0("nmd_target_rbps_", DATE_STAMP, ".csv")))
+fwrite(nmd_gene_ct, file.path(OUT_DIR, paste0("nmd_target_genes_by_ct_", DATE_STAMP, ".csv")))
+cat("Saved to:", OUT_DIR, "\n")
+```
+
+# ENCODE eCLIP RBP roster (Van Nostrand 2020)
+
+```{r eclip}
+# Deposited 2026-07-29 -- see the note at RBP_CSV above. THIS is the roster §2's functional
+# classes actually come from, despite the manuscript crediting the Gerstberger census, whose file
+# has no functional-class column at all (its columns are gene_symbol, ensembl_gene_id,
+# consensus_rna_target, domains). That attribution is a manuscript wording question, not a
+# reachability one, and depositing the file settles only the latter.
+enc <- file.path(.P$DEPOSIT, "encode_rbp_roster_vannostrand2020.csv")
+enc <- fread(enc)
+enc <- as.data.frame(enc)
+colnames(enc)[1:2] <- c("RBP_name","GeneID")
+enc_ens <- sv(enc$GeneID)
+
+# which ENCODE RBPs are NMD targets in our data
+enc$is_nmd_target <- enc_ens %in% sv(nmd_genes)
+cat(sprintf("ENCODE RBPs that are NMD targets in our cells: %d of %d (%.0f%%)\n",
+            sum(enc$is_nmd_target), nrow(enc), 100*mean(enc$is_nmd_target)))
+
+# ---- enrichment: are ENCODE RBPs over-represented among NMD targets? ----
+is_enc <- function(gid) sv(gid) %in% enc_ens
+tab_enc <- table(NMD_target = bg_genes %in% nmd_genes, ENCODE_RBP = is_enc(bg_genes))
+print(tab_enc)
+ft_enc <- fisher.test(tab_enc, alternative="greater")
+cat(sprintf("\nENCODE-RBP enrichment among NMD targets: OR=%.2f (95%% CI %.2f-%.2f), p=%.2e\n",
+            ft_enc$estimate, ft_enc$conf.int[1], ft_enc$conf.int[2], ft_enc$p.value))
+
+# ── Claim 2.6.2, ENCODE half — THE PUBLISHED PAIR "255 of 356" CANNOT EXIST ────────────
+# The two numbers come from opposite sides of the comparison and there is no set for which both
+# hold:
+#   sum(is_enc(nmd_genes)) = 255 -- GENE-ID side, whose matching background total is 347.
+#   sum(enc$is_nmd_target) = 254 -- ROSTER side, whose denominator is nrow(enc) = 356.
+# The self-consistent pairs are 254/356 and 255/347. The one-unit gap is NPM1, counted twice on
+# the gene-id side because it appears both as a plain versioned id and inside a SQANTI fusion id
+# that truncates to the same base. All three numbers are emitted so the pairing error is visible
+# rather than requiring a reader to reconstruct it.
+ENC_POP_GID <- paste("our NMD-target GENE IDS matching the ENCODE eCLIP roster by versionless",
+                     "Ensembl gene id; gene ids, so a fusion id can double-count one roster",
+                     "gene. Background side of this same construction totals 347")
+ENC_POP_ROSTER <- paste("rows of the ENCODE eCLIP roster flagged as NMD targets in our data --",
+                        "the ROSTER side, one row per roster gene, so no double counting;",
+                        "denominator is the full roster")
+claim_emit("2.6.2", "ENCODE-roster RBPs among NMD-target gene ids",
+           sum(is_enc(nmd_genes)), published = "255", n = length(nmd_genes),
+           population = ENC_POP_GID)
+claim_emit("2.6.2", "ENCODE roster rows flagged as NMD targets (roster side)",
+           sum(enc$is_nmd_target), n = nrow(enc), population = ENC_POP_ROSTER)
+claim_emit("2.6.2", "size of the ENCODE eCLIP roster", nrow(enc),
+           published = "356", n = nrow(enc),
+           population = "all rows of the published ENCODE eCLIP RBP roster, one per RBP")
+claim_emit("2.6.2", "odds ratio, ENCODE-RBP enrichment among NMD targets",
+           unname(ft_enc$estimate), published = "4.1", n = length(bg_genes),
+           population = paste("one-sided Fisher exact test on NMD-target vs not, crossed with",
+                              "roster-RBP vs not, over the DIE-tested background gene ids"))
+claim_emit("2.6.2", "Fisher p, ENCODE-RBP enrichment (paper states p < 1e-3)",
+           ft_enc$p.value, n = length(bg_genes),
+           population = "same test as the odds ratio above")
+
+kable(data.frame(
+  set     = c("NMD-target genes","background (DIE-tested)"),
+  n_genes = c(length(nmd_genes), length(bg_genes)),
+  n_ENCODE_RBP = c(sum(is_enc(nmd_genes)), sum(is_enc(bg_genes))),
+  pct_ENCODE_RBP = round(100*c(mean(is_enc(nmd_genes)), mean(is_enc(bg_genes))),1)),
+  caption="ENCODE RBP fraction among NMD-target genes vs all DIE-tested genes (Van Nostrand 2020 roster).")
+
+# break down by ENCODE function category (counts + enrichment per category)
+fn_cols <- c("Splicing regulation","Spliceosome","Exon Junction Complex",
+             "3' end processing","RNA stability & decay","Translation regulation","RNA localization")
+kable(bind_rows(lapply(fn_cols, function(fc){
+  inset    <- enc[[fc]] %in% c(1,"1")
+  fc_ens   <- intersect(enc_ens[inset], sv(bg_genes))
+  tb <- table(NMD = bg_genes %in% nmd_genes, INCAT = sv(bg_genes) %in% fc_ens)
+  f  <- tryCatch(fisher.test(tb, alternative="greater"), error=function(e) NULL)
+  data.frame(`function`        = fc,
+             n_RBPs            = sum(inset),
+             n_NMD_target      = sum(inset & enc$is_nmd_target),
+             pct_NMD_target    = round(100*mean(enc$is_nmd_target[inset]),0),
+             OR  = if (is.null(f)) NA else round(unname(f$estimate),2),
+             p   = if (is.null(f)) NA else signif(f$p.value,3))
+})), caption="ENCODE RBPs that are NMD targets in our lung cells, by function category, with enrichment of each category among NMD targets (one-sided Fisher vs DIE-tested background).")
+
+# ── Claim 2.6.3 — the two functional-class odds ratios ────────────────────────────────
+# BOTH ORs REPRODUCE AND THE SUPERLATIVE DOES NOT. The sentence says splicing regulators and
+# core spliceosome components "were the most enriched (splicing regulation OR 4.0; spliceosome
+# OR 6.9)", but Spliceosome's OR EXCEEDS splicing regulation's, so splicing regulation is not
+# the most enriched class. The ordering is emitted as a supporting number alongside the two ORs
+# so the claim can be checked rather than inferred.
+#
+# AND THE CLASSES ARE NOT THE GERSTBERGER CENSUS'S. The sentence attributes them to that census,
+# whose file has FOUR columns -- gene symbol, Ensembl gene id, consensus RNA target, domains --
+# and no functional class at all. They come from the ENCODE roster read above. Depositing that
+# roster settles reachability and settles nothing about the attribution, which is Yul's call.
+FC_POP <- paste("one-sided Fisher exact test for enrichment of an ENCODE functional class among",
+                "NMD-target genes, over the DIE-tested background gene ids. The class membership",
+                "column is the ENCODE/Van Nostrand roster's, NOT the Gerstberger census's. The",
+                "class sets OVERLAP -- 22 roster genes carry both of these two flags -- so the",
+                "two odds ratios are not independent and not mutually exclusive")
+.fc_or <- function(fc) {
+  inset  <- enc[[fc]] %in% c(1, "1")
+  fc_ens <- intersect(enc_ens[inset], sv(bg_genes))
+  tb <- table(NMD = bg_genes %in% nmd_genes, INCAT = sv(bg_genes) %in% fc_ens)
+  f  <- tryCatch(fisher.test(tb, alternative = "greater"), error = function(e) NULL)
+  if (is.null(f)) NA_real_ else unname(f$estimate)
+}
+.or_splreg <- .fc_or("Splicing regulation")
+.or_spliceo <- .fc_or("Spliceosome")
+claim_emit("2.6.3", "odds ratio, splicing-regulation class enrichment among NMD targets",
+           .or_splreg, published = "4.0", n = length(bg_genes), population = FC_POP)
+claim_emit("2.6.3", "odds ratio, spliceosome class enrichment among NMD targets",
+           .or_spliceo, published = "6.9", n = length(bg_genes), population = FC_POP)
+# The superlative, made checkable: 1 if splicing regulation really is the more enriched of the
+# two the sentence names, 0 if it is not.
+claim_emit("2.6.3", "is splicing regulation more enriched than spliceosome (1 = yes)",
+           as.integer(.or_splreg > .or_spliceo), n = length(bg_genes),
+           population = paste("comparison of the two odds ratios above; the sentence asserts",
+                              "splicing regulation is among the most enriched classes"))
+
+# of the splicing RBPs that ARE NMD targets, which have eCLIP available
+spl <- enc[(enc$`Splicing regulation` %in% c(1,"1") | enc$Spliceosome %in% c(1,"1")) & enc$is_nmd_target, ]
+cat(sprintf("\nSplicing-RBP NMD targets with eCLIP data: HepG2=%d, K562=%d (candidates for a binding overlay)\n",
+            sum(spl$`eCLIP HepG2` %in% c(1,"1")), sum(spl$`eCLIP K562` %in% c(1,"1"))))
+
+```
+
+```{r session}
+sessionInfo()
+```
