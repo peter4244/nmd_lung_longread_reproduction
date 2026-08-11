@@ -1,0 +1,715 @@
+---
+title: "Isoform-Level DIE: limma-voom + mashr"
+author: "Leshem, Yul"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: lumen
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+---
+
+Code location: `/udd/reyle/nmd_lungcells_2026/code/final/Isoform_Level_Quantification.Rmd`
+
+```{r setup, include=FALSE}
+.nmd_root <- local({ d <- getwd(); while (!file.exists(file.path(d, "config", "paths.yml"))) {
+  p <- dirname(d); if (identical(p, d)) stop("repo root not found"); d <- p }; d })
+source(file.path(.nmd_root, "R", "load_config.R")); .P <- nmd_paths(.nmd_root)
+source(file.path(.nmd_root, "R", "claim_emit.R"))  # Phase 2 claim-value emission
+# .P$OUT is written to directly below and nothing else creates it (clean-room rerun,
+# 2026-07-28). paths.yml promises "created on demand"; nmd_ensure_out is that promise.
+nmd_ensure_out(.P)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, dev = "pdf")
+options(bitmapType = "cairo")
+```
+
+# Overview
+
+This report produces isoform-level differential expression results for the
+NMD-inhibitor (Smg1i) vs DMSO contrast across four primary human lung cell
+types (AT2, LAE, FB, MV), using long-read PacBio Kinnex/MAS-Seq counts
+quantified by Isocall and filtered through SQANTI3.
+
+Cell-type codes in the raw data use the internal labels DD (= LAE) and AT (= AT2);
+sample names keep these prefixes to match the count-matrix columns, and the cell-type
+factor is relabeled to LAE/AT2 for analysis and all saved outputs (matching the
+short-read pipeline).
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(edgeR)
+  library(limma)
+  library(DT)
+  library(BiocParallel)
+  library(htmltools)
+  library(dplyr)
+  library(ggrepel)
+  library(gridExtra)
+  library(tidyr)
+})
+
+# Bioconductor namespace masking guard
+select <- dplyr::select
+filter <- dplyr::filter
+rename <- dplyr::rename
+count  <- dplyr::count
+slice  <- dplyr::slice
+
+# Output paths
+OUT_DIR_FIGURES <- file.path(.P$FIGURES, "lr_iso")
+DATE_STAMP      <- "4.30.26"
+dir.create(OUT_DIR_FIGURES, recursive = TRUE, showWarnings = FALSE)
+
+# Note: per-cell-type volcano plots, top-50 tables, and the logFC-correlation
+# heatmap are produced in the downstream LR summary RMDs, not here.
+```
+
+# Step 1 — Load Counts and GTF
+
+```{r load-data}
+counts_iso <- fread(
+  file.path(.P$DEPOSIT, "nmd_lungcells_counts_4ct.csv"),
+  data.table = FALSE
+)
+cat(sprintf("Loading isoform count matrix. Dimensions: %d isoforms x %d sample columns.\n",
+            nrow(counts_iso), ncol(counts_iso) - 1L))
+
+stopifnot("Duplicate transcript IDs in count matrix" = sum(duplicated(counts_iso$id)) == 0)
+
+n_na <- sum(is.na(counts_iso[, -1]))
+if (n_na > 0) cat(sprintf("WARNING: count matrix contains %d NA values (treated as 0).\n", n_na))
+
+gtf_raw <- fread(
+  file.path(.P$SQANTI, "nmd_lungcells_filtered.gtf"),
+  header = FALSE, sep = "\t", quote = "",
+  col.names = c("seqname", "source", "type", "start", "end",
+                "score", "strand", "frame", "attributes")
+)
+cat("Loaded GTF. Features by type:\n")
+print(table(gtf_raw$type))
+```
+
+# Step 2 — Build Transcript / Gene Annotation
+
+Parse the GTF to get transcript-to-gene mapping, exonic length per transcript,
+and (where available) transcript biotype. Symbols come from the project's
+gmap RDS; biotype is preferred from the GTF and falls back to biomaRt only if
+the GTF lacks that attribute.
+
+```{r annotation}
+parse_attr <- function(attrs, key) {
+  pattern <- paste0(key, ' "([^"]+)"')
+  m       <- regmatches(attrs, regexpr(pattern, attrs, perl = TRUE))
+  out     <- rep(NA_character_, length(attrs))
+  has     <- nchar(m) > 0
+  out[has] <- gsub(paste0(key, ' "|"'), "", m[has])
+  out
+}
+
+# -------- Transcript-to-gene mapping --------
+gtf_tx <- gtf_raw[gtf_raw$type == "transcript", ]
+gtf_tx$transcript_id <- parse_attr(gtf_tx$attributes, "transcript_id")
+gtf_tx$gene_id       <- parse_attr(gtf_tx$attributes, "gene_id")
+
+tx2gene <- unique(gtf_tx[!is.na(gtf_tx$transcript_id), c("transcript_id", "gene_id")])
+
+# Defensive: collapse transcripts mapping to multiple genes (rare)
+tx_multi_gene <- tx2gene %>% group_by(transcript_id) %>% filter(n() > 1)
+if (nrow(tx_multi_gene) > 0) {
+  cat(sprintf("FILTER: %d transcript(s) map to multiple genes; keeping the FIRST gene for each.\n",
+              n_distinct(tx_multi_gene$transcript_id)))
+  tx2gene <- tx2gene[!duplicated(tx2gene$transcript_id), ]
+}
+
+# -------- Exonic length per transcript --------
+gtf_exon <- gtf_raw[gtf_raw$type == "exon", ]
+gtf_exon$transcript_id <- parse_attr(gtf_exon$attributes, "transcript_id")
+gtf_exon$width         <- gtf_exon$end - gtf_exon$start + 1
+
+exon_lengths <- gtf_exon %>%
+  group_by(transcript_id) %>%
+  summarise(exonic_length = sum(width), .groups = "drop")
+
+gdf <- merge(tx2gene, exon_lengths, by = "transcript_id", all.x = TRUE)
+names(gdf)[1:2] <- c("txid", "gene_id")
+
+# -------- Add gene symbol via project gmap --------
+gmap            <- readRDS(file.path(.P$ANNOT, "gmap_txlevel_ENSGv115_2025.08.12.rds"))
+gene_symbol_map <- unique(gmap[, c("ensembl_gene_id_version", "hgnc_symbol")])
+gdf <- merge(gdf, gene_symbol_map,
+             by.x = "gene_id", by.y = "ensembl_gene_id_version",
+             all.x = TRUE)
+
+# -------- Add transcript biotype (prefer GTF, fall back to biomaRt) --------
+sample_attrs <- gtf_tx$attributes[1:5]
+has_transcript_type <- any(grepl('transcript_type', sample_attrs))
+has_gene_type       <- any(grepl('gene_type',       sample_attrs))
+
+if (has_transcript_type) {
+  biotype_df <- unique(data.frame(
+    txid = gtf_tx$transcript_id,
+    transcript_biotype = parse_attr(gtf_tx$attributes, "transcript_type"),
+    stringsAsFactors = FALSE
+  ))
+  gdf <- merge(gdf, biotype_df, by = "txid", all.x = TRUE)
+} else if (has_gene_type) {
+  biotype_df <- unique(data.frame(
+    txid = gtf_tx$transcript_id,
+    transcript_biotype = parse_attr(gtf_tx$attributes, "gene_type"),
+    stringsAsFactors = FALSE
+  ))
+  gdf <- merge(gdf, biotype_df, by = "txid", all.x = TRUE)
+} else if ("transcript_biotype" %in% names(gmap)) {
+  # Offline source, preferred over a live biomaRt query. The deposited transcript map
+  # carries GENCODE v49 (= Ensembl 115) biotypes, matching its own ENSGv115 vintage, so
+  # this is both deterministic and network-free. Novel (non-ENST) isoforms have no
+  # Ensembl biotype and stay NA, which is correct.
+  biotype_df <- unique(data.frame(
+    txid               = gmap$ensembl_transcript_id_version,
+    transcript_biotype = gmap$transcript_biotype,
+    stringsAsFactors   = FALSE
+  ))
+  gdf <- merge(gdf, biotype_df, by = "txid", all.x = TRUE)
+  cat(sprintf("Biotype from the deposited transcript map: %d / %d transcripts annotated.\n",
+              sum(!is.na(gdf$transcript_biotype)), nrow(gdf)))
+} else {
+  # Last resort: live Ensembl query. Reached only if the deposited map lacks biotype.
+  if (!require("biomaRt", quietly = TRUE)) BiocManager::install("biomaRt")
+  library(biomaRt)
+  # Pinned to Ensembl v115 to match the deposited annotation maps
+  # (gmap_*_ENSGv115_*.rds). Unpinned, this silently tracks whatever Ensembl is current,
+  # so the biotypes could drift from the published ones. It is still a LIVE network call --
+  # the deposit carries no offline biotype source. See MORNING_NOTES.md.
+  ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl", version = 115)
+
+  tx_ids_noversion <- unique(sub("\\..*", "", gdf$txid))
+  batch_size       <- 5000
+  biotype_list     <- list()
+  for (b in seq(1, length(tx_ids_noversion), by = batch_size)) {
+    batch_end <- min(b + batch_size - 1, length(tx_ids_noversion))
+    biotype_list[[ceiling(b / batch_size)]] <- getBM(
+      attributes = c("ensembl_transcript_id", "transcript_biotype"),
+      filters    = "ensembl_transcript_id",
+      values     = tx_ids_noversion[b:batch_end],
+      mart       = ensembl
+    )
+  }
+  biotype_df <- unique(do.call(rbind, biotype_list))
+
+  gdf$txid_noversion <- sub("\\..*", "", gdf$txid)
+  gdf <- merge(gdf, biotype_df,
+               by.x = "txid_noversion", by.y = "ensembl_transcript_id",
+               all.x = TRUE)
+  gdf$txid_noversion <- NULL
+}
+
+if (!"transcript_biotype" %in% colnames(gdf)) gdf$transcript_biotype <- NA
+
+cat(sprintf("Annotation built: %d transcripts. Symbol coverage %d/%d; biotype coverage %d/%d.\n",
+            nrow(gdf), sum(!is.na(gdf$hgnc_symbol)), nrow(gdf),
+            sum(!is.na(gdf$transcript_biotype)), nrow(gdf)))
+cat(sprintf("Count-matrix transcripts found in annotation: %d of %d.\n",
+            sum(counts_iso$id %in% gdf$txid), nrow(counts_iso)))
+
+rm(gtf_raw, gtf_tx, gtf_exon)
+```
+
+# Step 3 — Reformat Sample Names and Build DGEList
+
+Original sample names from the count matrix look like `Sample##_CT_ID_Treatment`.
+We strip the `Sample##` prefix and rebuild as `ID_Treatment_CT`, keeping the
+internal CT code (DD/AT) in the name so downstream regex parsing can pull the
+cell type off the end. ALI/submerged cultures (DO and the three DD ALI donors)
+are dropped, and the cell-type factor is then relabeled DD→LAE and AT→AT2 for
+analysis (sample names keep their DD/AT prefixes).
+
+```{r prepare-counts}
+rownames(counts_iso) <- counts_iso$id
+counts_iso$id        <- NULL
+count_mat            <- round(as.matrix(counts_iso))
+
+cat(sprintf("Formatted isoform count matrix: %d isoforms x %d samples.\n",
+            nrow(count_mat), ncol(count_mat)))
+cat(sprintf("  Total counts: %s | median library size: %s | all-zero isoforms: %d.\n",
+            format(sum(count_mat), big.mark = ","),
+            format(median(colSums(count_mat)), big.mark = ","),
+            sum(rowSums(count_mat) == 0)))
+
+# Reformat sample names: Sample##_CT_ID_Treatment -> ID_Treatment_CT
+# The deposited matrix already uses <donor>_<treatment>_<cellType> with the published
+# cell-type names, so no reformatting is needed -- this asserts the layout instead.
+#
+# This must NOT silently fall through: the old reformatter assumed
+# Sample{N}_{CT}_{donor}_{treatment} and, applied to a deposit column, scrambled it
+# (001V_DMSO_AT2 -> DMSO_AT2_001V), which put donor IDs in the cell-type field and only
+# surfaced much later as an unrelated relevel() error.
+CT_PUBLISHED <- c("AT2", "LAE", "FB", "MV")
+.parts <- strsplit(colnames(count_mat), "_")
+stopifnot(
+  "sample columns are not <donor>_<treatment>_<cellType>" =
+    all(lengths(.parts) == 3),
+  "sample columns carry an unexpected treatment" =
+    all(vapply(.parts, `[`, character(1), 2) %in% c("DMSO", "Smg1i")),
+  "sample columns carry a cell type outside the manuscript scope" =
+    all(vapply(.parts, `[`, character(1), 3) %in% CT_PUBLISHED),
+  "Duplicate sample names" = sum(duplicated(colnames(count_mat))) == 0
+)
+cat("Sample columns verified (ID_Treatment_CT). Examples:\n  ",
+    paste(head(colnames(count_mat), 5), collapse = ", "), "\n")
+```
+
+```{r build-pheno-and-dge}
+pheno <- data.frame(sample_name = colnames(count_mat), stringsAsFactors = FALSE)
+pheno$id        <- sapply(strsplit(pheno$sample_name, "_"), function(x) x[1])
+pheno$treatment <- sapply(strsplit(pheno$sample_name, "_"), function(x) x[2])
+pheno$ct        <- vapply(strsplit(pheno$sample_name, "_"), `[`, character(1), 3)
+cat("Cell-type counts:\n"); print(table(pheno$ct))
+
+# ---- 4-CT-native: nothing is dropped or relabelled here ----
+# The deposited matrix contains exactly the 26 manuscript samples with the published
+# cell-type names, so the ALI/submerged drop and the DD->LAE / AT->AT2 relabel that
+# earlier versions performed are already applied at source. Asserted, not repeated.
+stopifnot(
+  "input carries cell types outside the manuscript scope" =
+    setequal(unique(pheno$ct), CT_PUBLISHED),
+  "expected 26 manuscript samples" = nrow(pheno) == 26L,
+  "expected 13 donor-matched DMSO/SMG1i pairs" = all(table(pheno$treatment) == 13L)
+)
+cat(sprintf("4-CT-native input verified (%s): %d samples, %d donors.\n",
+            paste(CT_PUBLISHED, collapse = ", "), nrow(pheno), length(unique(pheno$id))))
+
+pheno$ct        <- relevel(factor(pheno$ct),        ref = "LAE")
+pheno$treatment <- relevel(factor(pheno$treatment), ref = "DMSO")
+cat(sprintf("Final design: %d samples; cell-type reference = %s, treatment reference = %s.\n",
+            nrow(pheno), levels(pheno$ct)[1], levels(pheno$treatment)[1]))
+cat("Samples per cell type x treatment:\n"); print(table(pheno$ct, pheno$treatment))
+
+# Match annotation to count matrix
+gdf_matched <- gdf[match(rownames(count_mat), gdf$txid), ]
+n_unmatched <- sum(is.na(gdf_matched$txid))
+if (n_unmatched > 0) {
+  cat(sprintf("Unmatched transcripts (novel isoforms, no annotation): %d.\n", n_unmatched))
+  gdf_matched$txid[is.na(gdf_matched$txid)] <- rownames(count_mat)[is.na(gdf_matched$txid)]
+}
+rownames(gdf_matched) <- rownames(count_mat)
+
+dge <- DGEList(count_mat, samples = pheno, genes = gdf_matched)
+dge_nofilt <- dge
+
+# (no dir.create for .P$FIGDATA -- it is an INPUT root; this script now writes to .P$OUT)
+saveRDS(dge_nofilt, file = file.path(.P$OUT, "dge_isoform_longread_2026.3.3.rds"))
+cat(sprintf("Built DGEList: %d isoforms x %d samples (before expression filter).\n",
+            nrow(dge$counts), ncol(dge$counts)))
+```
+
+# Step 4 — Filter and Normalize
+
+```{r filter-normalize}
+design_all <- model.matrix(~ ct + treatment + ct:treatment, data = dge$samples)
+cat(sprintf("Design matrix rank: %d of %d columns.\n", qr(design_all)$rank, ncol(design_all)))
+
+n_before <- nrow(dge)
+keep <- filterByExpr(dge, design = design_all, min.count = 5, min.total.count = 10, min.prop = 0)
+dge  <- dge[keep, , keep.lib.sizes = FALSE]
+
+# ── Claim 2.1.3 — the isoform universe ────────────────────────────────────────────────
+# 162,800 is the SAME number claim 1.1.1 reports as "expressed isoforms", reached here through
+# the filter rather than through the SQANTI join, and the two must not drift apart.
+ISO_UNIVERSE_POP <- paste("long-read isoforms surviving filterByExpr (min.count = 5,",
+                          "min.total.count = 10, min.prop = 0) under the ~ct + treatment +",
+                          "ct:treatment design, over all 26 samples in BOTH treatment arms;",
+                          "four primary cell types")
+claim_emit("2.1.3", "isoforms analysed", nrow(dge),
+           published = "162,800", n = nrow(dge), population = ISO_UNIVERSE_POP)
+cat(sprintf("FILTER: removed low-expression isoforms (filterByExpr; min.count=5, min.total.count=10).\n  Isoforms before: %d / Isoforms now: %d (%.1f%% kept).\n",
+            n_before, nrow(dge), 100 * nrow(dge) / n_before))
+
+dge <- calcNormFactors(dge, method = "TMM")
+cat(sprintf("Applied TMM normalization. Norm factors: range %.3f-%.3f, median %.3f.\n",
+            min(dge$samples$norm.factors), max(dge$samples$norm.factors),
+            median(dge$samples$norm.factors)))
+extreme_nf <- dge$samples$norm.factors < 0.7 | dge$samples$norm.factors > 1.3
+if (any(extreme_nf)) {
+  cat(sprintf("  WARNING: extreme norm factors for: %s.\n",
+              paste(dge$samples$sample_name[extreme_nf], collapse = ", ")))
+}
+
+saveRDS(dge,
+        file = file.path(.P$OUT, "dge_isoform_longread_filtered_2026.3.3.rds"))
+cat(sprintf("Final filtered + normalized DGEList: %d samples, %d isoforms.\n",
+            ncol(dge), nrow(dge)))
+```
+
+# Step 5 — Diagnostic PCA
+
+```{r pca}
+v <- voom(dge, design = design_all, plot = TRUE)
+cat(sprintf("Applied voom (log2-CPM, %d isoforms x %d samples). Running PCA for QC.\n",
+            nrow(v$E), ncol(v$E)))
+
+pca     <- prcomp(t(v$E), scale. = TRUE)
+pca_df  <- as.data.frame(pca$x[, 1:2])
+var_exp <- round(100 * (pca$sdev^2 / sum(pca$sdev^2))[1:2], 1)
+
+pca_df$treatment <- dge$samples$treatment
+pca_df$ct        <- dge$samples$ct
+pca_df$id        <- dge$samples$id
+
+p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, color = treatment, shape = ct)) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_manual(values = c("DMSO" = "orange", "Smg1i" = "purple")) +
+  labs(title = "Pre-Adjustment PCA",
+       subtitle = "Treatment (color), cell type (shape)",
+       x = paste0("PC1 (", var_exp[1], "%)"),
+       y = paste0("PC2 (", var_exp[2], "%)")) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, color = "grey40"))
+
+ggsave(file.path(OUT_DIR_FIGURES, paste0("pca_lr_iso_", DATE_STAMP, ".png")),
+       p_pca, width = 10, height = 6, dpi = 300, bg = "white")
+print(p_pca)
+
+# Sample-distance outlier check
+dist_mat  <- as.matrix(dist(t(v$E)))
+mean_dist <- rowMeans(dist_mat)
+outliers  <- names(mean_dist[mean_dist > mean(mean_dist) + 2 * sd(mean_dist)])
+if (length(outliers) > 0) cat("Distance outliers (> 2 SD):\n  ", paste(outliers, collapse = ", "), "\n")
+```
+
+# Step 6 — Fit Model
+
+Model: `~ ct + treatment + ct:treatment` with within-donor blocking via
+`duplicateCorrelation`. LAE is the cell-type reference, DMSO is the treatment reference.
+
+```{r fit-model}
+corfit <- duplicateCorrelation(v, design_all, block = dge$samples$id)
+cat(sprintf("Estimated within-donor correlation using duplicateCorrelation (blocked on donor): consensus = %.4f.\n",
+            corfit$consensus.correlation))
+
+fit <- lmFit(v, design_all,
+             block       = dge$samples$id,
+             correlation = corfit$consensus.correlation)
+fit <- eBayes(fit)
+
+plotSA(fit, main = "Residual SD vs Average Expression")
+```
+
+# Step 7 — Per-Cell-Type Smg1i Contrasts
+
+```{r contrasts}
+colnames(fit$design)       <- make.names(colnames(fit$design))
+colnames(fit$coefficients) <- colnames(fit$design)
+
+contrast_matrix <- makeContrasts(
+  Smg1i_in_LAE = treatmentSmg1i,
+  Smg1i_in_AT2 = treatmentSmg1i + ctAT2.treatmentSmg1i,
+  Smg1i_in_FB  = treatmentSmg1i + ctFB.treatmentSmg1i,
+  Smg1i_in_MV  = treatmentSmg1i + ctMV.treatmentSmg1i,
+  levels = fit$design
+)
+
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+cat("Fitted limma-voom model and defined per-cell-type contrasts: ",
+    paste(colnames(contrast_matrix), collapse = ", "), ".\n", sep = "")
+
+cat("\nSignificance overview (FDR < 0.05):\n")
+for (j in seq_len(ncol(fit2$coefficients))) {
+  tt     <- topTable(fit2, coef = j, number = Inf, sort.by = "none")
+  n_sig  <- sum(tt$adj.P.Val <= 0.05)
+  n_up   <- sum(tt$adj.P.Val <= 0.05 & tt$logFC > 0)
+  n_down <- sum(tt$adj.P.Val <= 0.05 & tt$logFC < 0)
+  cat(sprintf("  %-14s: %5d sig (%4d NMD susceptible / up, %4d down)\n",
+              colnames(fit2$coefficients)[j], n_sig, n_up, n_down))
+}
+```
+
+# Step 8 — Adaptive Shrinkage Across Cell Types
+
+## 8.1 Setup
+
+```{r mashr-setup}
+if (!require("ashr",     quietly = TRUE)) install.packages("ashr")
+if (!require("mashr",    quietly = TRUE)) BiocManager::install("mashr")
+if (!require("reshape2", quietly = TRUE)) install.packages("reshape2")
+
+library(mashr); library(ashr); library(reshape2)
+```
+
+## 8.2 Extract Effect Sizes and Standard Errors
+
+```{r mashr-extract}
+bhat <- fit2$coefficients
+shat <- fit2$coefficients / fit2$t
+n_before <- nrow(shat)
+
+finite_rows <- apply(shat, 1, function(x) all(is.finite(x) & x > 0))
+bhat <- bhat[finite_rows, ]
+shat <- shat[finite_rows, ]
+cat(sprintf("FILTER: kept isoforms with a valid (finite, positive) SE in all %d cell types.\n  Isoforms before: %d / Isoforms now: %d (dropped %d).\n",
+            ncol(shat), n_before, nrow(bhat), n_before - sum(finite_rows)))
+
+stopifnot("bhat / shat dim mismatch" = identical(dim(bhat), dim(shat)))
+cat(sprintf("Effect-size and SE matrices ready for mashr: %d isoforms x %d cell types.\n",
+            nrow(bhat), ncol(bhat)))
+```
+
+## 8.3 Estimate Null Correlation
+
+```{r mashr-correlation}
+mash_data_init <- mash_set_data(Bhat = bhat, Shat = shat)
+m_1by1         <- mash_1by1(mash_data_init)
+strong         <- get_significant_results(m_1by1, thresh = 0.05)
+cat(sprintf("Found %d strong signals (gene-by-gene ash, lfsr < 0.05) to learn data-driven covariance.\n",
+            length(strong)))
+
+# Smaller random subset than the gene-level pipeline (10k) — the isoform matrix is much larger.
+set.seed(42)
+n_random   <- min(10000, nrow(bhat))
+random_idx <- sample(seq_len(nrow(bhat)), n_random)
+cat(sprintf("Sampling %d random isoforms (seed 42) to estimate the cross-cell-type null correlation.\n", n_random))
+
+mash_data_random <- mash_set_data(Bhat = bhat[random_idx, ], Shat = shat[random_idx, ])
+Vhat <- estimate_null_correlation_simple(mash_data_random)
+cat("Estimated null correlation (Vhat):\n"); print(round(Vhat, 3))
+
+mash_data <- mash_set_data(Bhat = bhat, Shat = shat, V = Vhat)
+```
+
+## 8.4 Build Covariance Library
+
+```{r mashr-covariances}
+if (length(strong) >= 5) {
+  U_pca <- cov_pca(mash_data, npc = min(5, ncol(bhat) - 1), subset = strong)
+} else {
+  U_pca <- list()
+}
+U_c   <- cov_canonical(mash_data)
+U_all <- c(U_pca, U_c)
+cat(sprintf("Built covariance library: %d data-driven (PCA) + %d canonical = %d total.\n",
+            length(U_pca), length(U_c), length(U_all)))
+```
+
+## 8.5 Fit Model
+
+```{r mashr-fit}
+t_start <- Sys.time()
+m       <- mash(mash_data, Ulist = U_all, outputlevel = 2)
+cat(sprintf("Fitted mashr model in %.1f min.\n",
+            as.numeric(difftime(Sys.time(), t_start, units = "mins"))))
+
+pi_vals <- get_estimated_pi(m)
+cat("Estimated mixture weights (components > 1%):\n")
+print(round(sort(pi_vals[pi_vals > 0.01], decreasing = TRUE), 3))
+```
+
+## 8.6 Posterior Means and lfsr
+
+```{r mashr-results}
+pm   <- get_pm(m)
+lfsr <- get_lfsr(m)
+cat(sprintf("Posterior means and lfsr computed for %d isoforms x %d cell types.\n",
+            nrow(pm), ncol(pm)))
+
+n_sig_mash <- apply(lfsr, 2, function(x) sum(x < 0.05))
+cat("\nSignificant isoforms (lfsr < 0.05):\n"); print(n_sig_mash)
+
+# 2.1.3's two ranges. The significant counts are SIGN-AGNOSTIC (lfsr only); the NMD-susceptible
+# share adds posterior mean > 0 and is divided by that cell type's own significant count, not by
+# the isoform universe. Two different denominators in one published sentence.
+ISO_SIG_POP <- paste("isoforms with mashr lfsr < 0.05 in a given cell type, counted per cell",
+                     "type over the analysed isoform universe; no requirement on effect SIGN")
+ISO_NMD_POP <- paste("of the isoforms significant (lfsr < 0.05) in a given cell type, the share",
+                     "with posterior mean logFC > 0 (up under SMG1i); denominator is that cell",
+                     "type's significant set, NOT the isoform universe")
+claim_emit("2.1.3", "fewest significant isoforms in a cell type", min(n_sig_mash),
+           published = "24,803", n = nrow(dge), population = ISO_SIG_POP)
+claim_emit("2.1.3", "most significant isoforms in a cell type", max(n_sig_mash),
+           published = "35,336", n = nrow(dge), population = ISO_SIG_POP)
+.nmd_share <- 100 * colSums(pm > 0 & lfsr < 0.05) / n_sig_mash[colnames(pm)]
+claim_emit("2.1.3", "lowest NMD susceptible share of significant isoforms (%)",
+           min(.nmd_share), published = "90.9", n = sum(n_sig_mash), population = ISO_NMD_POP)
+claim_emit("2.1.3", "highest NMD susceptible share of significant isoforms (%)",
+           max(.nmd_share), published = "92.0", n = sum(n_sig_mash), population = ISO_NMD_POP)
+
+cat("\nNMD susceptible isoforms (posterior mean logFC > 0 & lfsr < 0.05):\n")
+for (j in seq_len(ncol(pm))) {
+  ct_name <- colnames(pm)[j]
+  n_nmd   <- sum(pm[, j] > 0 & lfsr[, j] < 0.05)
+  cat(sprintf("  %-14s: %5d of %5d significant (%.1f%%)\n",
+              ct_name, n_nmd, n_sig_mash[ct_name],
+              100 * n_nmd / max(n_sig_mash[ct_name], 1)))
+}
+
+cat("\nShrunken (mashr) vs unshrunken (limma) significant counts:\n")
+for (j in seq_len(ncol(bhat))) {
+  ct_name   <- colnames(bhat)[j]
+  limma_res <- topTable(fit2, coef = ct_name, number = Inf, sort.by = "none")
+  n_limma   <- sum(limma_res$adj.P.Val < 0.05)
+  cat(sprintf("  %-14s: unshrunken = %5d, shrunken = %5d (ratio: %.2f)\n",
+              ct_name, n_limma, n_sig_mash[ct_name], n_sig_mash[ct_name] / max(n_limma, 1)))
+}
+```
+
+## 8.7 Effect Sharing
+
+```{r mashr-sharing}
+n_sig_total <- length(get_significant_results(m, thresh = 0.05))
+cat(sprintf("Total isoforms significant in >=1 cell type (lfsr < 0.05): %d.\n", n_sig_total))
+
+if (n_sig_total >= 2) {
+  sharing      <- get_pairwise_sharing(m, factor = 0.5, lfsr_thresh = 0.05)
+  sharing_sign <- get_pairwise_sharing(m, factor = 0,   lfsr_thresh = 0.05)
+  cat("Computed pairwise effect sharing (same sign & within 2-fold magnitude):\n")
+  print(round(sharing, 2))
+
+  # ── Claim 2.3.3, isoform half ───────────────────────────────────────────────────────
+  # SHARING BY MAGNITUDE (factor = 0.5): per pair, the denominator is the UNION of the two cell
+  # types' lfsr < 0.05 sets and the numerator is the isoforms whose posterior-mean ratio lies in
+  # (0.5, 2). The denominator DIFFERS FOR EVERY PAIR, so n is omitted rather than invented.
+  # sharing_sign (factor = 0) is a different, larger quantity and is not what is published, and
+  # Jaccard over the same sets gives a third answer matching neither range. The DIAGONAL is
+  # excluded: it is 1 by construction.
+  .lae  <- grep("LAE", rownames(sharing), value = TRUE)[1]
+  .off  <- 100 * sharing[.lae, colnames(sharing) != .lae]
+  .trio <- setdiff(rownames(sharing), .lae)
+  .tsub <- sharing[.trio, .trio]
+  .ts   <- 100 * .tsub[upper.tri(.tsub)]
+  SHARE_POP_I <- paste("pairwise mashr sharing by magnitude (factor = 0.5) between cell types at",
+                       "ISOFORM level; per-pair denominator is the union of the two cell types'",
+                       "lfsr < 0.05 sets, so it differs for every pair")
+  claim_emit("2.3.3", "lowest isoform-level sharing for a LAE-involving pair (%)", min(.off),
+             published = "35", population = SHARE_POP_I)
+  claim_emit("2.3.3", "highest isoform-level sharing for a LAE-involving pair (%)", max(.off),
+             published = "72", population = SHARE_POP_I)
+  claim_emit("2.3.3", "lowest isoform-level sharing within the AT2/FB/MV trio (%)", min(.ts),
+             published = "68", population = SHARE_POP_I)
+  claim_emit("2.3.3", "highest isoform-level sharing within the AT2/FB/MV trio (%)", max(.ts),
+             published = "83", population = SHARE_POP_I)
+} else {
+  sharing      <- NULL
+  sharing_sign <- NULL
+  cat("Too few significant isoforms for sharing analysis.\n")
+}
+```
+
+## 8.8 Visualizations
+
+```{r mashr-sharing-plot, fig.width=8, fig.height=7}
+if (!is.null(sharing)) {
+  CT_ORDER <- c("LAE", "AT2", "FB", "MV")
+
+  sharing_clean <- sharing
+  rownames(sharing_clean) <- gsub("Smg1i_in_", "", rownames(sharing_clean))
+  colnames(sharing_clean) <- gsub("Smg1i_in_", "", colnames(sharing_clean))
+
+  sharing_df <- melt(sharing_clean)
+  colnames(sharing_df) <- c("CellType1", "CellType2", "Sharing")
+  sharing_df$CellType1 <- factor(sharing_df$CellType1, levels = CT_ORDER)
+  sharing_df$CellType2 <- factor(sharing_df$CellType2, levels = CT_ORDER)
+
+  p_share <- ggplot(sharing_df, aes(x = CellType1, y = CellType2, fill = Sharing)) +
+    geom_tile(color = "white", linewidth = 0.8) +
+    geom_text(aes(label = round(Sharing, 2)),
+              size = 4, fontface = "bold",
+              color = ifelse(sharing_df$Sharing > 0.6, "white", "grey20")) +
+    scale_fill_gradient(low = "white", high = "#185FA5",
+                        limits = c(0, 1), name = "Sharing") +
+    labs(title    = "Pairwise Effect Sharing",
+         subtitle = "Same sign & within 2-fold magnitude (lfsr < 0.05)",
+         x = NULL, y = NULL) +
+    theme_minimal(base_size = 13) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+          axis.text.y = element_text(face = "bold"),
+          panel.grid  = element_blank(),
+          plot.title  = element_text(face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(color = "grey40", hjust = 0.5))
+
+  ggsave(file.path(OUT_DIR_FIGURES, paste0("sharing_heatmap_lr_iso_", DATE_STAMP, ".png")),
+         p_share, width = 8, height = 7, dpi = 300, bg = "white")
+  print(p_share)
+}
+```
+
+## 8.9 Save Results
+
+```{r mashr-save}
+# Outputs go to .P$OUT, never an input root. Writing regenerated objects back over the
+# retained reference copies destroys the only comparison available for verification --
+# it happened on 2026-07-25 and cost the published isoform DGEList and part of the
+# isoform mashr set. See MORNING_NOTES.md.
+OUT_DIR_MASH    <- file.path(.P$OUT, "mashr_isoform")
+DATE_STAMP_MASH <- "2026.3.10"
+dir.create(OUT_DIR_MASH, recursive = TRUE, showWarnings = FALSE)
+
+saveRDS(m, file = file.path(OUT_DIR_MASH, paste0("mashr_isoform_model_", DATE_STAMP_MASH, ".rds")))
+
+gene_anno <- dge$genes[, c("txid", "gene_id", "hgnc_symbol")]
+gene_anno <- gene_anno[!duplicated(gene_anno$txid), ]
+
+pm_df <- as.data.frame(pm)
+pm_df$txid <- rownames(pm)
+pm_df <- merge(pm_df, gene_anno, by = "txid", all.x = TRUE)
+pm_df <- pm_df[, c("txid", "gene_id", "hgnc_symbol", colnames(pm))]
+pm_df <- pm_df[order(pm_df$txid), ]
+fwrite(pm_df, file = file.path(OUT_DIR_MASH,
+                               paste0("mashr_isoform_posterior_means_", DATE_STAMP_MASH, ".csv")))
+
+lfsr_df <- as.data.frame(lfsr)
+lfsr_df$txid <- rownames(lfsr)
+lfsr_df <- merge(lfsr_df, gene_anno, by = "txid", all.x = TRUE)
+lfsr_df <- lfsr_df[, c("txid", "gene_id", "hgnc_symbol", colnames(lfsr))]
+lfsr_df <- lfsr_df[order(lfsr_df$txid), ]
+fwrite(lfsr_df, file = file.path(OUT_DIR_MASH,
+                                 paste0("mashr_isoform_lfsr_", DATE_STAMP_MASH, ".csv")))
+
+if (!is.null(sharing)) {
+  fwrite(as.data.frame(sharing),
+         file = file.path(OUT_DIR_MASH, paste0("mashr_isoform_sharing_2fold_", DATE_STAMP_MASH, ".csv")),
+         row.names = TRUE)
+  fwrite(as.data.frame(sharing_sign),
+         file = file.path(OUT_DIR_MASH, paste0("mashr_isoform_sharing_sign_", DATE_STAMP_MASH, ".csv")),
+         row.names = TRUE)
+}
+fwrite(as.data.frame(Vhat),
+       file = file.path(OUT_DIR_MASH, paste0("mashr_isoform_null_correlation_", DATE_STAMP_MASH, ".csv")),
+       row.names = TRUE)
+
+for (j in seq_len(ncol(pm))) {
+  ct_name <- colnames(pm)[j]
+  res <- data.frame(
+    txid           = rownames(pm),
+    logFC          = pm[, j],
+    adj.P.Val      = lfsr[, j],
+    nmd_responsive = pm[, j] > 0 & lfsr[, j] < 0.05,   # column name kept for downstream compatibility
+    stringsAsFactors = FALSE
+  )
+  res <- merge(res, gene_anno, by = "txid", all.x = TRUE)
+  res <- res[order(res$adj.P.Val), ]
+
+  ct_code <- tolower(gsub("Smg1i_in_", "", ct_name))   # at2, lae, fb, mv
+  ct_code <- gsub("_", "", ct_code)
+
+  fwrite(res, file = file.path(OUT_DIR_MASH,
+                               paste0("nmd_mashr_die_", ct_code, "_", DATE_STAMP_MASH, ".csv")))
+
+  n_nmd <- sum(res$nmd_responsive)
+  n_sig <- sum(res$adj.P.Val < 0.05)
+  cat(sprintf("  %-14s: %5d significant (lfsr < 0.05), %5d NMD susceptible\n",
+              ct_name, n_sig, n_nmd))
+}
+cat(sprintf("Saved mashr outputs to %s: model RDS, posterior means, lfsr, sharing, null correlation,\n  and %d per-cell-type CSVs.\n",
+            OUT_DIR_MASH, ncol(pm)))
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
