@@ -1,0 +1,47 @@
+# Conda environment for the MODEL half of the pipeline (Section 5).
+#
+# CAPTURED, NOT INVENTED. Every version below was read on 2026-08-03 from
+# /home/p.castaldi/.conda/envs/nmd_model on the Explorer cluster — the environment that
+# ran the KernelSHAP jobs behind the current Section 5 numbers. It is the environment of
+# record for the model, and it is NOT the one that renders the figures (see
+# environment-figures.yml; this env has no seaborn at all).
+#
+# WHY VERSION-ONLY PINS AND NOT `conda env export`. A full export pins build strings
+# (`py311h5f...`) and a platform (`linux-64`). Those identifiers exist on no other machine,
+# so the export solves only on a clone of Explorer and fails everywhere else with an
+# unsatisfiable-spec error that looks like a missing package. Version-only pins are exact
+# in the sense that matters — same package, same version — and portable across platforms.
+#
+# WHY torch IS IN THE pip SECTION. torch is the one package here NOT installed from
+# conda-forge; it came from pip as 2.5.1+cu121. The `+cu121` suffix is a PyTorch-index
+# local version and is absent from PyPI's default index, so `pip install torch==2.5.1+cu121`
+# fails without the index URL below.
+#
+# IF YOU DO NOT HAVE AN NVIDIA GPU: replace the two pip lines with plain `torch==2.5.1`.
+# CUDA affects speed and floating-point association, not the model definition. Attribution
+# values are floating-point sums and may differ in the last decimal places between CPU and
+# GPU; the reported quantities are not sensitive at that scale, but they are not bitwise
+# identical either, and this file should not pretend otherwise.
+
+name: nmd_model
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11.15
+  - numpy=2.4.3
+  - pandas=3.0.1
+  - scipy=1.17.1
+  - h5py=3.16.0
+  - scikit-learn=1.8.0
+  - matplotlib=3.10.8
+  - pyyaml=6.0.3
+  - tqdm=4.67.3
+  - pip
+  # shap IS REQUIRED, not optional: deepshap.py imports it, and Figure 5D and every branch
+  # attribution in the §5 report come from it. It was absent from every shipped environment while
+  # the model repository's own environment.yml carried it, so a reader who built from this file
+  # got an ImportError at the DeepSHAP step.
+  - shap=0.46.*
+  - pip:
+      - --index-url https://download.pytorch.org/whl/cu121
+      - torch==2.5.1+cu121
