@@ -1,0 +1,2359 @@
+---
+title: "NMD analysis: current GENCODE-only scopes (2026-07-11)"
+subtitle: "Canonical scopes for Figure 3 (D/E/F) + Figure 4 (A/B at all-3-ENST + coding-CDS n=130; C/D at ref-AUG-traceable re-intersected n=819/819). Branched from 05_final_report_mashr.Rmd; that report is now legacy."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: hide
+    fig_width: 8
+    fig_height: 5
+---
+
+```{r setup, include=FALSE}
+.nmd_root <- local({ d <- getwd(); while (!file.exists(file.path(d, "config", "paths.yml"))) {
+  p <- dirname(d); if (identical(p, d)) stop("repo root not found"); d <- p }; d })
+source(file.path(.nmd_root, "R", "load_config.R")); .P <- nmd_paths(.nmd_root)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5)
+
+# CLAIM-VALUE EMISSION (Phase 2). Each §4 claim's number is written by the chunk that computes
+# it, with the population in words, to $NMD_CLAIM_VALUES (default tmp/claim_values.tsv).
+# tools/check_claim_values.py then compares against what the paper printed. The population is
+# required and is captured HERE because the call site is the only place it is known --
+# unstated populations are the dominant defect class in this manuscript, and this report is
+# where the clearest instance lives: Panel C's legend names n=130 for a panel computed over
+# 1,578 pairs per arm (claim 4.4.3), a factor of 12.
+source(file.path(.nmd_root, "R", "claim_emit.R"))
+
+# REPOINTED 2026-07-27 off .P$LEGACY onto the deposit-rebuilt tree, so §4's claims can be
+# rebuilt from the deposit. This is the CANONICAL gencode-scope report (the 2026-06-15 file is
+# legacy-bannered "DO NOT cite its numbers as canonical" and is deliberately left alone --
+# repointing a report retained to reproduce a PRIOR state would defeat its purpose).
+#
+# NMD_ROOT was used for TWO DIFFERENT THINGS through one variable:
+#   DATA (3 uses)     -- decide every number this report computes. Repointed below.
+#   FIGURES (14 uses) -- include_graphics() embeds of pre-rendered PNGs, which cannot change
+#                        a computed value. They stay on the legacy figure tree.
+# Naming them apart is the point: one variable covering both is how a presentation path gets
+# mistaken for evidence that the data root was repointed.
+DM              <- .P$ISOPAIR_OUT
+ISOPAIR_WRAPPER <- file.path(.nmd_root, "analysis/isopair/isopair_wrapper")  # helper source()
+                                                                             # only; no data
+FASTA_PATH      <- file.path(.P$SQANTI, "nmd_lungcells_corrected.fasta")
+
+# Presentation only -- see above. Deliberately NOT called NMD_ROOT.
+#
+# REPOINTED 2026-07-29 (D22) off .P$LEGACY onto the repo itself. The old default made this
+# report UNRENDERABLE by anyone without ../nmd, and not obviously so: knitr's include_graphics
+# defaults to error = TRUE (verified, knitr 1.51; nothing here sets knitr.graphics.error), so a
+# missing PNG ABORTS THE KNIT. The first embed is at L1034 and the chunk that prints n=130 is at
+# L1058 -- a reader holding only the deposit died twenty-four lines short of the number, with a
+# missing-file error that says nothing about why.
+#
+# The setup comment above is right that these embeds "cannot change a computed value", and that
+# was read for months as meaning they could not matter. They cannot change the value; they can
+# and did stop anyone else from ever seeing it. Causality and reachability are different
+# questions.
+FIG_ROOT <- Sys.getenv("NMD_FIG_ROOT", .nmd_root)
+
+# EMBED FIGURES WITHOUT LETTING knitr REWRITE THE PATH (2026-08-03).
+#
+# The clean-room run died here at chunk 35/98 with "Cannot find the file(s):
+# ../../../figures/...". The files were present and FIG_ROOT was correct -- knitr had REWRITTEN
+# the absolute path to be relative to the DOCUMENT (three levels down, in
+# analysis/isopair/isopair_wrapper/) and then resolved it against the WORKING DIRECTORY, which
+# render() sets to the repo root. Correct path, two different bases.
+#
+# rel_path = FALSE tells knitr to leave the absolute path alone. Measured, not assumed: passing a
+# knit-root-relative path instead renders "successfully" but emits
+# "[WARNING] Could not fetch resource ..." and drops the image from the output -- a silent
+# degradation, which is worse than the halt it replaces. This form renders with no warning and
+# the image embedded.
+inc_fig <- function(x) knitr::include_graphics(x, rel_path = FALSE)
+
+# CREATE THE DIRECTORIES THIS REPORT WRITES INTO, rather than relying on them existing.
+#
+# W69's clean-tree run died here at chunk 29/98: fwrite() to
+# figures/multipanel/figure3_isopair_and_ptc/data/panelB_sequence_similarity.tsv with
+# "Unable to create new file for writing (it does not exist already)". In the authoring tree
+# these directories exist because tracked TSVs sit in them -- figure3/data has 5 tracked files
+# and SF33/data has 7 -- so the report has never had to create one. That is a directory
+# existing BY ACCIDENT OF WHAT GIT TRACKS, and two things make it fragile: git does not track
+# empty directories, so any of these becomes absent the moment its last file is removed; and
+# whether figure-data TSVs ship at all is an open reading of D1, which admits "figures" and
+# excludes "intermediate data" without saying which of the two these are.
+#
+# Same defect class as three of the four the cut rerun harness found: nothing implemented
+# config/paths.yml's promise that OUT is "created on demand", and seven scripts wrote into
+# data_mashr/analysis_cache/ that none of them created -- which cost 75 minutes of completed
+# ORF scan. A script must create what it writes into.
+for (.d in file.path(.nmd_root, c(
+       "figures/multipanel/figure3_isopair_and_ptc/data",
+       "figures/multipanel/figure4_ptcneg_and_model/data",
+       "figures/supplemental/SF33_CdsAnd3UTR_GENCODE/data"))) {
+  if (!dir.exists(.d)) dir.create(.d, recursive = TRUE, showWarnings = FALSE)
+}
+
+stopifnot(
+  "ISOPAIR_WRAPPER does not resolve"                   = dir.exists(ISOPAIR_WRAPPER),
+  "DM does not resolve"                                = dir.exists(DM),
+  "FASTA_PATH does not exist (needed for §4b Kozak PWM)" = file.exists(FASTA_PATH)
+)
+
+library(Isopair)
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+
+stopifnot(packageVersion("Isopair") >= "0.99.4")
+
+source(file.path(ISOPAIR_WRAPPER, "analysis_functions.R"))
+
+profiles_c2 <- readRDS(file.path(DM, "profiles_c2_allsamples.rds"))
+profiles_c4 <- readRDS(file.path(DM, "profiles_c4_allsamples.rds"))
+cds         <- as.data.table(readRDS(file.path(DM, "cds.rds")))
+structures  <- as.data.table(readRDS(file.path(DM, "structures.rds")))
+ref_atg     <- readRDS(file.path(DM, "analysis_cache/ref_atg_analysis.rds"))
+utr5_refaug <- readRDS(file.path(DM, "analysis_cache/utr5_features_refaug.rds"))
+utr5_all    <- readRDS(file.path(DM, "analysis_cache/utr5_features_all.rds"))
+expr_mat    <- readRDS(file.path(DM, "expression_data.rds"))
+nmd_class   <- readRDS(file.path(DM, "nmd_classification.rds"))
+dmso_samples <- readRDS(file.path(DM, "dmso_samples.rds"))
+
+need_in <- function(obj, cols, label) {
+  missing <- setdiff(cols, colnames(obj))
+  if (length(missing) > 0)
+    stop(sprintf("%s missing columns: %s", label,
+                  paste(missing, collapse = ", ")))
+  invisible(TRUE)
+}
+
+# profiles_c{2,4} schema
+need_in(profiles_c2,
+        c("gene_id", "reference_isoform_id", "comparator_isoform_id"),
+        "profiles_c2")
+need_in(profiles_c4,
+        c("gene_id", "reference_isoform_id", "comparator_isoform_id"),
+        "profiles_c4")
+
+# cds schema (used in §2a own-stop conversion, §2d CDS length, §4 TD2 ORF)
+need_in(cds,
+        c("isoform_id", "coding_status", "cds_start", "cds_stop",
+          "strand", "orf_length"),
+        "cds")
+
+# structures schema (exon coords for genomicToTranscript + tx-length)
+need_in(structures,
+        c("isoform_id", "exon_starts", "exon_ends", "strand"),
+        "structures")
+
+# utr5 caches
+need_in(utr5_refaug$isoform_features,
+        c("isoform_id", "utr5_length", "longest_orf_nt"),
+        "utr5_refaug$isoform_features")
+need_in(utr5_all$isoform_features,
+        c("isoform_id", "utr5_length", "longest_orf_nt"),
+        "utr5_all$isoform_features")
+
+# ref_atg slots + columns
+stopifnot("ref_atg missing c2 slot" = "c2" %in% names(ref_atg))
+stopifnot("ref_atg missing c4 slot" = "c4" %in% names(ref_atg))
+need_in(as.data.frame(ref_atg$c2),
+        c("comparator_isoform_id", "reference_isoform_id", "gene_id",
+          "category", "comp_orf_length", "ref_orf_length",
+          "comp_orf_length_from_ref_atg", "ref_atg_genomic",
+          "ref_atg_exonic_in_comp", "original_ptc",
+          "utr3_via_non_ptc_stop_nt"),
+        "ref_atg$c2")
+need_in(as.data.frame(ref_atg$c4),
+        c("comparator_isoform_id", "reference_isoform_id", "gene_id",
+          "category", "utr3_via_non_ptc_stop_nt"),
+        "ref_atg$c4")
+
+format_p <- function(p, digits = 2) {
+  if (is.na(p)) return("NA")
+  if (p < 1e-3) formatC(p, format = "e", digits = digits)
+  else formatC(signif(p, digits + 1), format = "g")
+}
+```
+
+```{r mechanism-helpers, include=FALSE}
+# Inline-replicated from figures/lib/mechanism_class.R (per v4 plan C2: kept
+# inline so the Rmd is self-contained; the two copies are simple enough to
+# compare in one diff if they ever drift).
+
+MECHANISM_CLASS_LEVELS <- c(
+  "NMD+/PTC+",
+  "NMD+/PTC- ORF same",
+  "NMD+/PTC- ORF extended",
+  "NMD+/PTC- ORF truncated",
+  "Ref AUG absent"
+)
+
+MECHANISM_CLASS_4_LEVELS <- c(
+  "NMD+/PTC+",
+  "NMD+/PTC- ORF match",
+  "NMD+/PTC- ORF diff",
+  "Ref AUG absent"
+)
+
+REF_AUG_PRESENT_CATEGORIES <- c(
+  "effectively_ptc", "no_downstream_ejc", "truncated_no_ejc"
+)
+
+mechanism_class <- function(category, comp_orf_length, ref_orf_length) {
+  stopifnot(length(category) == length(comp_orf_length),
+            length(category) == length(ref_orf_length))
+  orf_diff <- comp_orf_length - ref_orf_length
+  cls <- rep(NA_character_, length(category))
+  cls[is.na(category) | !category %in% REF_AUG_PRESENT_CATEGORIES] <-
+    "Ref AUG absent"
+  cls[!is.na(category) & category == "effectively_ptc"] <- "NMD+/PTC+"
+  ndj_mask <- !is.na(category) & category == "no_downstream_ejc"
+  trc_mask <- !is.na(category) & category == "truncated_no_ejc"
+  cls[ndj_mask & !is.na(orf_diff) & orf_diff == 0] <- "NMD+/PTC- ORF same"
+  cls[ndj_mask & !is.na(orf_diff) & orf_diff > 0]  <- "NMD+/PTC- ORF extended"
+  cls[trc_mask & !is.na(orf_diff) & orf_diff < 0]  <- "NMD+/PTC- ORF truncated"
+  # ndj/trc with NA orf_diff: route to PTC- (mech4 merges to NMD+/PTC-).
+  # Synced with figures/lib/mechanism_class.R.
+  cls[ndj_mask & is.na(orf_diff)] <- "NMD+/PTC- ORF same"
+  cls[trc_mask & is.na(orf_diff)] <- "NMD+/PTC- ORF truncated"
+  cls[is.na(cls)] <- "Ref AUG absent"
+  factor(cls, levels = MECHANISM_CLASS_LEVELS)
+}
+
+mechanism_class_4 <- function(cls) {
+  cls_char <- as.character(cls)
+  out <- ifelse(cls_char %in% c("NMD+/PTC- ORF extended",
+                                "NMD+/PTC- ORF truncated"),
+                "NMD+/PTC- ORF diff",
+                ifelse(cls_char == "NMD+/PTC- ORF same",
+                       "NMD+/PTC- ORF match",
+                       cls_char))
+  factor(out, levels = MECHANISM_CLASS_4_LEVELS)
+}
+
+ref_source <- function(reference_isoform_id) {
+  out <- ifelse(grepl("^ENST", reference_isoform_id), "GENCODE", "TD2")
+  factor(out, levels = c("GENCODE", "TD2"))
+}
+
+TES_CONCORDANT_THRESHOLD_NT <- 50L
+tes_concordant <- function(comp_tx_len, ref_tx_len,
+                           threshold = TES_CONCORDANT_THRESHOLD_NT) {
+  abs(comp_tx_len - ref_tx_len) <= threshold
+}
+```
+
+# Overview {.unnumbered}
+
+This report supersedes `05_final_report_mashr.Rmd` (now legacy-bannered) for the
+two canonical scopes used in the manuscript's Figure 3 and Figure 4:
+
+1. **all-3-ENST + coding-CDS (n=130)** — both NMD+ and Control comparators
+   have ENST reference isoforms with a complete coding CDS. Drives Figure 3
+   D/E/F and Figure 4 Panels A/B + the `CDSand3UTR_GENCODEonly` supplement.
+2. **ref-AUG-traceable, re-intersected on `(gene_id, reference_isoform_id)`
+   after category filter (n=819/819)** — drives Figure 4 Panels C/D and
+   the `TD2BiasEvidence` supplement (`n=819` broad, `n=348` occult-PTC).
+
+Analyses kept in the legacy Rmd (per v4 plan): per-cell-type reclassification,
+two-pass TD2→ref-AUG handoff, the "85% combined" framework, the n=1,904/22,335
+GENCODE-only 3'UTR outside-set, and all ORF / model analyses
+(`06_orf_analysis_mashr.Rmd`).
+
+# §1 — Isopair construction and pair sets
+
+The Stage-2 gene-matched pair cohort (`pop_BC`) is the foundation of every
+analysis in this report. Construction proceeds in three stages, replicated
+inline so the cohort can be regenerated without re-running upstream scripts:
+
+1. **Upstream isoform calling and filtering** (`01_prepare_data_mashr.R`) —
+   the long-read isocall count matrix (`nmd_isocall.count_matrix.txt`,
+   `r format(645273L, big.mark=",")` isoforms × 38 samples; constant defined
+   at the head of `01_prepare_data_mashr.R`) is reduced by removing the 2 DO
+   outlier samples, restricting to the four manuscript cell types, then applying
+   TMM normalization, the condition-stratified 5% isoform filter, and
+   `edgeR::filterByExpr`. Output: `expression_data.rds` with
+   `r format(nrow(expr_mat), big.mark=",")` filtered isoforms ×
+   `r ncol(expr_mat)` samples spanning the four manuscript cell types
+   (AT, DD, FB, MV): AT 6 (3 DMSO + 3 SMG1i), DD 8 (4 + 4), FB 6 (3 + 3),
+   MV 6 (3 + 3). The cell-type restriction is applied at the source, so the
+   isoform universe, normalization, reference selection, reference-share floor,
+   and pair construction are all on the four cell types.
+
+2. **Pair construction** (`02_build_profiles_mashr.R`) — `profiles_c2`
+   pairs the top NMD-sensitive isoform per gene against its dominant non-NMD
+   reference; `profiles_c4` pairs the top-two non-NMD isoforms per gene.
+   Cache: `profiles_c{2,4}_allsamples.rds` (c2 = `r format(nrow(profiles_c2), big.mark=",")`
+   pre-match rows; c4 = `r format(nrow(profiles_c4), big.mark=",")`).
+
+3. **Gene-matching** (inline below; replicates `03_nmd_analysis_mashr.Rmd`
+   Stage-2 filter) — restrict both arms to the shared `(gene_id,
+   reference_isoform_id)` set so every gene contributes both a NMD pair and
+   a Control pair under the same reference.
+
+```{r sec1-pop-bc, include=FALSE}
+pop_bc_shared <- dplyr::inner_join(
+  unique(profiles_c2[, c("gene_id", "reference_isoform_id")]),
+  unique(profiles_c4[, c("gene_id", "reference_isoform_id")]),
+  by = c("gene_id", "reference_isoform_id")
+)
+pop_bc_c2 <- dplyr::semi_join(profiles_c2, pop_bc_shared,
+                              by = c("gene_id", "reference_isoform_id"))
+pop_bc_c4 <- dplyr::semi_join(profiles_c4, pop_bc_shared,
+                              by = c("gene_id", "reference_isoform_id"))
+
+ref_ids_pop  <- unique(pop_bc_c2$reference_isoform_id)
+nmd_ids_pop  <- unique(pop_bc_c2$comparator_isoform_id)
+ctrl_ids_pop <- unique(pop_bc_c4$comparator_isoform_id)
+
+# Claim 4.1.2 — the analysis population. The paper's four selection criteria (>= 3 expressed
+# isoforms, 1 NMD susceptible, 2 non-NMD, dominant non-NMD >= 25% of gene expression) are
+# applied UPSTREAM in profile construction, not here, so this chunk can only speak to the
+# resulting count; the criteria themselves are not emitted and will show as unclaimed.
+claim_emit("4.1.2", "genes in the analysis population", nrow(pop_bc_shared),
+           published = 1578, n = nrow(pop_bc_shared),
+           population = paste("genes with a shared (gene, reference isoform) pair in BOTH the",
+                              "NMD-comparator and Control-comparator profile sets, so every",
+                              "gene contributes exactly one NMD and one Control pair; no CDS",
+                              "or GENCODE-annotation constraint applied"))
+```
+
+`pop_BC` = `r format(nrow(pop_bc_shared), big.mark=",")` shared `(gene,
+reference)` pairs; `r format(nrow(pop_bc_c2), big.mark=",")` NMD-comp pairs
+and `r format(nrow(pop_bc_c4), big.mark=",")` Control-comp pairs — i.e.,
+every gene contributes exactly one of each.
+
+### Cohort cascade — pop_BC through Section A / Section C / TD2 branches
+
+<!-- ── hoisted 2026-07-26 ─────────────────────────────────────────────────────────
+     These four chunks compute the Section A / Section C / PTC / attribution cohorts.
+     They used to sit AFTER the flowchart, which is why the flowchart hardcoded its
+     numbers: chunks evaluate in order, so it could not see them. All four are
+     include=FALSE and verified to use nothing from §1a-§1c, so hoisting them changes
+     no output and lets the diagram label itself from the same objects the tables use.
+     ──────────────────────────────────────────────────────────────────────────── -->
+
+```{r sec2-scope, include=FALSE}
+profiles_c2_dt <- as.data.table(profiles_c2)
+profiles_c4_dt <- as.data.table(profiles_c4)
+cds_dt         <- cds
+
+is_enst  <- function(x) grepl("^ENST", x)
+make_key <- function(d) paste(d$gene_id, d$reference_isoform_id, sep = "::")
+
+# Step 1 — pop_BC (gene-matched on shared (gene, ref))
+pop_bc_keys <- intersect(unique(make_key(profiles_c2_dt)),
+                          unique(make_key(profiles_c4_dt)))
+pop_bc_c2   <- profiles_c2_dt[make_key(profiles_c2_dt) %in% pop_bc_keys]
+pop_bc_c4   <- profiles_c4_dt[make_key(profiles_c4_dt) %in% pop_bc_keys]
+
+# Step 2 — all-ENST on both reference AND comparator
+pop_bc_c2_E <- pop_bc_c2[is_enst(reference_isoform_id) &
+                           is_enst(comparator_isoform_id)]
+pop_bc_c4_E <- pop_bc_c4[is_enst(reference_isoform_id) &
+                           is_enst(comparator_isoform_id)]
+joint1      <- intersect(make_key(pop_bc_c2_E), make_key(pop_bc_c4_E))
+pop_bc_c2_E <- pop_bc_c2_E[make_key(pop_bc_c2_E) %in% joint1]
+pop_bc_c4_E <- pop_bc_c4_E[make_key(pop_bc_c4_E) %in% joint1]
+
+# Step 3 — coding-everywhere (curated CDS on both sides)
+coding_ids <- cds_dt[coding_status == "coding", isoform_id]
+have_cds   <- function(d) d$reference_isoform_id %in% coding_ids &
+                          d$comparator_isoform_id %in% coding_ids
+pop_bc_c2_E2 <- pop_bc_c2_E[have_cds(pop_bc_c2_E)]
+pop_bc_c4_E2 <- pop_bc_c4_E[have_cds(pop_bc_c4_E)]
+
+# Step 4 — re-intersect on (gene, ref) after the coding filter, so both arms
+#          share the same reference set
+joint2 <- intersect(make_key(pop_bc_c2_E2), make_key(pop_bc_c4_E2))
+gencode_all3_c2 <- pop_bc_c2_E2[make_key(pop_bc_c2_E2) %in% joint2]
+gencode_all3_c4 <- pop_bc_c4_E2[make_key(pop_bc_c4_E2) %in% joint2]
+
+sec2_cascade <- data.frame(
+  Step = c("pop_BC (gene-matched)",
+           "+ all-ENST (ref & comp)",
+           "  re-intersect on (gene, ref)",
+           "+ coding-CDS everywhere",
+           "  re-intersect on (gene, ref)"),
+  c2_n = c(nrow(pop_bc_c2),
+           length(unique(c(make_key(pop_bc_c2_E), make_key(pop_bc_c4_E)))),
+           nrow(pop_bc_c2_E),
+           nrow(pop_bc_c2_E2),
+           nrow(gencode_all3_c2)),
+  c4_n = c(nrow(pop_bc_c4),
+           NA,
+           nrow(pop_bc_c4_E),
+           nrow(pop_bc_c4_E2),
+           nrow(gencode_all3_c4))
+)
+
+# Claim 4.1.3 — the GENCODE reference set ("all three analyzed isoforms present in the GENCODE
+# reference"). This is the population n=130 refers to, and it is the denominator claims 4.4.7
+# and 4.5.2 report their PTC rates over.
+SEC_A_POPULATION <- paste("genes whose reference, NMD comparator and Control comparator are ALL",
+                          "GENCODE (ENST) isoforms with a curated coding CDS, re-intersected on",
+                          "(gene, reference) after the coding filter so the NMD and Control arms",
+                          "share one gene-matched universe; a subset of the gene-matched pair cohort (one reference, one NMD comparator and one Control comparator per gene)")
+claim_emit("4.1.3", "genes in the GENCODE reference set", nrow(gencode_all3_c2),
+           published = 132, n = nrow(gencode_all3_c2), population = SEC_A_POPULATION)
+```
+```{r sec2a-ptc, include=FALSE}
+coding_cds <- cds[coding_status == "coding"]
+struct_idx <- match(coding_cds$isoform_id, structures$isoform_id)
+
+own_stop_tx_lookup <- (function() {
+  stop_tx <- rep(NA_integer_, nrow(coding_cds))
+  for (i in seq_len(nrow(coding_cds))) {
+    si <- struct_idx[i]
+    if (is.na(si)) next
+    strand <- coding_cds$strand[i]
+    if (is.na(strand) || strand == "") next
+    stop_g <- if (strand == "+") coding_cds$cds_stop[i] else coding_cds$cds_start[i]
+    stop_tx[i] <- Isopair::genomicToTranscript(
+      stop_g, structures$exon_starts[[si]], structures$exon_ends[[si]], strand)
+  }
+  data.table(isoform_id = coding_cds$isoform_id,
+             own_stop_tx_pos = stop_tx,
+             strand = coding_cds$strand)
+})()
+
+junctions_for <- function(iso_id) {
+  si <- match(iso_id, structures$isoform_id)
+  if (is.na(si)) return(integer(0))
+  exon_starts <- structures$exon_starts[[si]]
+  exon_ends   <- structures$exon_ends[[si]]
+  strand      <- structures$strand[si]
+  if (is.na(strand) || strand == "") return(integer(0))
+  exon_lens <- exon_ends - exon_starts + 1L
+  if (strand == "-") exon_lens <- rev(exon_lens)
+  if (length(exon_lens) <= 1L) return(integer(0))
+  cumsum(exon_lens[-length(exon_lens)])
+}
+
+augment_own_stop <- function(pop) {
+  merge(pop[, .(gene_id, reference_isoform_id, comparator_isoform_id)],
+        own_stop_tx_lookup,
+        by.x = "comparator_isoform_id", by.y = "isoform_id",
+        all.x = TRUE)
+}
+compute_ptc_info <- function(d) {
+  d[, last_ejc_tx_pos := vapply(comparator_isoform_id,
+                                 function(iso) {
+                                   junc <- junctions_for(iso)
+                                   if (length(junc) == 0L) NA_integer_ else max(junc)
+                                 }, integer(1))]
+  d[, distance := last_ejc_tx_pos - own_stop_tx_pos]
+  d[, has_ptc := !is.na(distance) & distance > 50L]
+  d
+}
+
+trace_c2 <- compute_ptc_info(augment_own_stop(gencode_all3_c2))
+trace_c4 <- compute_ptc_info(augment_own_stop(gencode_all3_c4))
+
+n_ptc_nmd     <- sum(trace_c2$has_ptc, na.rm = TRUE)
+n_ptc_ctrl    <- sum(trace_c4$has_ptc, na.rm = TRUE)
+n_avail_nmd   <- sum(!is.na(trace_c2$distance))
+n_avail_ctrl  <- sum(!is.na(trace_c4$distance))
+ptc_rate_nmd  <- 100 * n_ptc_nmd  / n_avail_nmd
+ptc_rate_ctrl <- 100 * n_ptc_ctrl / n_avail_ctrl
+fold_enrich   <- ptc_rate_nmd / ptc_rate_ctrl
+
+ptc_fisher <- fisher.test(matrix(c(
+  n_ptc_nmd,            n_avail_nmd  - n_ptc_nmd,
+  n_ptc_ctrl,           n_avail_ctrl - n_ptc_ctrl
+), nrow = 2, byrow = TRUE))
+
+pop_ptc_c2 <- merge(
+  gencode_all3_c2,
+  trace_c2[has_ptc == TRUE,
+           .(comparator_isoform_id, own_stop_tx_pos, last_ejc_tx_pos, distance)],
+  by = "comparator_isoform_id"
+)
+
+# ── Claims 4.4.7 and 4.5.2 — the PTC rate in the GENCODE reference set ────────────────
+# The denominator here is pairs with a COMPUTABLE stop-to-last-EJC distance, which is not
+# automatically the whole Section A cohort: a single-exon comparator has no junction, so
+# junctions_for() returns integer(0) and the distance is NA. Stating that is the point of the
+# population field -- the published "48/130" does not say which 130.
+PTC_POP_NMD <- paste("NMD-comparator pairs in the GENCODE reference set (all three isoforms",
+                     "ENST with a curated coding CDS) that have a computable stop-to-last-EJC",
+                     "distance; comparators with no exon junction are excluded as NA")
+PTC_POP_CTRL <- sub("NMD-comparator", "Control-comparator", PTC_POP_NMD)
+
+claim_emit("4.4.7", "PTC rate in NMD comparators (%)", ptc_rate_nmd,
+           published = 36.4, n = n_avail_nmd, population = PTC_POP_NMD)
+claim_emit("4.4.7", "NMD comparators with a PTC (count)", n_ptc_nmd,
+           published = 48, n = n_avail_nmd, population = PTC_POP_NMD)
+claim_emit("4.4.7", "NMD comparators assessable for a PTC (denominator)", n_avail_nmd,
+           published = 132, n = n_avail_nmd, population = PTC_POP_NMD)
+claim_emit("4.4.7", "PTC rate in Control comparators (%)", ptc_rate_ctrl,
+           published = 1.5, n = n_avail_ctrl, population = PTC_POP_CTRL)
+claim_emit("4.4.7", "Control comparators with a PTC (count)", n_ptc_ctrl,
+           published = 2, n = n_avail_ctrl, population = PTC_POP_CTRL)
+
+claim_emit("4.5.2", "PTC fold enrichment, NMD over Control", fold_enrich,
+           published = 24, n = n_avail_nmd + n_avail_ctrl,
+           population = paste("ratio of the two PTC rates above, over the GENCODE reference",
+                              "set; both arms gene-matched, one NMD and one Control comparator",
+                              "per gene"))
+# The paper states this as an INEQUALITY ("p < 10^-13"), not as a value. Emitting it against a
+# point value would score a disagreement for a claim that is satisfied by any smaller p, so the
+# computed p is recorded as a SUPPORTING number with the paper's threshold named in the
+# quantity, and the inequality is checked by reading it.
+claim_emit("4.5.2", "PTC rate in NMD comparators (%)", ptc_rate_nmd,
+           published = 36.4, n = n_avail_nmd, population = PTC_POP_NMD)
+claim_emit("4.5.2", "PTC rate in Control comparators (%)", ptc_rate_ctrl,
+           published = 1.5, n = n_avail_ctrl, population = PTC_POP_CTRL)
+claim_emit("4.5.2", "Fisher p for PTC enrichment (paper states p < 1e-13)",
+           ptc_fisher$p.value, n = n_avail_nmd + n_avail_ctrl,
+           population = paste("Fisher exact test on PTC-positive vs PTC-negative counts in the",
+                              "two arms of the GENCODE reference set"))
+```
+```{r sec2b-attribution, include=FALSE}
+fc_c2 <- readRDS(file.path(DM, "analysis_cache/fc_c2_allsamples.rds"))
+fw_c2 <- readRDS(file.path(DM, "analysis_cache/fw_c2_allsamples.rds"))
+
+own_stop_genomic_lookup <- setNames(
+  ifelse(coding_cds$strand == "+", coding_cds$cds_stop, coding_cds$cds_start),
+  coding_cds$isoform_id)
+own_atg_genomic_lookup <- setNames(
+  ifelse(coding_cds$strand == "+", coding_cds$cds_start, coding_cds$cds_stop),
+  coding_cds$isoform_id)
+strand_lookup <- setNames(coding_cds$strand, coding_cds$isoform_id)
+
+ep_ids <- pop_ptc_c2$comparator_isoform_id
+fc_ps <- as.data.table(fc_c2$pair_summary)
+fc_ep <- fc_ps[comparator_isoform_id %in% ep_ids]
+frameshift_cats <- c("same_start_frameshift",
+                     "diff_start_diff_frame_with_frameshift")
+fc_ep[, is_frameshift_cat := frame_category %in% frameshift_cats]
+
+ptc_genomic_pos <- own_stop_genomic_lookup[fc_ep$comparator_isoform_id]
+atg_genomic_pos <- own_atg_genomic_lookup[fc_ep$comparator_isoform_id]
+strand_vec      <- strand_lookup[fc_ep$comparator_isoform_id]
+names(ptc_genomic_pos) <- fc_ep$comparator_isoform_id
+names(atg_genomic_pos) <- fc_ep$comparator_isoform_id
+names(strand_vec)      <- fc_ep$comparator_isoform_id
+is_fs_lookup <- setNames(fc_ep$is_frameshift_cat, fc_ep$comparator_isoform_id)
+
+attr_b <- as.data.table(attribute_ptc_events(
+  pairs           = fc_ep[, .(comparator_isoform_id, reference_isoform_id)],
+  fw_events       = fw_c2$events,
+  profiles        = as.data.frame(pop_ptc_c2),
+  ptc_genomic_pos = ptc_genomic_pos,
+  atg_genomic_pos = atg_genomic_pos,
+  strand_vec      = strand_vec,
+  is_frameshift_vec = is_fs_lookup
+))
+n_direct_b     <- sum(attr_b$attribution == "direct")
+n_unresolved_b <- sum(attr_b$attribution == "unresolved")
+
+# Same-stop 3'UTR splice handling
+fc_ep[, strand_s     := strand_lookup[comparator_isoform_id]]
+fc_ep[, comp_stop_s  := own_stop_genomic_lookup[comparator_isoform_id]]
+fc_ep[, ref_stop_s   := own_stop_genomic_lookup[reference_isoform_id]]
+fc_ep[, same_stop_s  := comp_stop_s == ref_stop_s]
+same_stop_b <- fc_ep[same_stop_s == TRUE]
+
+ss_events_b <- data.table()
+if (nrow(same_stop_b) > 0) {
+  ss_stop_vec   <- setNames(same_stop_b$comp_stop_s, same_stop_b$comparator_isoform_id)
+  ss_strand_vec <- setNames(same_stop_b$strand_s,    same_stop_b$comparator_isoform_id)
+  ss_events_b <- as.data.table(attribute_3utr_splice(
+    pairs            = same_stop_b[, .(comparator_isoform_id, reference_isoform_id)],
+    profiles         = as.data.frame(pop_ptc_c2),
+    stop_genomic_pos = ss_stop_vec,
+    strand_vec       = ss_strand_vec
+  ))[attribution == "direct"]
+}
+n_same_stop_direct <- nrow(ss_events_b)
+
+# Combine: same-stop precedence over diff-stop
+same_stop_ids <- if (nrow(ss_events_b) > 0) ss_events_b$comparator_isoform_id else character(0)
+diffstop_b    <- attr_b[attribution == "direct" &
+                        !comparator_isoform_id %in% same_stop_ids]
+all_attr_new  <- rbind(diffstop_b, ss_events_b, fill = TRUE)
+all_attr_new  <- all_attr_new[attribution == "direct"]
+all_attr_new$event_short <- shorten_event_labels(all_attr_new$ptc_causing_event,
+                                                  collapse_rare = 3)
+n_unique_direct <- nrow(all_attr_new)
+
+# Mechanism breakdown (38 / 23 / 8 target)
+all_attr_new[, mechanism := factor(mechanism,
+                                   levels = c("Frameshift", "In-frame stop", "3'UTR splice"))]
+mech_tab <- as.data.frame(table(all_attr_new$mechanism, useNA = "ifany"))
+names(mech_tab) <- c("Mechanism", "n")
+
+# ── Claims 4.4.10 and 4.6.1 — the mechanism split of the attributed PTC events ─────────
+# EMITTED HERE, AT THE POINT OF COMPUTATION, not in `sec2b-mech-table` where the ledger
+# attributes them: that chunk only calls knitr::kable on this object. The contract requires the
+# call site because the population is known here and nowhere else.
+MECH_POP <- paste("splicing events attributed as the direct cause of a PTC, one per PTC-positive",
+                  "pair, in the GENCODE reference set; same-stop 3'UTR-splice attributions take",
+                  "precedence over different-stop ones, and unresolved attributions are excluded")
+mech_n <- function(m) {
+  i <- match(m, as.character(mech_tab$Mechanism))
+  if (is.na(i)) 0L else as.integer(mech_tab$n[i])
+}
+n_fs <- mech_n("Frameshift"); n_ifs <- mech_n("In-frame stop"); n_u3 <- mech_n("3'UTR splice")
+
+claim_emit("4.4.10", "attributed PTC-causing events", n_unique_direct,
+           published = 48, n = n_unique_direct, population = MECH_POP)
+claim_emit("4.4.10", "frameshift events (count)", n_fs,
+           published = 25, n = n_unique_direct, population = MECH_POP)
+claim_emit("4.4.10", "in-frame stop events (count)", n_ifs,
+           published = 18, n = n_unique_direct, population = MECH_POP)
+claim_emit("4.4.10", "3'UTR splice events (count)", n_u3,
+           published = 5, n = n_unique_direct, population = MECH_POP)
+
+# The three percentages are asserted by BOTH 4.4.10 (the figure legend) and 4.6.1 (the Results
+# sentence). Two claims, so two emissions each -- the S4 key is (claim_id, quantity), and one
+# writer per number is preserved because both come from this single computation.
+#
+# WRITTEN OUT RATHER THAN LOOPED OVER c("4.4.10", "4.6.1"): with the id in a loop variable the
+# claim id is not a literal at the call site, and tools/check_claim_emit_sites.py -- correctly --
+# scored 4.6.1 as uninstrumented, because a call site no static check can find cannot be
+# verified before the run.
+pct_fs  <- 100 * n_fs  / n_unique_direct
+pct_ifs <- 100 * n_ifs / n_unique_direct
+pct_u3  <- 100 * n_u3  / n_unique_direct
+claim_emit("4.4.10", "frameshift share of attributed events (%)", pct_fs,
+           published = 54, n = n_unique_direct, population = MECH_POP)
+claim_emit("4.4.10", "in-frame stop share of attributed events (%)", pct_ifs,
+           published = 38, n = n_unique_direct, population = MECH_POP)
+claim_emit("4.4.10", "3'UTR splice share of attributed events (%)", pct_u3,
+           published = 8, n = n_unique_direct, population = MECH_POP)
+claim_emit("4.6.1", "frameshift share of attributed events (%)", pct_fs,
+           published = 54, n = n_unique_direct, population = MECH_POP)
+claim_emit("4.6.1", "in-frame stop share of attributed events (%)", pct_ifs,
+           published = 38, n = n_unique_direct, population = MECH_POP)
+claim_emit("4.6.1", "3'UTR splice share of attributed events (%)", pct_u3,
+           published = 8, n = n_unique_direct, population = MECH_POP)
+```
+```{r sec3-scope, include=FALSE}
+ref_atg_c2 <- as.data.table(ref_atg$c2)
+ref_atg_c4 <- as.data.table(ref_atg$c4)
+
+# Step 1 — ENST-reference subset of pop_BC (no constraint on comparator)
+sec_C_c2_base <- pop_bc_c2[is_enst(reference_isoform_id)]
+sec_C_c4_base <- pop_bc_c4[is_enst(reference_isoform_id)]
+
+# Step 2 — restrict ref_atg tables to the ENST-reference pop_BC comparators
+c2_full <- ref_atg_c2[comparator_isoform_id %in%
+                        sec_C_c2_base$comparator_isoform_id]
+c4_full <- ref_atg_c4[comparator_isoform_id %in%
+                        sec_C_c4_base$comparator_isoform_id]
+
+# Step 3 — ref-AUG-traceable category filter (per side)
+TR    <- REF_AUG_PRESENT_CATEGORIES   # from mechanism-helpers chunk
+c2_tr <- c2_full[category %in% TR]
+c4_tr <- c4_full[category %in% TR]
+
+# Step 4 — re-intersect on (gene, reference) AFTER the category filter so
+#          NMD and Control panels share the same 1:1 gene-matched universe
+shared_keys <- merge(
+  unique(c2_tr[, .(gene_id, reference_isoform_id)]),
+  unique(c4_tr[, .(gene_id, reference_isoform_id)]),
+  by = c("gene_id", "reference_isoform_id")
+)
+refaug_matched_c2 <- merge(c2_tr, shared_keys,
+                            by = c("gene_id", "reference_isoform_id"))
+refaug_matched_c4 <- merge(c4_tr, shared_keys,
+                            by = c("gene_id", "reference_isoform_id"))
+
+# Classification: 5-group → 4-group → 3-group merged
+refaug_matched_c2[, mech5 := mechanism_class(category, comp_orf_length, ref_orf_length)]
+refaug_matched_c2[, mech4 := mechanism_class_4(mech5)]
+refaug_matched_c2[, group3 := data.table::fcase(
+  mech4 == "NMD+/PTC+",                                       "NMD+/PTC+",
+  mech4 %in% c("NMD+/PTC- ORF match", "NMD+/PTC- ORF diff"),  "NMD+/PTC-",
+  default = "Ref AUG absent"
+)]
+
+sec3_cascade <- data.frame(
+  Step = c("pop_BC (gene-matched)",
+           "+ ENST-reference (no comp constraint)",
+           "+ ref-AUG-traceable category (per side)",
+           "  re-intersect on (gene, ref)"),
+  c2_n = c(nrow(pop_bc_c2),
+           nrow(sec_C_c2_base),
+           nrow(c2_tr),
+           nrow(refaug_matched_c2)),
+  c4_n = c(nrow(pop_bc_c4),
+           nrow(sec_C_c4_base),
+           nrow(c4_tr),
+           nrow(refaug_matched_c4))
+)
+
+sec3_class <- as.data.frame(table(refaug_matched_c2$group3,
+                                   useNA = "ifany"))
+names(sec3_class) <- c("group", "n")
+
+# Claim 4.1.4 — the reference AUG-traceable set.
+SEC_C_POPULATION <- paste("NMD-comparator pairs whose REFERENCE isoform is GENCODE (ENST) and",
+                          "whose comparator falls in a ref-AUG-traceable category, so the CDS",
+                          "can be projected onto novel comparators by tracing the reference AUG;",
+                          "re-intersected on (gene, reference) after the category filter so both",
+                          "arms share one gene-matched universe. No requirement that the",
+                          "comparator itself be in GENCODE, which is what makes it ~6x larger",
+                          "than the GENCODE reference set")
+claim_emit("4.1.4", "NMD pairs in the reference AUG-traceable set", nrow(refaug_matched_c2),
+           published = 833, n = nrow(refaug_matched_c2), population = SEC_C_POPULATION)
+```
+
+```{r sec1-flowchart-data, include=FALSE}
+# Pull canonical counts for the flowchart (NMD classification + pair
+# construction stages) from the loaded caches. The §2 / §3 scope counts and
+# the TD2 broad / occult-PTC scope counts are taken from the canonical Pass-7
+# verifier manifest at reproducibility/verify_pass7_new_rmd.R — these are
+# guarded against drift by both verifiers.
+n_filtered    <- nrow(expr_mat)                       # 123,790 isoforms
+n_samples_4ct <- 26L                                  # 4-CT manuscript scope
+n_dmso_4ct    <- 13L                                  # AT 3 + DD 4 + FB 3 + MV 3
+n_smg1i_4ct   <- 13L
+n_nmd_as      <- length(nmd_class[["all_samples"]]$nmd)
+n_nonnmd_as   <- length(nmd_class[["all_samples"]]$non_nmd)
+n_c2_before   <- nrow(profiles_c2)
+n_c4_before   <- nrow(profiles_c4)
+fmt <- function(x) format(x, big.mark = ",")
+
+# --- Flowchart cohort labels, 2026-07-26 ----------------------------------------------
+# These were HARDCODED into the diagram's dot spec (1,548 / 130 / 819 / 48 / 36.9% / OR
+# 37.06 / 756 ...). They could not be computed here because the chunks that derive them ran
+# AFTER the diagram; those four chunks are now hoisted above it, so the diagram labels
+# itself from the same objects the tables use and cannot drift from them again.
+#
+# The rebuild is what made the drift visible: the diagram still said 130/130 while the text
+# said 132/132, in one document.
+fd_popbc_c2  <- nrow(pop_bc_c2);        fd_popbc_c4  <- nrow(pop_bc_c4)
+fd_enst_c2   <- nrow(pop_bc_c2_E);      fd_enst_c4   <- nrow(pop_bc_c4_E)
+fd_all3_c2   <- nrow(gencode_all3_c2);  fd_all3_c4   <- nrow(gencode_all3_c4)
+fd_ptc_n     <- n_ptc_nmd
+fd_ptc_pct   <- ptc_rate_nmd
+fd_nptc_n    <- n_avail_nmd - n_ptc_nmd
+fd_or        <- unname(ptc_fisher$estimate)
+fd_p         <- ptc_fisher$p.value
+fd_fold      <- fold_enrich
+fd_scC_base_c2 <- nrow(sec_C_c2_base);  fd_scC_base_c4 <- nrow(sec_C_c4_base)
+fd_scC_tr_c2   <- nrow(c2_tr);          fd_scC_tr_c4   <- nrow(c4_tr)
+fd_scC_c2      <- nrow(refaug_matched_c2); fd_scC_c4   <- nrow(refaug_matched_c4)
+.g <- function(g) { v <- sec3_class$n[sec3_class$group == g]; if (length(v)) v[1] else NA_integer_ }
+fd_scC_ptc_n   <- .g("NMD+/PTC+")
+fd_scC_nptc_n  <- .g("NMD+/PTC-")
+fd_scC_ptc_pct <- 100 * fd_scC_ptc_n / fd_scC_c2
+```
+
+```{r sec1-flowchart, fig.width=11, fig.height=14, echo=FALSE}
+dot_spec <- sprintf('
+digraph cohort_cascade {
+  graph [rankdir=TB, fontname="Helvetica", nodesep=0.5, ranksep=0.6, splines=ortho]
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=12, margin="0.18,0.10"]
+  edge  [color="#666666", penwidth=1.6, fontname="Helvetica", fontsize=10, fontcolor="#333"]
+
+  // ─── Upstream chain ────────────────────────────────────────────────
+  A [label=<<b>4-CT manuscript-scope cohort</b><br/>
+            %d samples (AT 6  ·  DD 8  ·  FB 6  ·  MV 6)<br/>
+            %s expressed isoforms (after TMM + 5%% filter)>,
+     fillcolor="#e8eef4", color="#2f4858"]
+
+  B [label=<<b>mashr NMD classification</b><br/>
+            NMD-sensitive: %s isoforms (union across CTs)<br/>
+            Non-NMD: %s isoforms (intersection across CTs)>,
+     fillcolor="#fff7bc", color="#d95f0e"]
+
+  C [label=<<b>Pair construction</b> (Isopair)<br/>
+            c4: top-two non-NMD isoforms per gene<br/>
+            c2: top NMD isoform vs the same reference<br/>
+            <font point-size="11">c2 pre-match: %s pairs  ·  c4 pre-match: %s pairs</font>>,
+     fillcolor="#e8f4f8", color="#2c7fb8"]
+
+  HUB [label=<<b><font point-size="15">pop_BC</font></b><br/>
+              Stage-2 gene-matched on (gene, reference)<br/>
+              <font point-size="14"><b>%s NMD pairs    /    %s Control pairs</b></font>>,
+       fillcolor="#1f3a5f", fontcolor="white", color="#0a1a30", penwidth=2.0]
+
+  A -> B [label=" per-CT mashr + 4-CT union "]
+  B -> C [label=" generatePairsExpression "]
+  C -> HUB [label=" inner_join on (gene, reference) "]
+
+  // ─── Section A branch (left) ───────────────────────────────────────
+  SA_H [label=<<b>SECTION A scope</b><br/>
+                all-3-ENST + coding-CDS<br/>
+                <font point-size="11">re-intersect on (gene, reference)</font>>,
+        fillcolor="#ef8a62", color="#7d4030", fontcolor="#1a0a05"]
+  SA1 [label=<+ all-3-ENST (ref AND comp)<br/>
+              re-intersect → <b>%s / %s</b>>,
+       fillcolor="#f5b294", color="#a2604a"]
+  SA2 [label=<+ coding-CDS everywhere<br/>
+              re-intersect → <b>%s / %s</b>>,
+       fillcolor="#f5b294", color="#a2604a"]
+  SA_CL [label=<<b>own-GENCODE-stop classifier</b><br/>
+                50-nt last-EJC rule>,
+         fillcolor="#fff7bc", color="#d95f0e"]
+  SA_PTC  [label=<<b>NMD+/PTC+</b><br/>n = %s  (%.1f%%)>,
+           fillcolor="#ef8a62", color="#7d4030"]
+  SA_NPTC [label=<<b>NMD+/PTC−</b><br/>n = %s>,
+           fillcolor="#fee08b", color="#a07a30"]
+  SA_CTL  [label=<<b>Control</b><br/>n = %s>,
+           fillcolor="#92c5de", color="#406080"]
+  SA_STAT [label=<Fisher OR = %.2f  ·  p = %.2e  ·  %.0f× enrichment>,
+           shape=plaintext, fillcolor="white"]
+  SA_F3 [label=<<b>Figure 3</b><br/>Panels D / E / F>,
+         fillcolor="#dddddd", color="#666"]
+  SA_F4 [label=<<b>Figure 4</b><br/>Panels A / B<br/>5\\\'UTR length + ORF>,
+         fillcolor="#dddddd", color="#666"]
+  SA_SUP [label=<<b>CDS / 3\\\'UTR supplement</b><br/>Row 1 (A / B / C)<br/>n = %s>,
+          fillcolor="#dddddd", color="#666"]
+
+  HUB -> SA_H [label="  ENST + coding-CDS  ", color="#7d4030"]
+  SA_H -> SA1 -> SA2 -> SA_CL -> {SA_PTC, SA_NPTC, SA_CTL} [color="#7d4030"]
+  SA_CL -> SA_STAT [style=dotted, arrowhead=none, color="#999"]
+  {SA_PTC, SA_NPTC, SA_CTL} -> SA_F3 [style=dashed, color="#888"]
+  {SA_PTC, SA_NPTC, SA_CTL} -> SA_F4 [style=dashed, color="#888"]
+  {SA_PTC, SA_NPTC, SA_CTL} -> SA_SUP [style=dashed, color="#888"]
+
+  // ─── Section C branch (right) ──────────────────────────────────────
+  SC_H [label=<<b>SECTION C scope</b><br/>
+                ENST-reference + ref-AUG-traceable<br/>
+                <font point-size="11">re-intersect AFTER category filter</font>>,
+        fillcolor="#3690c0", color="#1f5570", fontcolor="white"]
+  SC1 [label=<+ ENST-reference only<br/>
+              pop_BC ENST-ref subset → <b>%s / %s</b>>,
+       fillcolor="#a6cee3", color="#406080"]
+  SC2 [label=<+ ref-AUG-traceable category per side<br/>
+              (effectively_ptc / no_downstream_ejc / truncated_no_ejc)<br/>
+              pre re-intersect: <b>%s NMD  /  %s Control</b>>,
+       fillcolor="#a6cee3", color="#406080"]
+  SC3 [label=<re-intersect on (gene, ref) → <b>%s / %s</b>>,
+       fillcolor="#a6cee3", color="#406080"]
+  SC_CL [label=<<b>mechanism_class_4 classifier</b><br/>
+                (figures/lib/mechanism_class.R)>,
+         fillcolor="#fff7bc", color="#d95f0e"]
+  SC_PTC  [label=<<b>NMD+/PTC+</b><br/>n = %s  (%.1f%%)>,
+           fillcolor="#ef8a62", color="#7d4030"]
+  SC_NPTC [label=<<b>NMD+/PTC−</b><br/>n = %s>,
+           fillcolor="#fee08b", color="#a07a30"]
+  SC_CTL  [label=<<b>Control</b><br/>n = %s>,
+           fillcolor="#92c5de", color="#406080"]
+  SC_F4 [label=<<b>Figure 4</b><br/>Panels C / D<br/>ref-AUG 5\\\'UTR + ORF>,
+         fillcolor="#dddddd", color="#666"]
+  SC_SUP [label=<<b>CDS / 3\\\'UTR supplement</b><br/>Row 2 (D / E / F)<br/>n = %s>,
+          fillcolor="#dddddd", color="#666"]
+
+  HUB -> SC_H [label="  ENST-reference  ", color="#1f5570"]
+  SC_H -> SC1 -> SC2 -> SC3 -> SC_CL -> {SC_PTC, SC_NPTC, SC_CTL} [color="#1f5570"]
+  {SC_PTC, SC_NPTC, SC_CTL} -> SC_F4 [style=dashed, color="#888"]
+  {SC_PTC, SC_NPTC, SC_CTL} -> SC_SUP [style=dashed, color="#888"]
+
+  // ─── TD2 cascade (branches off Section C scope) ────────────────────
+  TD2_BR [label=<<b>TD2BiasEvidence — broad</b><br/>
+                  Section C ∩ TD2 CDS ∩ ref-AUG ORF ∩ ref AUG exonic<br/>
+                  <b>n = 819</b>>,
+          fillcolor="#a48bbf", color="#4a3556"]
+  TD2_OC [label=<<b>TD2BiasEvidence — occult-PTC</b><br/>
+                  broad ∩ effectively_ptc ∩ original_ptc = FALSE<br/>
+                  <b>n = 348</b><br/>
+                  <font point-size="11">TD2/ref ORF 7.67×  ·  ref &gt; TD2 Kozak 286 / 348 (82%%)<br/>
+                  paired p = 9.3e−36  ·  TD2 downstream of ref AUG 99.1%%</font>>,
+          fillcolor="#7a3f8f", color="#3a1e44", fontcolor="white"]
+
+  SC3 -> TD2_BR [label="  + TD2 CDS available  ", color="#4a3556"]
+  TD2_BR -> TD2_OC [label="  + occult-PTC filter  ", color="#4a3556"]
+
+  // ─── Rank constraints — encourage Section A and Section C side-by-side
+  { rank=same; SA_H; SC_H }
+  { rank=same; SA1; SC1 }
+  { rank=same; SA2; SC2 }
+  { rank=same; SA_CL; SC_CL }
+  { rank=same; SA_PTC, SA_NPTC, SA_CTL; SC_PTC, SC_NPTC, SC_CTL }
+}',
+  n_samples_4ct, fmt(n_filtered),
+  fmt(n_nmd_as), fmt(n_nonnmd_as),
+  fmt(n_c2_before), fmt(n_c4_before),
+  # HUB (pop_BC)
+  fmt(fd_popbc_c2), fmt(fd_popbc_c4),
+  # Section A cascade
+  fmt(fd_enst_c2), fmt(fd_enst_c4),
+  fmt(fd_all3_c2), fmt(fd_all3_c4),
+  fmt(fd_ptc_n), fd_ptc_pct,
+  fmt(fd_nptc_n), fmt(fd_all3_c4),
+  fd_or, fd_p, fd_fold,
+  fmt(fd_all3_c2),
+  # Section C cascade
+  fmt(fd_scC_base_c2), fmt(fd_scC_base_c4),
+  fmt(fd_scC_tr_c2),   fmt(fd_scC_tr_c4),
+  fmt(fd_scC_c2),      fmt(fd_scC_c4),
+  fmt(fd_scC_ptc_n),   fd_scC_ptc_pct,
+  fmt(fd_scC_nptc_n),  fmt(fd_scC_c4),
+  fmt(fd_scC_c2))   # SC_SUP
+
+if (requireNamespace("DiagrammeR", quietly = TRUE)) {
+  DiagrammeR::grViz(dot_spec, width = 1100, height = 1400)
+} else {
+  message("DiagrammeR not installed — flowchart not rendered")
+}
+```
+
+The figure-consumer endpoints (gray boxes) tie each cohort to the figures and
+supplements that consume it: Figure 3 D/E/F and Figure 4 A/B + the
+CDS/3'UTR supplement Row 1 from Section A; Figure 4 C/D + the
+CDS/3'UTR supplement Row 2 from Section C; and the TD2BiasEvidence
+supplement from the n=819 → n=348 occult-PTC chain.
+
+## §1a — Transcript-length comparison
+
+Lengths are recomputed inline from `structures.rds`. The legacy Rmd reported
+slightly different values because it used the full pre-match c4 set; the
+pop_BC-restricted Control median is the correct comparator.
+
+```{r sec1-tx-length, include=FALSE}
+tx_lengths_all <- setNames(
+  vapply(seq_len(nrow(structures)), function(i)
+    sum(structures$exon_ends[[i]] - structures$exon_starts[[i]] + 1L),
+    integer(1)),
+  structures$isoform_id
+)
+
+# pop_BC is gene-matched: each gene contributes exactly one (ref, NMD comp,
+# Control comp) triplet. Build the triplet table so Wilcoxon tests are
+# PROPERLY PAIRED on the gene-matched design (Pass 2 / M1 fix).
+pop_bc_triplets <- merge(
+  pop_bc_c2[, c("gene_id", "reference_isoform_id", "comparator_isoform_id")],
+  pop_bc_c4[, c("gene_id", "reference_isoform_id", "comparator_isoform_id")],
+  by = c("gene_id", "reference_isoform_id"),
+  suffixes = c("_nmd", "_ctrl"))
+pop_bc_triplets$ref_len  <- tx_lengths_all[pop_bc_triplets$reference_isoform_id]
+pop_bc_triplets$nmd_len  <- tx_lengths_all[pop_bc_triplets$comparator_isoform_id_nmd]
+pop_bc_triplets$ctrl_len <- tx_lengths_all[pop_bc_triplets$comparator_isoform_id_ctrl]
+pop_bc_triplets <- pop_bc_triplets[
+  complete.cases(pop_bc_triplets[, c("ref_len", "nmd_len", "ctrl_len")]), ]
+
+ref_lens  <- pop_bc_triplets$ref_len
+nmd_lens  <- pop_bc_triplets$nmd_len
+ctrl_lens <- pop_bc_triplets$ctrl_len
+
+len_summary <- data.frame(
+  Group   = c("Reference (non-NMD)", "NMD comparator", "Control comparator"),
+  n       = c(length(ref_lens), length(nmd_lens), length(ctrl_lens)),
+  Median  = c(median(ref_lens), median(nmd_lens), median(ctrl_lens)),
+  Q25     = c(unname(quantile(ref_lens, 0.25)),
+              unname(quantile(nmd_lens, 0.25)),
+              unname(quantile(ctrl_lens, 0.25))),
+  Q75     = c(unname(quantile(ref_lens, 0.75)),
+              unname(quantile(nmd_lens, 0.75)),
+              unname(quantile(ctrl_lens, 0.75))),
+  row.names = NULL
+)
+len_pw <- data.frame(
+  Comparison = c("NMD vs Reference", "NMD vs Control", "Control vs Reference"),
+  p_value    = c(
+    wilcox.test(nmd_lens,  ref_lens,  paired = TRUE, exact = FALSE)$p.value,
+    wilcox.test(nmd_lens,  ctrl_lens, paired = TRUE, exact = FALSE)$p.value,
+    wilcox.test(ctrl_lens, ref_lens,  paired = TRUE, exact = FALSE)$p.value
+  )
+)
+```
+
+Median transcript length (nt):
+**Reference** = `r format(median(ref_lens), big.mark=",")`,
+**NMD comparator** = `r format(median(nmd_lens), big.mark=",")`,
+**Control comparator** = `r format(median(ctrl_lens), big.mark=",")`.
+
+Paired Wilcoxon (each gene contributes one (ref, NMD comp, Control comp)
+triplet, so paired tests are the correct comparator on this gene-matched
+design): NMD vs Reference `r format_p(len_pw$p_value[1])`;
+NMD vs Control `r format_p(len_pw$p_value[2])`;
+Control vs Reference `r format_p(len_pw$p_value[3])`.
+
+```{r sec1-tx-length-table, echo=FALSE}
+knitr::kable(len_summary, caption = "Transcript length by isoform role (pop_BC scope, nt)",
+             digits = 0, format.args = list(big.mark = ","))
+knitr::kable(len_pw, caption = "Paired Wilcoxon: transcript length (gene-matched pairs)")
+```
+
+## §1b — Annotation status by role
+
+```{r sec1-annotation, include=FALSE}
+is_novel_iso <- function(ids) grepl("[.]novel[0-9]+$", ids)
+
+ann_table <- data.frame(
+  Role = c("Reference (non-NMD)", "NMD comparator", "Control comparator"),
+  n    = c(length(ref_ids_pop), length(nmd_ids_pop), length(ctrl_ids_pop)),
+  ENST = c(sum(!is_novel_iso(ref_ids_pop)),
+           sum(!is_novel_iso(nmd_ids_pop)),
+           sum(!is_novel_iso(ctrl_ids_pop))),
+  Novel = c(sum(is_novel_iso(ref_ids_pop)),
+            sum(is_novel_iso(nmd_ids_pop)),
+            sum(is_novel_iso(ctrl_ids_pop)))
+)
+ann_table$pct_ENST  <- round(100 * ann_table$ENST  / ann_table$n, 1)
+ann_table$pct_Novel <- round(100 * ann_table$Novel / ann_table$n, 1)
+```
+
+References are predominantly GENCODE-annotated
+(`r ann_table$pct_ENST[ann_table$Role == "Reference (non-NMD)"]`% ENST,
+`r format(ann_table$ENST[ann_table$Role == "Reference (non-NMD)"], big.mark=",")` /
+`r format(ann_table$n[ann_table$Role == "Reference (non-NMD)"], big.mark=",")`),
+while NMD comparators are predominantly novel
+(`r ann_table$pct_Novel[ann_table$Role == "NMD comparator"]`%) — consistent with
+NMD-sensitive transcripts being underrepresented in reference annotations.
+
+```{r sec1-annotation-table, echo=FALSE}
+knitr::kable(ann_table, caption = "Annotation status by role (pop_BC scope)")
+```
+
+The Reference %ENST and the NMD-comparator %Novel define the scope reduction
+that motivates §2 (the GENCODE-only n=130 scope: where ALL three isoforms are
+ENST-annotated, which constrains the cohort sharply).
+
+## §1c — Per-gene isoform diversity and reference-isoform dominance
+
+The §4¶1 descriptive numbers (median expressed-isoforms per gene; reference-
+isoform share of parent-gene expression) are computed here from the same
+pop_BC universe used for transcript-length in §1a, so the SF
+*PairSetDescriptives* draws from these canonical chunks rather than
+recomputing.
+
+```{r sec1-iso-per-gene, include=FALSE}
+# Expressed non-NMD isoforms per gene across the pop_BC universe.
+# Filter: gene in pop_BC; isoform has a row in the TMM-normalized count matrix
+# (expression_data.rds); NOT classified as NMD-sensitive by mashr 4-CT union.
+nmd_iso_set <- nmd_class[["all_samples"]]$nmd
+expr_iso    <- rownames(expr_mat)
+
+sec1_iso <- data.table::as.data.table(structures)[
+  gene_id %in% pop_bc_shared$gene_id &
+    isoform_id %in% expr_iso &
+    !isoform_id %in% nmd_iso_set,
+  .(isoform_id, gene_id)]
+
+iso_per_gene <- sec1_iso[, .(n_isoforms = .N), by = gene_id]
+# Genes with zero matches keep a 0 count (rare; preserves denominator).
+all_pop_genes <- data.table::data.table(gene_id = unique(pop_bc_shared$gene_id))
+iso_per_gene <- merge(all_pop_genes, iso_per_gene, by = "gene_id", all.x = TRUE)
+iso_per_gene[is.na(n_isoforms), n_isoforms := 0L]
+
+iso_med <- as.integer(median(iso_per_gene$n_isoforms))
+iso_iqr <- as.integer(IQR(iso_per_gene$n_isoforms))
+```
+
+Across the `r format(nrow(iso_per_gene), big.mark=",")` pop_BC genes, the
+median number of expressed non-NMD isoforms per gene is **`r iso_med`**
+(IQR = `r iso_iqr`). The pop_BC ≥3-isoform inclusion criterion sets the floor.
+
+```{r sec1-ref-share, include=FALSE}
+# Reference-isoform DMSO 4-CT mean expression as a fraction of the gene's
+# total non-NMD DMSO 4-CT mean expression. The same denominator (non-NMD
+# expressed isoforms of the gene) used in sec1-iso-per-gene.
+dmso_4ct_samples <- unique(c(dmso_samples$AT, dmso_samples$DD,
+                              dmso_samples$FB, dmso_samples$MV))
+stopifnot(all(dmso_4ct_samples %in% colnames(expr_mat)))
+
+dmso_means <- rowMeans(expr_mat[, dmso_4ct_samples, drop = FALSE])
+sec1_iso[, mean_dmso := dmso_means[isoform_id]]
+sec1_iso[is.na(mean_dmso), mean_dmso := 0]
+gene_total_dmso <- sec1_iso[, .(gene_total = sum(mean_dmso)), by = gene_id]
+
+ref_share <- data.table::data.table(
+  gene_id              = pop_bc_c2$gene_id,
+  reference_isoform_id = pop_bc_c2$reference_isoform_id
+)
+ref_share <- merge(ref_share, gene_total_dmso, by = "gene_id", all.x = TRUE)
+ref_share[, ref_dmso := dmso_means[reference_isoform_id]]
+ref_share[is.na(ref_dmso), ref_dmso := 0]
+ref_share[, share := ifelse(gene_total > 0, ref_dmso / gene_total, NA_real_)]
+
+ref_share_med_pct  <- round(100 * median(ref_share$share, na.rm = TRUE))
+ref_share_ge50_pct <- round(100 * mean(ref_share$share >= 0.50, na.rm = TRUE))
+```
+
+The median reference-isoform DMSO 4-CT mean expression captures
+**`r ref_share_med_pct`%** of the parent gene's total non-NMD expression;
+**`r ref_share_ge50_pct`%** of references are above the 50% threshold.
+
+## §1d — Figure 3 Panels A/B/C
+
+Panels A (pair-set concept), B (sequence similarity), and C (event prevalence)
+characterize the pop_BC pair structure.
+
+**Panel C's numbers are computed HERE**, in the chunk below, and the figure only
+renders them (S13: no result may originate in `figures/`). Until 2026-07-27 this
+report embedded Panel C as an image while its values were derived in
+`figures/multipanel/figure3_isopair_and_ptc/data_export.R` — so re-rendering this
+report could not check them, and a restyle of the figure could move a published
+number silently. Panels A and B are unchanged and still render from the figure
+pipeline.
+
+```{r sec1d-panelB-sequence-similarity}
+# ── Panel B — sequence similarity of the comparator to the reference ──────────────────
+# S13. Panel B was a RESHAPE rather than a derivation -- data_export.R read the div_*
+# caches and stacked pct_shared into long form -- but claim 4.2.2 ("the NMD isoforms
+# shared more sequence content with the reference") is a RESULT asserted from that
+# distribution, and it was stated in no report. It had no producer outside figure code and
+# no asserted value at all, so nothing could check it.
+#
+# The panel data and the comparison behind the sentence now both live here.
+div_c2 <- readRDS(file.path(DM, "analysis_cache/div_c2_allsamples.rds"))
+div_c4 <- readRDS(file.path(DM, "analysis_cache/div_c4_allsamples.rds"))
+
+# div_* is row-aligned to the gene-matched pop_BC arms; assert rather than assume, because a
+# silent misalignment would pair each comparator with another pair's similarity value.
+stopifnot("div_c2 not row-aligned to pop_bc_c2" = nrow(div_c2) == nrow(pop_bc_c2),
+          "div_c4 not row-aligned to pop_bc_c4" = nrow(div_c4) == nrow(pop_bc_c4))
+
+panelB <- data.table::rbindlist(list(
+  data.table::data.table(comparison = "NMD",     pct_shared = div_c2$pct_shared),
+  data.table::data.table(comparison = "Control", pct_shared = div_c4$pct_shared)))
+panelB <- panelB[!is.na(pct_shared)]
+
+data.table::fwrite(panelB, file.path(.nmd_root,
+  "figures/multipanel/figure3_isopair_and_ptc/data/panelB_sequence_similarity.tsv"), sep = "\t")
+
+# The comparison claim 4.2.2 actually makes:
+b_med_nmd  <- median(panelB[comparison == "NMD"]$pct_shared)
+b_med_ctrl <- median(panelB[comparison == "Control"]$pct_shared)
+b_wilcox   <- wilcox.test(pct_shared ~ comparison, data = panelB)
+
+# Claim 4.2.2 is RELATIONAL -- "the NMD isoforms shared more sequence content with the
+# reference" -- and states no number, so these are SUPPORTING values with no `published`. The
+# assertion is the ORDERING of the two medians, and a reader checks it by reading them.
+PANEL_B_POP <- paste("pairs from the gene-matched pair cohort (one reference, one NMD comparator and one Control comparator per gene) with a non-missing exonic-sequence-shared value, one NMD and",
+                     "one Control comparator per gene; percentage of the comparator's exonic",
+                     "sequence shared with the reference isoform")
+claim_emit("4.2.2", "median exonic sequence shared with the reference, NMD (%)", b_med_nmd,
+           n = sum(panelB$comparison == "NMD"), population = PANEL_B_POP)
+claim_emit("4.2.2", "median exonic sequence shared with the reference, Control (%)", b_med_ctrl,
+           n = sum(panelB$comparison == "Control"), population = PANEL_B_POP)
+claim_emit("4.2.2", "Wilcoxon p, NMD vs Control sequence shared", b_wilcox$p.value,
+           n = nrow(panelB), population = PANEL_B_POP)
+```
+
+Median exonic sequence shared with the reference is
+**`r sprintf("%.1f%%", b_med_nmd)`** for NMD comparators against
+**`r sprintf("%.1f%%", b_med_ctrl)`** for Controls
+(Wilcoxon rank-sum p = `r signif(b_wilcox$p.value, 3)`;
+n = `r format(sum(panelB$comparison == "NMD"), big.mark=",")` NMD and
+`r format(sum(panelB$comparison == "Control"), big.mark=",")` Control pairs with a
+non-missing value). This is the comparison behind the Results sentence that NMD isoforms
+share more sequence with the reference than Controls do.
+
+```{r sec1d-panelC-event-prevalence}
+# ── Data provenance ───────────────────────────────────────────────────────────────────
+# Starting data: pop_bc_c2 / pop_bc_c4 from sec1-pop-bc above -- the shared (gene,
+# reference) pairs, one NMD comparator and one Control comparator per gene. Event booleans
+# (tss_changed, n_se, n_ir, ...) come from buildProfiles -> compareSplicingChoices; the
+# Partial_IR_5/3 flags come from the detailed_events list-column.
+#
+# ── ONE CONVENTION, LOCAL TO THIS TABLE (Pete, 2026-07-27) ────────────────────────────
+# IR is reported as the UNION of IR and IR_diff. The justification is biological, and it
+# comes from Isopair itself: per cooccurrence.R the two are the same mechanism, and Isopair
+# defines has_ir = n_ir + n_ir_diff. The merge is a per-pair OR rather than a sum of bars,
+# so a pair carrying BOTH an IR and an IR_diff event is counted once, not twice.
+#
+# The event caller still separates them, and this collapse is deliberately NOT applied
+# globally -- every other event table in the isopair reports keeps IR_diff as its own row.
+# Local to this table (Pete, 2026-07-27).
+#
+# The Control arm needs no adjustment: pop_bc_c4 is already one pair per gene, matched to
+# pop_bc_c2. Verified identical to the figure's own gene-matching, 1,578 vs 1,578 with zero
+# difference in either direction (verification/phaseC/panelC_from_report_logic.R).
+event_counts <- function(pr) c(
+  Alt_TSS          = sum(pr$tss_changed),
+  Alt_TES          = sum(pr$tes_changed),
+  A5SS             = sum(pr$n_a5ss > 0),
+  A3SS             = sum(pr$n_a3ss > 0),
+  SE               = sum(pr$n_se > 0),
+  Missing_Internal = sum(pr$n_missing_internal > 0),
+  IR               = sum(pr$n_ir > 0 | pr$n_ir_diff > 0),   # <- the convention
+  Partial_IR_5     = sum(sapply(pr$detailed_events, function(d) any(d$event_type == "Partial_IR_5"))),
+  Partial_IR_3     = sum(sapply(pr$detailed_events, function(d) any(d$event_type == "Partial_IR_3"))))
+
+evt_nmd  <- event_counts(pop_bc_c2)
+evt_ctrl <- event_counts(pop_bc_c4)
+n_evt_nmd  <- nrow(pop_bc_c2)
+n_evt_ctrl <- nrow(pop_bc_c4)
+
+panelC <- data.frame(
+  event_type              = names(evt_nmd),
+  n_pairs_with_event_NMD  = as.integer(evt_nmd),
+  pct_of_pairs_NMD        = round(100 * evt_nmd  / n_evt_nmd,  1),
+  n_pairs_with_event_Ctrl = as.integer(evt_ctrl),
+  pct_of_pairs_Ctrl       = round(100 * evt_ctrl / n_evt_ctrl, 1),
+  stringsAsFactors = FALSE)
+
+panelC$fisher_OR <- NA_real_; panelC$fisher_p <- NA_real_
+for (i in seq_len(nrow(panelC))) {
+  ft <- tryCatch(fisher.test(matrix(c(
+          panelC$n_pairs_with_event_NMD[i],  n_evt_nmd  - panelC$n_pairs_with_event_NMD[i],
+          panelC$n_pairs_with_event_Ctrl[i], n_evt_ctrl - panelC$n_pairs_with_event_Ctrl[i]),
+          nrow = 2)), error = function(e) NULL)
+  if (!is.null(ft)) { panelC$fisher_OR[i] <- round(ft$estimate, 2); panelC$fisher_p[i] <- ft$p.value }
+}
+panelC$direction <- ifelse(panelC$fisher_p > 0.05, "Non-significant",
+                    ifelse(panelC$fisher_OR > 1, "Enriched in NMD", "Enriched in Control"))
+panelC <- panelC[order(panelC$fisher_p), ]
+
+# The figure READS this; it must not recompute it.
+panelC_path <- file.path(.nmd_root,
+  "figures/multipanel/figure3_isopair_and_ptc/data/panelC_event_prevalence.tsv")
+write.table(panelC, panelC_path, sep = "\t", row.names = FALSE, quote = FALSE)
+
+# ── Claims 4.4.3, 4.4.4, 4.2.3 ────────────────────────────────────────────────────────
+# THE POPULATION IS THE FINDING HERE. This panel is computed over pop_BC -- every gene's NMD
+# and Control pair, no CDS or GENCODE constraint, because splice-event detection needs no CDS.
+# The manuscript's Panel C legend says "pairs where all three isoforms are GENCODE annotated
+# (n=130)", which is the Section A scope belonging to panels D/E/F. The emission below declares
+# the real denominator against that published 130, so the ~12x population error is recorded as a
+# disagreement rather than left in prose.
+PANEL_C_POP <- paste("pairs from the gene-matched pair cohort (one reference, one NMD comparator and one Control comparator per gene), one NMD comparator and one gene-matched Control comparator",
+                     "per gene; NO CDS or GENCODE-annotation constraint, because splice-event",
+                     "detection does not require a CDS. IR is reported as the union of IR and",
+                     "IR_diff, a per-pair OR local to this table")
+claim_emit("4.4.3", "pairs per arm in the Panel C population", n_evt_nmd,
+           n = n_evt_nmd, population = PANEL_C_POP)
+
+se_row      <- panelC[panelC$event_type == "SE", ]
+se_pct_nmd  <- se_row$pct_of_pairs_NMD
+se_pct_ctrl <- se_row$pct_of_pairs_Ctrl
+# `published` AS A STRING, NOT A DOUBLE. R renders as.character(51.0) as "51", which drops the
+# paper's stated decimal place -- and the checker takes its tolerance from the literal, so the
+# comparison silently loosened from +/-0.05 to +/-0.5 and scored the computed 51.3 as AGREEING
+# with a published 51.0 that the ledger records as a difference. Measured, not theorised.
+claim_emit("4.4.4", "SE prevalence in NMD pairs (%)", se_pct_nmd,
+           published = 51.3, n = n_evt_nmd, population = PANEL_C_POP)
+claim_emit("4.4.4", "SE prevalence in Control pairs (%)", se_pct_ctrl,
+           published = 21.7, n = n_evt_ctrl, population = PANEL_C_POP)
+claim_emit("4.4.4", "Fisher p for SE prevalence, NMD vs Control", se_row$fisher_p,
+           published = 1e-68, n = n_evt_nmd + n_evt_ctrl, population = PANEL_C_POP)
+
+# 4.2.3 says SE is "twice as frequent" in NMD pairs. The "2" the ledger extracted is an English
+# intensifier, not a printed point estimate, so the ratio is a SUPPORTING number: emitting it
+# against published = 2 would score the adjudicated-as-reproduced 2.4x as a disagreement.
+claim_emit("4.2.3", "SE prevalence ratio, NMD over Control", se_pct_nmd / se_pct_ctrl,
+           n = n_evt_nmd + n_evt_ctrl, population = PANEL_C_POP)
+```
+
+Panel C is computed over **`r format(n_evt_nmd, big.mark=",")`** NMD pairs and
+**`r format(n_evt_ctrl, big.mark=",")`** gene-matched Control pairs. Skipped exon is
+**`r panelC$pct_of_pairs_NMD[panelC$event_type == "SE"]`%** of NMD pairs against
+**`r panelC$pct_of_pairs_Ctrl[panelC$event_type == "SE"]`%** of Control pairs.
+
+```{r sec1d-panelC-table, echo=FALSE}
+knitr::kable(transform(panelC, fisher_p = signif(fisher_p, 3)),
+             caption = sprintf("Figure 3 Panel C — splice event prevalence, pop_BC (n=%s NMD / %s Control pairs). IR is the union of IR and IR_diff, a convention local to this table.",
+                               format(n_evt_nmd, big.mark=","), format(n_evt_ctrl, big.mark=",")),
+             format.args = list(big.mark = ","),
+             row.names = FALSE)
+```
+
+```{r sec1-fig3abc, echo=FALSE, fig.cap=c("Figure 3 Panel A — Isoform pair construction (schematic)", "Figure 3 Panel B — Sequence similarity to reference", "Figure 3 Panel C — Splice event prevalence"), out.width="100%"}
+inc_fig(c(
+  file.path(FIG_ROOT, "figures/multipanel/figure3_isopair_and_ptc/figure3_panelA_pair_concept.png"),
+  file.path(FIG_ROOT, "figures/multipanel/figure3_isopair_and_ptc/figure3_panelB_sequence_similarity.png"),
+  file.path(FIG_ROOT, "figures/multipanel/figure3_isopair_and_ptc/figure3_panelC_event_prevalence.png")
+))
+```
+
+# §2 — PTC analysis at the GENCODE-only scope (n=130)
+
+The Section A scope is the most stringent "complete GENCODE-only" subset:
+every isoform in the pair (Reference, NMD comparator, Control comparator) is
+GENCODE-annotated (ENST prefix) AND has a curated coding CDS. This eliminates
+TD2-derived CDS calls from the comparison and gives the cleanest possible
+PTC-vs-non-PTC contrast.
+
+**Scope construction** (replicated from
+[`figures/multipanel/figure4_ptcneg_and_model/data_export.R`](../../../../figures/multipanel/figure4_ptcneg_and_model/data_export.R) §"Section A scope"):
+
+<!-- The computation chunk that was here is now hoisted above the §1 flowchart, so the
+     flowchart can label itself from computed values instead of hardcoded literals.
+     It is include=FALSE and emits nothing, so nothing moved visibly. 2026-07-26 -->
+
+Filter cascade from pop_BC down to the n=130 Section A scope:
+
+```{r sec2-scope-table, echo=FALSE}
+knitr::kable(sec2_cascade,
+             caption = sprintf("Section A scope cascade — pop_BC → all-ENST → coding-everywhere → gencode_all3 (n=%s / %s)",
+                               format(nrow(gencode_all3_c2), big.mark=","),
+                               format(nrow(gencode_all3_c4), big.mark=",")),
+             format.args = list(big.mark = ","),
+             col.names = c("Filter step", "c2 rows", "c4 rows"))
+```
+
+`gencode_all3_c2` = `r nrow(gencode_all3_c2)` NMD pairs;
+`gencode_all3_c4` = `r nrow(gencode_all3_c4)` Control pairs. Both arms share
+the same `r length(joint2)` `(gene, reference)` pairs.
+
+**Why the cohort drops from 1,385/1,385 ENST-reference pairs to 130 coding-
+everywhere pairs:** the ENST-on-comparator filter is the tightest constraint
+— most NMD comparators in `pop_BC` are novel isoforms
+(`r ann_table$pct_Novel[ann_table$Role == "NMD comparator"]`% per §1b), so
+requiring ENST on the NMD-comparator side eliminates the bulk of the cohort.
+Requiring a curated CDS on top reduces further to 130. This stringent scope
+defines the Section A panels in Figure 3 (D/E/F) and Figure 4 (A/B), plus
+the `CDSand3UTR_GENCODEonly` supplement.
+
+## §2a — PTC determination
+
+At this scope every isoform is GENCODE-annotated with a curated coding CDS, so
+PTC status is determined per comparator from its own annotated stop's distance
+to the last exon-exon junction (50-nt rule). No ref-AUG projection is needed.
+This is the methodology used by Figure 3 Panels D/E/F and is replicated inline
+from
+[`figures/multipanel/figure3_isopair_and_ptc/data_export.R`](../../../../figures/multipanel/figure3_isopair_and_ptc/data_export.R).
+
+<!-- The computation chunk that was here is now hoisted above the §1 flowchart, so the
+     flowchart can label itself from computed values instead of hardcoded literals.
+     It is include=FALSE and emits nothing, so nothing moved visibly. 2026-07-26 -->
+
+**PTC+ rates** (own GENCODE stop + 50-nt rule, n=`r nrow(gencode_all3_c2)`
+NMD pairs / `r nrow(gencode_all3_c4)` Control pairs):
+
+- NMD: `r n_ptc_nmd` / `r n_avail_nmd` = **`r sprintf("%.1f", ptc_rate_nmd)`%**
+- Control: `r n_ptc_ctrl` / `r n_avail_ctrl` = **`r sprintf("%.1f", ptc_rate_ctrl)`%**
+- Fold enrichment: **`r sprintf("%.1f×", fold_enrich)`**
+- Fisher: OR = `r sprintf("%.1f", ptc_fisher$estimate)`, p = `r format_p(ptc_fisher$p.value)`
+
+```{r sec2a-panelD-export}
+# ── Panel D — stop-to-last-EJC distance, all-3-ENST scope ─────────────────────────────
+# S13. Like Panel B this is a reshape rather than a new quantity: `distance` is computed by
+# compute_ptc_info() in sec2-scope above. It moves here so the figure has no reason to
+# re-derive it, and so the panel and the report cannot drift.
+panelD <- data.table::rbindlist(list(
+  data.table::as.data.table(trace_c2)[!is.na(distance),
+    .(comparator_isoform_id, gene_id, reference_isoform_id,
+      comparison = "NMD", distance, last_ejc_tx_pos, own_stop_tx_pos)],
+  data.table::as.data.table(trace_c4)[!is.na(distance),
+    .(comparator_isoform_id, gene_id, reference_isoform_id,
+      comparison = "Control", distance, last_ejc_tx_pos, own_stop_tx_pos)]))
+
+data.table::fwrite(panelD, file.path(.nmd_root,
+  "figures/multipanel/figure3_isopair_and_ptc/data/panelD_stop_codon_distance.tsv"), sep = "\t")
+```
+
+```{r sec2a-fig3-panelD, echo=FALSE, fig.cap="Figure 3 Panel D — Stop-to-last-EJC distance at the n=130 scope", out.width="80%"}
+inc_fig(
+  file.path(FIG_ROOT, "figures/multipanel/figure3_isopair_and_ptc/figure3_panelD_stop_codon_distance.png")
+)
+```
+
+## §2b — PTC-causing event attribution
+
+For each of the `r n_ptc_nmd` PTC+ NMD pairs, we attribute the splice event
+that introduced the PTC. Two attribution functions are applied:
+
+- `attribute_ptc_events()` — matches a `detailed_events` row to the stop
+  position via `fw_events` (forward-walked junctions); handles the diff-stop
+  case where the comparator's PTC is at a different genomic position from
+  the reference's stop.
+- `attribute_3utr_splice()` — for same-stop pairs (comparator's own GENCODE
+  stop equals the reference's stop), looks for splice events DOWNSTREAM of
+  the stop in the 3'UTR.
+
+For the small set of pairs where both functions return a `"direct"` row, the
+same-stop call takes precedence (a 3'UTR splice is a more specific
+attribution than a diff-stop event when the stops coincide).
+
+<!-- The computation chunk that was here is now hoisted above the §1 flowchart, so the
+     flowchart can label itself from computed values instead of hardcoded literals.
+     It is include=FALSE and emits nothing, so nothing moved visibly. 2026-07-26 -->
+
+**Attribution accounting:**
+`r n_direct_b` direct (from `attribute_ptc_events`) +
+`r n_same_stop_direct` same-stop 3'UTR splice =
+`r n_direct_b + n_same_stop_direct` total attribution rows →
+`r n_unique_direct` unique direct (same-stop takes precedence over diff-stop;
+`r n_direct_b + n_same_stop_direct - n_unique_direct` rows were attributed by
+both functions, with the same-stop call kept) →
+`r n_ptc_nmd - n_unique_direct` unresolved out of `r n_ptc_nmd` PTC+ pairs
+(`r sprintf("%.1f%%", 100 * n_unique_direct / n_ptc_nmd)` attribution coverage).
+
+The pre-combine `attribute_ptc_events` pass left `r n_unresolved_b`
+unresolved; the same-stop pass rescued
+`r n_unresolved_b - (n_ptc_nmd - n_unique_direct)`
+of those, leaving `r n_ptc_nmd - n_unique_direct` finally unresolved.
+
+**Mechanism breakdown** of the `r n_unique_direct` attributed PTC events:
+
+```{r sec2b-mech-table, echo=FALSE}
+knitr::kable(mech_tab,
+             caption = sprintf("Mechanism breakdown for the %d attributed PTC events (0 of 48 PTC+ unresolved; Section A n=130 scope)", n_unique_direct),
+             col.names = c("Mechanism", "n"))
+```
+
+**Panels E and F are computed HERE** (S13), from the attribution already performed in
+`sec2b-attribution` above; the figure only renders them. Until 2026-07-27 they were
+derived in `figures/multipanel/figure3_isopair_and_ptc/panel_e_compute.R`, which read
+the same two caches and repeated the same attribution.
+
+```{r sec2b-panelEF-export}
+# ── Panel E — PTC-causing event enrichment vs the Control baseline ────────────────────
+# NMD side: the attributed PTC-causing events from sec2b-attribution (all_attr_new).
+# Control side: every detailed_event in the all-3-ENST Control arm (gencode_all3_c4).
+#
+# ONE CONVENTION, LOCAL TO THIS TABLE: IR_diff collapses into IR on the CONTROL side, so
+# the two arms are counted on the same event vocabulary. Same biological justification as
+# Panel C (Isopair cooccurrence.R: has_ir = n_ir + n_ir_diff).
+#
+# NOTE THE DENOMINATORS DIFFER BY CONSTRUCTION and that is deliberate: the NMD side counts
+# ATTRIBUTED events (one per PTC+ pair) while the Control side counts ALL events in the arm.
+# It is an event-composition comparison, not a per-pair rate, which is why `enrichment` is a
+# ratio of percentages rather than an odds ratio.
+# MERGE IR_diff* INTO IR AT THE SOURCE, on a LOCAL COPY. The figure does this at
+# panel_e_compute.R:113, BEFORE deriving event_short, so both the Panel E proportion table
+# and the Panel F mechanism breakdown treat IR_diff as IR -- same mechanism, same Isopair
+# justification as Panel C (has_ir = n_ir + n_ir_diff).
+#
+# On a COPY, not on all_attr_new itself: the convention is local to these two tables (Pete),
+# and the report's own event_short at the attribution chunk keeps IR_diff separate. Applying
+# it in place would silently redefine an object other chunks share.
+#
+# Found by the byte-identity test, not by reading: collapsing only the CONTROL side left
+# Panel E with IR n_ptc=3 plus a stray IR_diff_3 row against the figure's IR n_ptc=4.
+attr_EF <- data.table::copy(data.table::as.data.table(all_attr_new))
+attr_EF[grepl("^IR_diff", ptc_causing_event), ptc_causing_event := "IR"]
+attr_EF$event_short <- shorten_event_labels(attr_EF$ptc_causing_event, collapse_rare = 3)
+
+n_ptc_attr_e <- nrow(attr_EF)
+ptc_evt_freq <- sort(table(attr_EF$ptc_causing_event), decreasing = TRUE)
+panelE <- data.table::data.table(
+  event_type   = names(ptc_evt_freq),
+  n_ptc_events = as.integer(ptc_evt_freq),
+  pct_of_ptc   = round(100 * as.integer(ptc_evt_freq) / n_ptc_attr_e, 1))
+
+ctrl_all_events <- do.call(rbind, lapply(gencode_all3_c4$detailed_events, as.data.frame))
+ctrl_all_events$event_type[grepl("^IR_diff", ctrl_all_events$event_type)] <- "IR"
+ctrl_event_freq <- table(ctrl_all_events$event_type)
+ctrl_total_e    <- sum(ctrl_event_freq)
+
+panelE[, n_ctrl_events := as.integer(ctrl_event_freq[event_type])]
+panelE[is.na(n_ctrl_events), n_ctrl_events := 0L]
+panelE[, pct_ctrl   := round(100 * n_ctrl_events / ctrl_total_e, 1)]
+panelE[, enrichment := round(pct_of_ptc / pmax(pct_ctrl, 0.1), 1)]
+panelE[, fisher_p := NA_real_][, direction := NA_character_]
+for (i in seq_len(nrow(panelE))) {
+  ft <- tryCatch(fisher.test(matrix(c(
+          panelE$n_ptc_events[i],  n_ptc_attr_e - panelE$n_ptc_events[i],
+          panelE$n_ctrl_events[i], ctrl_total_e - panelE$n_ctrl_events[i]), nrow = 2)),
+        error = function(e) NULL)
+  if (!is.null(ft)) {
+    panelE$fisher_p[i]  <- signif(ft$p.value, 3)
+    panelE$direction[i] <- if (ft$p.value > 0.05) "Non-significant"
+      else if (panelE$enrichment[i] > 1) "Enriched in PTC-causing" else "Depleted in PTC-causing"
+  }
+}
+panelE <- panelE[, .(event_type, n_ptc_events, pct_of_ptc, n_ctrl_events, pct_ctrl,
+                     enrichment, fisher_p, direction)]
+
+# ── Panel F — mechanism breakdown x event type (long form for the stacked bar) ────────
+attr_F <- data.table::copy(attr_EF)   # same IR-collapsed copy Panel E uses
+attr_F[, mechanism := factor(mechanism,
+        levels = c("Frameshift", "In-frame stop", "3'UTR splice"))]
+sankey_agg <- attr_F[!is.na(mechanism), .(n = .N), by = .(event_short, mechanism)]
+evt_totals <- sankey_agg[, .(total = sum(n)), by = event_short][order(-total)]
+sankey_agg[, event_short := factor(event_short, levels = evt_totals$event_short)]
+panelF <- sankey_agg[order(event_short, mechanism),
+                     .(event_type = as.character(event_short),
+                       mechanism  = as.character(mechanism), n)]
+
+# The figures READ these; they must not recompute them.
+data.table::fwrite(panelE, file.path(.nmd_root,
+  "figures/multipanel/figure3_isopair_and_ptc/data/panelE_ptc_event_attribution.tsv"), sep = "\t")
+data.table::fwrite(panelF, file.path(.nmd_root,
+  "figures/multipanel/figure3_isopair_and_ptc/data/panelF_mechanism_breakdown.tsv"), sep = "\t")
+
+# ── Claims 4.4.8, 4.4.9, 4.6.2 — Panel E event composition ────────────────────────────
+# THE TWO DENOMINATORS ARE DIFFERENT BY CONSTRUCTION and the manuscript does not say so, which
+# is why both are spelled out here: the NMD side counts one ATTRIBUTED event per PTC-positive
+# pair, the Control side counts EVERY detailed event in the Control arm. `enrichment` is
+# therefore a ratio of percentages, not an odds ratio.
+PANEL_E_POP_NMD <- paste("splicing events attributed as the direct cause of a PTC, one per",
+                         "PTC-positive pair in the GENCODE reference set; IR_diff collapsed",
+                         "into IR on a local copy so both arms use one event vocabulary")
+PANEL_E_POP_CTRL <- paste("ALL detailed splicing events in the Control arm of the GENCODE",
+                          "reference set -- not one per pair -- with IR_diff collapsed into IR")
+
+claim_emit("4.4.8", "attributed PTC-causing events", n_ptc_attr_e,
+           published = 48, n = n_ptc_attr_e, population = PANEL_E_POP_NMD)
+claim_emit("4.4.8", "total Control splicing events (Panel E baseline)", ctrl_total_e,
+           published = 292, n = ctrl_total_e, population = PANEL_E_POP_CTRL)
+
+# 4.4.9 and 4.6.2 assert the same three events at different rounding. One emission per number:
+# a single row declaring nine published values would be matched set-wise, with no positional
+# pairing, which is the property D19 voided 25 results over.
+e_row <- function(ev) panelE[event_type == ev]
+for (spec in list(
+      list(ev = "SE",      pct = 47.9, ctrl = 14.4, p = 7e-7,  pct6 = 50, ctrl6 = 14),
+      list(ev = "A5SS",    pct = 12.5, ctrl = 4.1,  p = 0.03,  pct6 = 13, ctrl6 = 4),
+      list(ev = "Alt_TES", pct = 4.2,  ctrl = "26.0", p = 3e-4, pct6 = NA, ctrl6 = NA))) {
+  r <- e_row(spec$ev)
+  if (nrow(r) != 1L) next
+  claim_emit("4.4.9", sprintf("%s share of PTC-causing events (%%)", spec$ev), r$pct_of_ptc,
+             published = spec$pct, n = n_ptc_attr_e, population = PANEL_E_POP_NMD)
+  claim_emit("4.4.9", sprintf("%s share of Control events (%%)", spec$ev), r$pct_ctrl,
+             published = spec$ctrl, n = ctrl_total_e, population = PANEL_E_POP_CTRL)
+  claim_emit("4.4.9", sprintf("Fisher p for %s, PTC-causing vs Control", spec$ev), r$fisher_p,
+             published = spec$p, n = n_ptc_attr_e + ctrl_total_e,
+             population = paste(PANEL_E_POP_NMD, "|| compared against:", PANEL_E_POP_CTRL))
+  # 4.6.2 restates SE and A5SS at whole-percent precision. Alt_TES is not in that sentence.
+  if (!is.na(spec$pct6)) {
+    claim_emit("4.6.2", sprintf("%s share of PTC-causing events (%%)", spec$ev), r$pct_of_ptc,
+               published = spec$pct6, n = n_ptc_attr_e, population = PANEL_E_POP_NMD)
+    claim_emit("4.6.2", sprintf("%s share of Control events (%%)", spec$ev), r$pct_ctrl,
+               published = spec$ctrl6, n = ctrl_total_e, population = PANEL_E_POP_CTRL)
+  }
+}
+# 4.6.2 states both p-values as INEQUALITIES ("p < 10^-6", "p < 0.05"), so they are supporting
+# numbers with the paper's threshold named -- see the note at claim 4.5.2.
+claim_emit("4.6.2", "Fisher p for SE (paper states p < 1e-6)", e_row("SE")$fisher_p,
+           n = n_ptc_attr_e + ctrl_total_e, population = PANEL_E_POP_NMD)
+claim_emit("4.6.2", "Fisher p for A5SS (paper states p < 0.05)", e_row("A5SS")$fisher_p,
+           n = n_ptc_attr_e + ctrl_total_e, population = PANEL_E_POP_NMD)
+```
+
+Panel E compares **`r n_ptc_attr_e`** attributed PTC-causing events against a Control
+baseline of **`r format(ctrl_total_e, big.mark=",")`** events. Panel F breaks the same
+**`r sum(panelF$n)`** attributed events down by mechanism.
+
+```{r sec2b-panelE-table, echo=FALSE}
+knitr::kable(panelE,
+             caption = sprintf("Figure 3 Panel E — PTC-causing event enrichment (n=%d attributed events vs %s Control events)",
+                               n_ptc_attr_e, format(ctrl_total_e, big.mark = ",")),
+             row.names = FALSE)
+```
+
+```{r sec2b-fig3-panelE-F, echo=FALSE, fig.cap=c("Figure 3 Panel E — PTC-causing event attribution (per-event Fisher table)", "Figure 3 Panel F — Mechanism breakdown × event type"), out.width="80%"}
+inc_fig(c(
+  file.path(FIG_ROOT, "figures/multipanel/figure3_isopair_and_ptc/figure3_panelE_ptc_event_attribution.png"),
+  file.path(FIG_ROOT, "figures/multipanel/figure3_isopair_and_ptc/figure3_panelF_mechanism_breakdown.png")
+))
+```
+
+## §2c — 5'UTR length + longest 5'UTR ORF at the n=130 scope
+
+At the n=130 all-3-ENST scope, the 5'UTR is the comparator's annotated 5'UTR
+(every isoform is GENCODE-annotated so the TD2-anchored `utr5_features_all`
+cache value equals the GENCODE 5'UTR length at this scope; the Rmd reads it
+from cache rather than recomputing). Three groups (using §2a `has_ptc`):
+
+- **NMD+/PTC+** (`r n_ptc_nmd` pairs) — `has_ptc == TRUE`
+- **NMD+/PTC−** (`r n_avail_nmd - n_ptc_nmd` pairs) — `has_ptc == FALSE`
+- **Control** (`r n_avail_ctrl` pairs) — `gencode_all3_c4` comparators
+
+The Control arm is a single group (not PTC-stratified) because PTC status is
+a property of the NMD-comparator. This matches the figure-side panel
+construction.
+
+Interpretive caution: at the n=130 scope, NMD+/PTC+ comparators have markedly
+short 5'UTRs (median 84.5 nt vs Control 138 nt) — this is most likely an
+alternative-TSS effect (PTC+ ENSTs at this scope tend to be 5'-truncated
+alternative transcripts) rather than 5'UTR cis-element divergence per se.
+The NMD+/PTC− 5'UTR enrichment is therefore the more biologically meaningful
+contrast for uORF-mediated NMD.
+
+```{r sec2c-helpers, include=FALSE}
+hodges_lehmann <- function(x, y) {
+  x <- x[!is.na(x)]; y <- y[!is.na(y)]
+  if (length(x) < 2L || length(y) < 2L) return(c(NA_real_, NA_real_, NA_real_, NA_real_))
+  wt <- tryCatch(wilcox.test(x, y, conf.int = TRUE, exact = FALSE),
+                  error = function(e) NULL)
+  if (is.null(wt)) return(c(NA_real_, NA_real_, NA_real_, NA_real_))
+  c(unname(wt$estimate), unname(wt$conf.int[1]), unname(wt$conf.int[2]),
+    unname(wt$p.value))
+}
+cliffs_delta <- function(x, y) {
+  x <- x[!is.na(x)]; y <- y[!is.na(y)]
+  if (length(x) == 0L || length(y) == 0L) return(NA_real_)
+  (sum(outer(x, y, ">")) - sum(outer(x, y, "<"))) / (length(x) * length(y))
+}
+pairwise_stats <- function(groups_list, lookup) {
+  combos <- combn(names(groups_list), 2, simplify = FALSE)
+  do.call(rbind, lapply(combos, function(p) {
+    x <- lookup[groups_list[[p[1]]]]; y <- lookup[groups_list[[p[2]]]]
+    x <- x[!is.na(x)]; y <- y[!is.na(y)]
+    hl <- hodges_lehmann(x, y)
+    d  <- cliffs_delta(x, y)
+    data.frame(group_x = p[1], group_y = p[2],
+               n_x = length(x), n_y = length(y),
+               median_x = round(median(x), 1), median_y = round(median(y), 1),
+               hl_shift = round(hl[1], 1),
+               hl_ci = sprintf("[%.1f, %.1f]", hl[2], hl[3]),
+               cliffs_delta = round(d, 3),
+               wilcox_p = hl[4],
+               stringsAsFactors = FALSE)
+  }))
+}
+group_descriptives <- function(groups_list, lookup, order_names) {
+  out <- do.call(rbind, lapply(order_names, function(g) {
+    v <- lookup[groups_list[[g]]]
+    v <- v[!is.na(v)]
+    data.frame(group = g, n = length(v),
+               median = round(median(v), 1),
+               q25 = round(unname(quantile(v, 0.25)), 1),
+               q75 = round(unname(quantile(v, 0.75)), 1),
+               stringsAsFactors = FALSE)
+  }))
+  rownames(out) <- NULL
+  out
+}
+```
+
+```{r sec2c-secA-groups, include=FALSE}
+ptc_pos_ids <- trace_c2[has_ptc == TRUE,  comparator_isoform_id]
+ptc_neg_ids <- trace_c2[has_ptc == FALSE, comparator_isoform_id]
+sec_A_groups <- list(
+  "NMD+/PTC+" = ptc_pos_ids,
+  "NMD+/PTC-" = ptc_neg_ids,
+  "Control"   = gencode_all3_c4$comparator_isoform_id
+)
+
+u5_all_dt <- as.data.table(utr5_all$isoform_features)
+u5_len_lookup <- setNames(as.numeric(u5_all_dt$utr5_length),    u5_all_dt$isoform_id)
+u5_orf_lookup <- setNames(as.numeric(u5_all_dt$longest_orf_nt), u5_all_dt$isoform_id)
+
+secA_utr5_desc <- group_descriptives(sec_A_groups, u5_len_lookup,
+                                      c("NMD+/PTC+", "NMD+/PTC-", "Control"))
+secA_utr5_pw   <- pairwise_stats(sec_A_groups, u5_len_lookup)
+secA_orf_desc  <- group_descriptives(sec_A_groups, u5_orf_lookup,
+                                      c("NMD+/PTC+", "NMD+/PTC-", "Control"))
+secA_orf_pw    <- pairwise_stats(sec_A_groups, u5_orf_lookup)
+
+secA_utr5_pw$wilcox_p_fmt <- vapply(secA_utr5_pw$wilcox_p, format_p, character(1))
+secA_orf_pw$wilcox_p_fmt  <- vapply(secA_orf_pw$wilcox_p,  format_p, character(1))
+
+# ── Claim 4.6.4 — three assertions, no published numbers ──────────────────────────────
+# "NMD+/PTC- isoforms had longer 5'UTRs and uORFs than BOTH other groups, with no significant
+# difference in CDS length." The paper prints no values, so every emission here is SUPPORTING:
+# the claim is an ordering plus a null, and a reader checks it from these six numbers.
+# BOTH comparisons matter, not just one -- "than both other groups" fails if PTC- exceeds only
+# Control. The CDS half is emitted in `sec2d-cds` below, where secA_cds_pw is built.
+SEC_A_FEATURE_POP <- paste("comparator isoforms of the GENCODE reference set, split into",
+                           "NMD+/PTC+, NMD+/PTC- and Control; isoforms with a missing value for",
+                           "the feature are dropped, so n differs between features")
+med_of <- function(desc, g) desc$median[match(g, desc$group)]
+for (spec in list(list(d = secA_utr5_desc, what = "5'UTR length (nt)"),
+                  list(d = secA_orf_desc,  what = "longest 5'UTR ORF (nt)"))) {
+  for (g in c("NMD+/PTC+", "NMD+/PTC-", "Control")) {
+    claim_emit("4.6.4", sprintf("median %s, %s", spec$what, g), med_of(spec$d, g),
+               n = spec$d$n[match(g, spec$d$group)], population = SEC_A_FEATURE_POP)
+  }
+}
+```
+
+### Panel A — 5'UTR length
+
+```{r sec2c-panelA-tables, echo=FALSE}
+knitr::kable(secA_utr5_desc,
+             caption = "5'UTR length (nt) — Section A descriptives",
+             col.names = c("Group", "n", "Median", "Q25", "Q75"))
+knitr::kable(secA_utr5_pw[, c("group_x","group_y","n_x","n_y","median_x","median_y","hl_shift","hl_ci","cliffs_delta","wilcox_p_fmt")],
+             caption = "5'UTR length — pairwise stats (Hodges–Lehmann shift, Cliff's δ, Wilcoxon p)",
+             col.names = c("X","Y","n_X","n_Y","Med X","Med Y","HL shift","HL 95% CI","Cliff's δ","Wilcoxon p"))
+```
+
+### Panel B — Longest 5'UTR ORF
+
+```{r sec2c-panelB-tables, echo=FALSE}
+knitr::kable(secA_orf_desc,
+             caption = "Longest 5'UTR ORF (nt) — Section A descriptives",
+             col.names = c("Group", "n", "Median", "Q25", "Q75"))
+knitr::kable(secA_orf_pw[, c("group_x","group_y","n_x","n_y","median_x","median_y","hl_shift","hl_ci","cliffs_delta","wilcox_p_fmt")],
+             caption = "Longest 5'UTR ORF — pairwise stats",
+             col.names = c("X","Y","n_X","n_Y","Med X","Med Y","HL shift","HL 95% CI","Cliff's δ","Wilcoxon p"))
+```
+
+```{r sec2c-fig4AB, echo=FALSE, fig.cap=c("Figure 4 Panel A — 5'UTR length at n=130 scope", "Figure 4 Panel B — Longest 5'UTR ORF at n=130 scope"), out.width="90%"}
+inc_fig(c(
+  file.path(FIG_ROOT, "figures/multipanel/figure4_ptcneg_and_model/figure4_panelA_5utr_length_all3enst.png"),
+  file.path(FIG_ROOT, "figures/multipanel/figure4_ptcneg_and_model/figure4_panelB_longest_5utr_orf_all3enst.png")
+))
+```
+
+## §2d — 3'UTR / CDS sanity at n=130
+
+Three additional structural features for the same `sec_A_groups`: CDS length,
+translation-based 3'UTR (`tx_len − own_stop_tx_pos`), and bias-corrected
+3'UTR via the `utr3_via_non_ptc_stop_nt` field of `ref_atg` (walks past PTCs
+to find the next non-PTC stop). The non-PTC measure is the more meaningful
+3'UTR-length comparator because for PTC+ pairs the translation-based 3'UTR
+inflates with PTC distance and is no longer comparable to the Control 3'UTR.
+
+```{r sec2d-features, include=FALSE}
+own_atg_tx_lookup <- (function() {
+  atg_tx <- rep(NA_integer_, nrow(coding_cds))
+  for (i in seq_len(nrow(coding_cds))) {
+    si <- struct_idx[i]; if (is.na(si)) next
+    strand <- coding_cds$strand[i]
+    if (is.na(strand) || strand == "") next
+    atg_g <- if (strand == "+") coding_cds$cds_start[i] else coding_cds$cds_stop[i]
+    atg_tx[i] <- Isopair::genomicToTranscript(
+      atg_g, structures$exon_starts[[si]], structures$exon_ends[[si]], strand)
+  }
+  setNames(atg_tx, coding_cds$isoform_id)
+})()
+
+tx_len_lookup <- setNames(
+  vapply(seq_len(nrow(structures)), function(i)
+    sum(structures$exon_ends[[i]] - structures$exon_starts[[i]] + 1L),
+    integer(1)),
+  structures$isoform_id
+)
+
+# Build per-comparator features for sec_A_groups
+ra_c2_lookup <- setNames(
+  as.data.table(ref_atg$c2)$utr3_via_non_ptc_stop_nt,
+  as.data.table(ref_atg$c2)$comparator_isoform_id
+)
+ra_c4_lookup <- setNames(
+  as.data.table(ref_atg$c4)$utr3_via_non_ptc_stop_nt,
+  as.data.table(ref_atg$c4)$comparator_isoform_id
+)
+
+compute_secA_feat <- function(comp_ids, ra_lookup) {
+  own_stop <- own_stop_tx_lookup$own_stop_tx_pos[match(comp_ids, own_stop_tx_lookup$isoform_id)]
+  own_atg  <- own_atg_tx_lookup[comp_ids]
+  tx_len   <- tx_len_lookup[comp_ids]
+  data.table(
+    comparator_isoform_id = comp_ids,
+    cds_nt   = pmax(0L, own_stop - own_atg + 1L),
+    utr3_nt  = pmax(0L, tx_len - own_stop),
+    utr3_via_non_ptc_stop_nt = ra_lookup[comp_ids]
+  )
+}
+
+feat_ptc_pos <- compute_secA_feat(ptc_pos_ids, ra_c2_lookup)
+feat_ptc_neg <- compute_secA_feat(ptc_neg_ids, ra_c2_lookup)
+feat_ctrl    <- compute_secA_feat(gencode_all3_c4$comparator_isoform_id, ra_c4_lookup)
+# At the n=130 all-3-ENST + coding-CDS scope every comparator's own GENCODE
+# stop is non-PTC by classification (PTC+ pairs were segregated via §2a's
+# has_ptc flag), so for PTC- and Control the bias-corrected 3'UTR length IS
+# the translation-based measure. Overwrite unconditionally (matches the
+# figure-side CDSand3UTR_GENCODEonly/data_export.R convention).
+feat_ptc_neg[, utr3_via_non_ptc_stop_nt := utr3_nt]
+feat_ctrl[,    utr3_via_non_ptc_stop_nt := utr3_nt]
+
+cds_lookup <- setNames(
+  c(feat_ptc_pos$cds_nt, feat_ptc_neg$cds_nt, feat_ctrl$cds_nt),
+  c(feat_ptc_pos$comparator_isoform_id,
+    feat_ptc_neg$comparator_isoform_id,
+    feat_ctrl$comparator_isoform_id)
+)
+utr3_lookup <- setNames(
+  c(feat_ptc_pos$utr3_nt, feat_ptc_neg$utr3_nt, feat_ctrl$utr3_nt),
+  c(feat_ptc_pos$comparator_isoform_id,
+    feat_ptc_neg$comparator_isoform_id,
+    feat_ctrl$comparator_isoform_id)
+)
+utr3_npstop_lookup <- setNames(
+  c(feat_ptc_pos$utr3_via_non_ptc_stop_nt,
+    feat_ptc_neg$utr3_via_non_ptc_stop_nt,
+    feat_ctrl$utr3_via_non_ptc_stop_nt),
+  c(feat_ptc_pos$comparator_isoform_id,
+    feat_ptc_neg$comparator_isoform_id,
+    feat_ctrl$comparator_isoform_id)
+)
+
+secA_cds_desc  <- group_descriptives(sec_A_groups, cds_lookup,
+                                      c("NMD+/PTC+", "NMD+/PTC-", "Control"))
+secA_cds_pw    <- pairwise_stats(sec_A_groups, cds_lookup)
+secA_utr3_desc <- group_descriptives(sec_A_groups, utr3_lookup,
+                                      c("NMD+/PTC+", "NMD+/PTC-", "Control"))
+secA_utr3_pw   <- pairwise_stats(sec_A_groups, utr3_lookup)
+secA_utr3np_desc <- group_descriptives(sec_A_groups, utr3_npstop_lookup,
+                                        c("NMD+/PTC+", "NMD+/PTC-", "Control"))
+secA_utr3np_pw   <- pairwise_stats(sec_A_groups, utr3_npstop_lookup)
+
+secA_cds_pw$wilcox_p_fmt    <- vapply(secA_cds_pw$wilcox_p,    format_p, character(1))
+secA_utr3_pw$wilcox_p_fmt   <- vapply(secA_utr3_pw$wilcox_p,   format_p, character(1))
+secA_utr3np_pw$wilcox_p_fmt <- vapply(secA_utr3np_pw$wilcox_p, format_p, character(1))
+```
+
+### CDS length
+
+```{r sec2d-cds, echo=FALSE}
+# Claim 4.6.4's third assertion — "no significant difference in CDS length". A NULL result, so
+# what has to be recorded is the p-value of each comparison involving NMD+/PTC-, not a median:
+# the claim is that neither reaches significance, and one of the two being null is not the
+# claim. Supporting numbers, since the paper prints none.
+for (i in seq_len(nrow(secA_cds_pw))) {
+  gx <- secA_cds_pw$group_x[i]; gy <- secA_cds_pw$group_y[i]
+  if (!("NMD+/PTC-" %in% c(gx, gy))) next
+  claim_emit("4.6.4", sprintf("Wilcoxon p for CDS length, %s vs %s", gx, gy),
+             secA_cds_pw$wilcox_p[i], n = nrow(secA_cds_desc),
+             population = SEC_A_FEATURE_POP)
+}
+
+knitr::kable(secA_cds_desc, caption = "CDS length (nt)",
+             col.names = c("Group","n","Median","Q25","Q75"))
+knitr::kable(secA_cds_pw[, c("group_x","group_y","median_x","median_y","hl_shift","hl_ci","cliffs_delta","wilcox_p_fmt")],
+             caption = "CDS length — pairwise stats",
+             col.names = c("X","Y","Med X","Med Y","HL shift","HL 95% CI","Cliff's δ","Wilcoxon p"))
+```
+
+### 3'UTR length (translation-based)
+
+```{r sec2d-utr3, echo=FALSE}
+knitr::kable(secA_utr3_desc, caption = "3'UTR length, translation-based (own stop → tx end)",
+             col.names = c("Group","n","Median","Q25","Q75"))
+knitr::kable(secA_utr3_pw[, c("group_x","group_y","median_x","median_y","hl_shift","hl_ci","cliffs_delta","wilcox_p_fmt")],
+             caption = "3'UTR translation-based — pairwise stats",
+             col.names = c("X","Y","Med X","Med Y","HL shift","HL 95% CI","Cliff's δ","Wilcoxon p"))
+```
+
+### 3'UTR length (bias-corrected, walks past PTCs)
+
+```{r sec2d-utr3np, echo=FALSE}
+knitr::kable(secA_utr3np_desc,
+             caption = "3'UTR length, bias-corrected (non-PTC-stop based)",
+             col.names = c("Group","n","Median","Q25","Q75"))
+knitr::kable(secA_utr3np_pw[, c("group_x","group_y","median_x","median_y","hl_shift","hl_ci","cliffs_delta","wilcox_p_fmt")],
+             caption = "3'UTR bias-corrected — pairwise stats",
+             col.names = c("X","Y","Med X","Med Y","HL shift","HL 95% CI","Cliff's δ","Wilcoxon p"))
+```
+
+<!-- MOVED 2026-08-11. This export chunk stood at line 1903, AFTER sec2d-supp below, and that
+     ordering made the report unrenderable from a clean state. sec2d-supp embeds SF36.png;
+     figure_sf36.py reads SF33/data/features_1166_subset_long.tsv; SF33's data_export.R does not
+     compute that file; and THIS chunk is its only writer. The report therefore had to pass
+     sec2d-supp to produce what sec2d-supp requires. Demonstrated in cleanroom_2026-08-11: an
+     8-pass render-build loop reached 13 of 14 required figures and stalled here for four passes.
+     The chunk is include=FALSE, so moving it emits nothing new and changes no rendered output;
+     its inputs refaug_matched_c2/c4 are created at lines 666-668, far above either position. -->
+```{r sec3d-refaug-cds-utr3-export, include=FALSE}
+nmd_C <- refaug_matched_c2[, .(comparator_isoform_id, group = group3,
+                                cds_nt = comp_orf_length_from_ref_atg,
+                                utr3_to_tx_end_nt, utr3_via_non_ptc_stop_nt)]
+ctrl_C <- refaug_matched_c4[, .(comparator_isoform_id, group = "Control",
+                                 cds_nt = comp_orf_length_from_ref_atg,
+                                 utr3_to_tx_end_nt, utr3_via_non_ptc_stop_nt)]
+all_feat_C <- rbind(nmd_C, ctrl_C, fill = TRUE)
+all_feat_C[, group := factor(group, levels = c("NMD+/PTC+", "NMD+/PTC-", "Control"))]
+
+SF33_DATA <- file.path(.nmd_root, "figures/supplemental/SF33_CdsAnd3UTR_GENCODE/data")
+dir.create(SF33_DATA, recursive = TRUE, showWarnings = FALSE)
+
+data.table::fwrite(
+  all_feat_C[, .(comparator_isoform_id, group, cds_nt,
+                 utr3_to_tx_end_nt, utr3_via_non_ptc_stop_nt)],
+  file.path(SF33_DATA, "features_1166_subset_long.tsv"), sep = "\t")
+
+emit_per_measure_C <- function(measure_col, slug) {
+  groups <- c("NMD+/PTC+", "NMD+/PTC-", "Control")
+  desc <- data.table::rbindlist(lapply(groups, function(g) {
+    vals <- all_feat_C[group == g, get(measure_col)]; vals <- vals[!is.na(vals)]
+    data.table::data.table(group = g, n = length(vals), median = median(vals),
+                           q25 = quantile(vals, 0.25), q75 = quantile(vals, 0.75))
+  }))
+  data.table::fwrite(desc, file.path(SF33_DATA, sprintf("%s_descriptives.tsv", slug)), sep = "\t")
+  pairs <- list(c("NMD+/PTC-", "NMD+/PTC+"), c("NMD+/PTC-", "Control"),
+                c("NMD+/PTC+", "Control"))
+  pw <- data.table::rbindlist(lapply(pairs, function(p) {
+    a <- all_feat_C[group == p[1], get(measure_col)]; a <- a[!is.na(a)]
+    b <- all_feat_C[group == p[2], get(measure_col)]; b <- b[!is.na(b)]
+    w <- suppressWarnings(wilcox.test(a, b, conf.int = TRUE))
+    data.table::data.table(
+      group_x = p[1], group_y = p[2], n_x = length(a), n_y = length(b),
+      median_x = median(a), median_y = median(b),
+      hl_shift = as.numeric(w$estimate),
+      hl_ci_lo = as.numeric(w$conf.int[1]), hl_ci_hi = as.numeric(w$conf.int[2]),
+      cliffs_delta = (sum(outer(a, b, ">")) - sum(outer(a, b, "<"))) / (length(a) * length(b)),
+      wilcox_p = w$p.value)
+  }))
+  data.table::fwrite(pw, file.path(SF33_DATA, sprintf("%s_pairwise.tsv", slug)), sep = "\t")
+  invisible(NULL)
+}
+emit_per_measure_C("cds_nt",                   "panelD_cds_length_refaug")
+emit_per_measure_C("utr3_to_tx_end_nt",        "panelE_utr3_translation_refaug")
+emit_per_measure_C("utr3_via_non_ptc_stop_nt", "panelF_utr3_non_ptc_stop_refaug")
+
+secC_utr3_desc   <- fread(file.path(SF33_DATA, "panelE_utr3_translation_refaug_descriptives.tsv"))
+secC_utr3np_desc <- fread(file.path(SF33_DATA, "panelF_utr3_non_ptc_stop_refaug_descriptives.tsv"))
+secC_utr3_pw     <- fread(file.path(SF33_DATA, "panelE_utr3_translation_refaug_pairwise.tsv"))
+secC_utr3np_pw   <- fread(file.path(SF33_DATA, "panelF_utr3_non_ptc_stop_refaug_pairwise.tsv"))
+```
+
+```{r sec2d-supp, echo=FALSE, fig.cap="CDSand3UTR_GENCODEonly supplement — 2×3 layout. Row 1 (Section A, n=130): A CDS length, B 3'UTR translation-based, C 3'UTR non-PTC-stop (bias-corrected). Row 2 (Section C, n=819, ref-AUG-projected): D CDS length, E 3'UTR translation-based, F 3'UTR non-PTC-stop. The bias-correction pattern (PTC+ inflation under translation-based collapses under non-PTC-stop measure) replicates across both scopes.", out.width="100%"}
+inc_fig(
+  c(file.path(FIG_ROOT, "figures/supplemental/SF33_CdsAnd3UTR_GENCODE/figure_sf33.png"),
+    file.path(FIG_ROOT, "figures/supplemental/SF36_CdsAnd3UTR_refAUG/figure_sf36.png"))
+)
+```
+
+# §3 — Larger-scope replication at ref-AUG-traceable (n=819)
+
+Section C extends Section A by relaxing the all-3-ENST + coding-CDS
+constraints and instead routing through the ref-AUG-projected ORF
+classification. This roughly 6× larger cohort lets us check that Section A's
+PTC findings replicate at the larger scope without relying on TD2's CDS calls
+on novel comparators.
+
+**Scope construction** (replicated from
+[`figures/multipanel/figure4_ptcneg_and_model/data_export.R`](../../../../figures/multipanel/figure4_ptcneg_and_model/data_export.R) §"Section C scope"):
+
+<!-- The computation chunk that was here is now hoisted above the §1 flowchart, so the
+     flowchart can label itself from computed values instead of hardcoded literals.
+     It is include=FALSE and emits nothing, so nothing moved visibly. 2026-07-26 -->
+
+Filter cascade from pop_BC down to the n=819 Section C scope:
+
+```{r sec3-scope-table, echo=FALSE}
+knitr::kable(sec3_cascade,
+             caption = sprintf("Section C scope cascade — pop_BC → ENST-ref → ref-AUG-traceable → re-intersect (n=%s / %s)",
+                               format(nrow(refaug_matched_c2), big.mark=","),
+                               format(nrow(refaug_matched_c4), big.mark=",")),
+             format.args = list(big.mark = ","),
+             col.names = c("Filter step", "c2 rows", "c4 rows"))
+```
+
+`refaug_matched_c2` = `r format(nrow(refaug_matched_c2), big.mark=",")` NMD
+pairs; `refaug_matched_c4` = `r format(nrow(refaug_matched_c4), big.mark=",")`
+Control pairs. Both arms share the same
+`r format(nrow(shared_keys), big.mark=",")` `(gene, reference)` pairs.
+
+**Mechanism classification** of the NMD arm (`mechanism_class_4()` on the
+ref-AUG-projected ORF category + ORF-length comparison):
+
+```{r sec3-class-table, echo=FALSE}
+knitr::kable(sec3_class,
+             caption = "Section C NMD-arm 3-group classification",
+             col.names = c("Group", "n"),
+             format.args = list(big.mark = ","))
+
+# ── Claim 4.7.4 — PTC+ rate at the reference AUG-traceable scope ──────────────────────
+n_ptc_pos_C <- sec3_class$n[sec3_class$group == "NMD+/PTC+"]
+n_secC      <- nrow(refaug_matched_c2)
+claim_emit("4.7.4", "NMD isoforms with an identified PTC (count)", n_ptc_pos_C,
+           published = 768, n = n_secC, population = SEC_C_POPULATION)
+claim_emit("4.7.4", "NMD isoforms in the reference AUG-traceable set (denominator)", n_secC,
+           published = 833, n = n_secC, population = SEC_C_POPULATION)
+claim_emit("4.7.4", "share of NMD isoforms with an identified PTC (%)",
+           100 * n_ptc_pos_C / n_secC, published = 92, n = n_secC,
+           population = SEC_C_POPULATION)
+```
+
+PTC+ rate at this scope: `r format(sec3_class$n[sec3_class$group == "NMD+/PTC+"], big.mark=",")` /
+`r format(nrow(refaug_matched_c2), big.mark=",")` =
+`r round(100 * sec3_class$n[sec3_class$group == "NMD+/PTC+"] / nrow(refaug_matched_c2), 1)`%.
+This is higher than Section A's PTC+ rate because the classifier definitions
+differ — see §5 for reconciliation.
+
+### Section C CDS / 3'UTR feature export (SF33 / SF36)
+
+Migrated here from `figures/supplemental/SF33_CdsAnd3UTR_GENCODE/data_export.R`
+on 2026-07-28 (S13: no result may originate in `figures/`). That script did not
+merely export — it **rebuilt the Section C cohort itself**, repeating the
+`sec3-scope` construction and the `mechanism_class → group3` classification, so
+one population was defined in two places and only one of them could be checked
+by re-rendering this report (S4). Claim 4.7.5's operative half — that the 3'UTR
+effect is limited to the ref-AUG-traceable set — was produced entirely outside
+the report layer.
+
+**Proven output-preserving before the move.** Both constructions were run against
+the same tree and compared: the same 833/833 cohort with an identical key set, an
+identical 1,666-row feature table, and identical descriptives and pairwise tables
+for all three measures. The `n = 1,166` in the old script's header was a stale
+legacy-tree vintage, not a different scope.
+
+
+```{r sec3d-utr3-tables, echo=FALSE}
+knitr::kable(secC_utr3_desc, caption = "Section C 3'UTR length, translation-based (ref-AUG-projected stop → tx end)")
+knitr::kable(secC_utr3np_desc, caption = "Section C 3'UTR length, bias-corrected (non-PTC-stop based)")
+```
+
+Claim 4.7.5 asserts the 3'UTR effect is *limited to* the ref-AUG-traceable set.
+Read against both scopes, that holds under the **bias-corrected** measure and
+fails under the **translation-based** one, so the sentence needs its measure named.
+
+```{r sec3d-utr3-4-7-5, echo=FALSE}
+knitr::kable(
+  rbind(secC_utr3_pw[, .(measure = "translation-based", group_x, group_y,
+                         median_x, median_y, wilcox_p)],
+        secC_utr3np_pw[, .(measure = "bias-corrected", group_x, group_y,
+                           median_x, median_y, wilcox_p)]),
+  caption = "Section C 3'UTR pairwise tests — the comparison claim 4.7.5 rests on")
+
+# ── Claim 4.7.5 — "limited to the Reference AUG-traceable set only" ────────────────────
+# A CONTRAST ACROSS TWO SCOPES, so BOTH have to be emitted or the word "limited" is unchecked:
+# the claim fails if the effect is also present in the GENCODE reference set. It is also
+# measure-dependent and the sentence names no measure, which is the defect on record -- so both
+# the translation-based and the bias-corrected test are emitted, for both scopes, four rows.
+# All supporting: the paper prints no number here.
+# BASE-R SUBSETTING, DELIBERATELY: Section A's pairwise table is a data.frame (from
+# pairwise_stats) and Section C's is a data.table (from fread), so data.table's
+# unquoted-column syntax works on one and raises "object 'group_x' not found" on the other.
+# Measured -- it halted the knit at this chunk after 56 emissions had already been written.
+utr3_p <- function(pw) {
+  i <- which(pw$group_x == "NMD+/PTC+" & pw$group_y == "Control")
+  if (!length(i)) i <- which(pw$group_x == "Control" & pw$group_y == "NMD+/PTC+")
+  if (!length(i)) NA_real_ else as.numeric(pw$wilcox_p[i[1]])
+}
+MEASURE_DEF <- c(
+  "translation-based" = paste("3'UTR measured from the isoform's own stop codon to the",
+                              "transcript end, so a PTC inflates it by construction"),
+  "bias-corrected"    = paste("3'UTR measured from the first NON-PTC stop codon, walking past",
+                              "a PTC, which removes that inflation"))
+for (spec in list(
+      list(pw = secA_utr3_pw,   scope = "GENCODE reference set",       m = "translation-based",
+           pop = SEC_A_POPULATION),
+      list(pw = secA_utr3np_pw, scope = "GENCODE reference set",       m = "bias-corrected",
+           pop = SEC_A_POPULATION),
+      list(pw = secC_utr3_pw,   scope = "reference AUG-traceable set", m = "translation-based",
+           pop = SEC_C_POPULATION),
+      list(pw = secC_utr3np_pw, scope = "reference AUG-traceable set", m = "bias-corrected",
+           pop = SEC_C_POPULATION))) {
+  claim_emit("4.7.5",
+             sprintf("Wilcoxon p, 3'UTR length PTC+ vs Control, %s measure, %s",
+                     spec$m, spec$scope),
+             utr3_p(spec$pw),
+             population = paste0(spec$pop, ". ", MEASURE_DEF[[spec$m]]))
+}
+```
+
+## §3a — 5'UTR length + longest 5'UTR ORF at Section C
+
+At the n=819 scope, most NMD comparators are novel (TD2-anchored CDS not
+reliable for 5'UTR measurement) — so we use `utr5_features_refaug`, which is
+the 5'UTR delimited by the ref-AUG-projected start. Three groups (from §3
+classification): NMD+/PTC+, NMD+/PTC− (ORF match + ORF diff merged), Control.
+
+```{r sec3a-secC-groups, include=FALSE}
+sec_C_groups <- list(
+  "NMD+/PTC+" = refaug_matched_c2[group3 == "NMD+/PTC+", comparator_isoform_id],
+  "NMD+/PTC-" = refaug_matched_c2[group3 == "NMD+/PTC-", comparator_isoform_id],
+  "Control"   = refaug_matched_c4$comparator_isoform_id
+)
+
+u5_refaug_dt <- as.data.table(utr5_refaug$isoform_features)
+u5_len_ra <- setNames(as.numeric(u5_refaug_dt$utr5_length),    u5_refaug_dt$isoform_id)
+u5_orf_ra <- setNames(as.numeric(u5_refaug_dt$longest_orf_nt), u5_refaug_dt$isoform_id)
+
+secC_utr5_desc <- group_descriptives(sec_C_groups, u5_len_ra,
+                                      c("NMD+/PTC+", "NMD+/PTC-", "Control"))
+secC_utr5_pw   <- pairwise_stats(sec_C_groups, u5_len_ra)
+secC_orf_desc  <- group_descriptives(sec_C_groups, u5_orf_ra,
+                                      c("NMD+/PTC+", "NMD+/PTC-", "Control"))
+secC_orf_pw    <- pairwise_stats(sec_C_groups, u5_orf_ra)
+secC_utr5_pw$wilcox_p_fmt <- vapply(secC_utr5_pw$wilcox_p, format_p, character(1))
+secC_orf_pw$wilcox_p_fmt  <- vapply(secC_orf_pw$wilcox_p,  format_p, character(1))
+```
+
+### Panel C — 5'UTR length (ref-AUG-anchored)
+
+```{r sec3a-panelC-tables, echo=FALSE}
+knitr::kable(secC_utr5_desc, caption = "5'UTR length (nt) — Section C descriptives",
+             col.names = c("Group","n","Median","Q25","Q75"))
+knitr::kable(secC_utr5_pw[, c("group_x","group_y","n_x","n_y","median_x","median_y","hl_shift","hl_ci","cliffs_delta","wilcox_p_fmt")],
+             caption = "5'UTR length — pairwise stats",
+             col.names = c("X","Y","n_X","n_Y","Med X","Med Y","HL shift","HL 95% CI","Cliff's δ","Wilcoxon p"))
+```
+
+### Panel D — Longest 5'UTR ORF (ref-AUG-anchored)
+
+```{r sec3a-panelD-tables, echo=FALSE}
+knitr::kable(secC_orf_desc, caption = "Longest 5'UTR ORF (nt) — Section C descriptives",
+             col.names = c("Group","n","Median","Q25","Q75"))
+knitr::kable(secC_orf_pw[, c("group_x","group_y","n_x","n_y","median_x","median_y","hl_shift","hl_ci","cliffs_delta","wilcox_p_fmt")],
+             caption = "Longest 5'UTR ORF — pairwise stats",
+             col.names = c("X","Y","n_X","n_Y","Med X","Med Y","HL shift","HL 95% CI","Cliff's δ","Wilcoxon p"))
+```
+
+```{r sec3a-fig4CD, echo=FALSE, fig.cap=c("Figure 4 Panel C — 5'UTR length at n=819 scope", "Figure 4 Panel D — Longest 5'UTR ORF at n=819 scope"), out.width="90%"}
+inc_fig(c(
+  file.path(FIG_ROOT, "figures/multipanel/figure4_ptcneg_and_model/figure4_panelC_5utr_length_refaug.png"),
+  file.path(FIG_ROOT, "figures/multipanel/figure4_ptcneg_and_model/figure4_panelD_longest_5utr_orf_refaug.png")
+))
+```
+
+## §3b — PTC rate at Section C
+
+Already computed inline in the §3 scope construction:
+`r format(sec3_class$n[sec3_class$group == "NMD+/PTC+"], big.mark=",")` PTC+ /
+`r format(nrow(refaug_matched_c2), big.mark=",")` =
+**`r round(100 * sec3_class$n[sec3_class$group == "NMD+/PTC+"] / nrow(refaug_matched_c2), 1)`%** at this scope (vs 37.9% at the n=130
+all-3-ENST scope). The classifier definitions differ —
+see §5 for reconciliation.
+
+# §4 — TD2 bias evidence (TD2BiasEvidence supplement)
+
+Scope (broad): `refaug_matched_c2 ∩ TD2 CDS available ∩ ref-AUG ORF computable
+∩ ref AUG exonic` → n=819 broad.
+Scope (occult-PTC): broad `∩ effectively_ptc ∩ original_ptc == FALSE` → n=348.
+
+**Scope construction.** Broad (n=819) = `refaug_matched_c2` ∩ TD2 CDS
+available ∩ ref-AUG ORF computable ∩ ref AUG exonic. Occult-PTC (n=348) =
+broad ∩ `category == "effectively_ptc"` ∩ `original_ptc == FALSE` — pairs
+where ref-AUG tracing revealed a PTC that TD2 missed. This is the population
+in which TD2's PTC-avoidance bias is most pronounced.
+
+```{r sec4-scope, include=FALSE}
+c2_full_dt <- as.data.table(refaug_matched_c2)
+comp_cds   <- cds[match(c2_full_dt$comparator_isoform_id, isoform_id)]
+c2_full_dt[, strand_use      := comp_cds$strand]
+c2_full_dt[, td2_atg_genomic := ifelse(comp_cds$strand == "+",
+                                       comp_cds$cds_start, comp_cds$cds_stop)]
+c2_full_dt[, td2_orf_nt      := comp_cds$orf_length * 3L]
+c2_full_dt[, ref_atg_orf_nt  := comp_orf_length_from_ref_atg]
+
+broad <- c2_full_dt[!is.na(td2_orf_nt) & !is.na(ref_atg_orf_nt) &
+                     ref_atg_exonic_in_comp == TRUE]
+```
+
+`broad` = `r format(nrow(broad), big.mark=",")` pairs (matches the
+n=819 TD2BiasEvidence supplement scope).
+
+```{r sec4-compute, include=FALSE}
+# CACHING REMOVED 2026-07-30 (Pete's call, W134). This chunk was cache=TRUE with
+# cache.extra=tools::md5sum(FASTA_PATH). Three reasons it had to go, in order of severity:
+#
+# 1. The cache directory was TRACKED IN GIT, so it shipped. .gitignore had no cache rule, and a
+#    git add on the directory swept it in at 6332ffd. D1 forecloses intermediate data in the
+#    citable repo, and a knitr cache is intermediate data by any reading.
+# 2. cache.extra covered ONLY the FASTA. This chunk also reads the isopair intermediates, so the
+#    key could not notice them changing -- which is exactly the case a deposit-native rebuild
+#    creates. Anyone who did hit the cache would see section 4 "reproduce" regardless of what
+#    their own intermediates contained.
+# 3. tools::md5sum() returns a PATH-NAMED vector, so the key silently included the deposit's
+#    ABSOLUTE PATH. That makes the cache non-portable on principle: it can only ever hit on the
+#    machine that wrote it, so it could never do its job in a repo meant for readers.
+#
+# The saving was never measured. The whole report renders in 42 s uncached (stage 3d, C74), so
+# there was nothing to protect.
+genomic_to_tx <- function(gp, es, ee, s) {
+  if (s == "-") { es <- rev(es); ee <- rev(ee) }
+  cum <- 0L
+  for (j in seq_along(es)) {
+    if (s == "+" && gp >= es[j] && gp <= ee[j]) return(cum + (gp - es[j]) + 1L)
+    if (s == "-" && gp >= es[j] && gp <= ee[j]) return(cum + (ee[j] - gp) + 1L)
+    cum <- cum + (ee[j] - es[j] + 1L)
+  }
+  NA_integer_
+}
+
+bs <- structures[match(broad$comparator_isoform_id, isoform_id)]
+ref_tx <- integer(nrow(broad)); td2_tx <- integer(nrow(broad))
+for (i in seq_len(nrow(broad))) {
+  es <- bs$exon_starts[[i]]; ee <- bs$exon_ends[[i]]
+  s  <- broad$strand_use[i]
+  if (length(es) == 0L || is.na(broad$ref_atg_genomic[i]) ||
+      is.na(broad$td2_atg_genomic[i])) {
+    ref_tx[i] <- NA_integer_; td2_tx[i] <- NA_integer_; next
+  }
+  ref_tx[i] <- genomic_to_tx(broad$ref_atg_genomic[i], es, ee, s)
+  td2_tx[i] <- genomic_to_tx(broad$td2_atg_genomic[i], es, ee, s)
+}
+broad[, ref_atg_tx_pos := ref_tx]
+broad[, td2_atg_tx_pos := td2_tx]
+broad[, distance_nt   := td2_atg_tx_pos - ref_atg_tx_pos]
+broad_clean <- broad[!is.na(ref_atg_tx_pos) & !is.na(td2_atg_tx_pos)]
+
+# Kozak PWM scoring — load sequences for broad_clean comparators from the
+# nmd_lungcells corrected FASTA via awk (avoid full Biostrings dependency).
+load_sequences <- function(isoform_ids, fasta_path) {
+  ids <- unique(isoform_ids)
+  id_file <- tempfile(fileext = ".txt")
+  writeLines(ids, id_file); on.exit(unlink(id_file), add = TRUE)
+  awk_cmd <- sprintf(
+    "awk 'BEGIN{while((getline id < \"%s\") > 0) want[id]=1} /^>/{if(seq && found) print hdr \"\\t\" seq; hdr=substr($1,2); found=(hdr in want); seq=\"\"; next} found{seq=seq$0} END{if(seq && found) print hdr \"\\t\" seq}' '%s'",
+    id_file, fasta_path)
+  raw <- system(awk_cmd, intern = TRUE)
+  split_raw <- strsplit(raw, "\t", fixed = TRUE)
+  setNames(toupper(vapply(split_raw, `[`, character(1), 2)),
+                   vapply(split_raw, `[`, character(1), 1))
+}
+seqs <- load_sequences(broad_clean$comparator_isoform_id, FASTA_PATH)
+pwm_seqs <- character(nrow(broad_clean))
+for (k in seq_len(nrow(broad_clean))) {
+  cid <- broad_clean$comparator_isoform_id[k]
+  if (cid %in% names(seqs)) pwm_seqs[k] <- seqs[cid]
+}
+v_ref <- !is.na(broad_clean$ref_atg_tx_pos) & pwm_seqs != ""
+v_td2 <- !is.na(broad_clean$td2_atg_tx_pos) & pwm_seqs != ""
+ref_pwm <- rep(NA_real_, nrow(broad_clean)); td2_pwm <- rep(NA_real_, nrow(broad_clean))
+if (sum(v_ref) > 0) {
+  r <- Isopair::scoreKozakPWM(pwm_seqs[v_ref], broad_clean$ref_atg_tx_pos[v_ref])
+  ref_pwm[v_ref] <- r$score
+}
+if (sum(v_td2) > 0) {
+  r <- Isopair::scoreKozakPWM(pwm_seqs[v_td2], broad_clean$td2_atg_tx_pos[v_td2])
+  td2_pwm[v_td2] <- r$score
+}
+broad_clean[, ref_kozak := ref_pwm]
+broad_clean[, td2_kozak := td2_pwm]
+
+# Broad-scope summary stats — ratio convention TD2/ref-AUG (matches the
+# TD2BiasEvidence supplement). For PTC+ pairs TD2 picks a downstream ATG
+# that extends past the PTC, so TD2 ORF > ref-AUG ORF on average.
+broad_orf_ratio <- median(broad_clean$td2_orf_nt) / median(broad_clean$ref_atg_orf_nt)
+broad_koz_valid  <- !is.na(broad_clean$ref_kozak) & !is.na(broad_clean$td2_kozak)
+broad_n_kozak    <- sum(broad_koz_valid)
+broad_n_ref_gt   <- sum(broad_clean$ref_kozak[broad_koz_valid] >
+                         broad_clean$td2_kozak[broad_koz_valid])
+broad_n_ref_eq   <- sum(broad_clean$ref_kozak[broad_koz_valid] ==
+                         broad_clean$td2_kozak[broad_koz_valid])
+broad_n_nontied  <- broad_n_kozak - broad_n_ref_eq
+broad_koz_w      <- wilcox.test(broad_clean$ref_kozak[broad_koz_valid],
+                                 broad_clean$td2_kozak[broad_koz_valid],
+                                 paired = TRUE)
+broad_pos_eq    <- sum(broad_clean$distance_nt == 0L)
+broad_pos_down  <- sum(broad_clean$distance_nt > 0L)
+broad_pos_up    <- sum(broad_clean$distance_nt < 0L)
+broad_pos_pct_down <- 100 * broad_pos_down / nrow(broad_clean)
+
+# Occult-PTC subset
+occ <- broad_clean[category == "effectively_ptc" & original_ptc == FALSE]
+occ_orf_ratio <- median(occ$td2_orf_nt) / median(occ$ref_atg_orf_nt)
+occ_koz_valid <- !is.na(occ$ref_kozak) & !is.na(occ$td2_kozak)
+occ_n_kozak   <- sum(occ_koz_valid)
+occ_n_ref_gt  <- sum(occ$ref_kozak[occ_koz_valid] > occ$td2_kozak[occ_koz_valid])
+occ_n_ref_eq  <- sum(occ$ref_kozak[occ_koz_valid] == occ$td2_kozak[occ_koz_valid])
+occ_n_nontied <- occ_n_kozak - occ_n_ref_eq
+occ_koz_w     <- wilcox.test(occ$ref_kozak[occ_koz_valid],
+                              occ$td2_kozak[occ_koz_valid], paired = TRUE)
+occ_pos_down  <- sum(occ$distance_nt > 0L)
+occ_pos_pct_down <- 100 * occ_pos_down / nrow(occ)
+```
+
+## §4a — TD2 vs ref-AUG ORF length
+
+| Scope | n | TD2 median ORF (nt) | ref-AUG median ORF (nt) | TD2/ref ratio |
+|---|---|---|---|---|
+| Broad | `r format(nrow(broad_clean), big.mark=",")` | `r format(median(broad_clean$td2_orf_nt), big.mark=",")` | `r format(median(broad_clean$ref_atg_orf_nt), big.mark=",")` | **`r sprintf("%.2f×", broad_orf_ratio)`** |
+| Occult-PTC | `r format(nrow(occ), big.mark=",")` | `r format(median(occ$td2_orf_nt), big.mark=",")` | `r format(median(occ$ref_atg_orf_nt), big.mark=",")` | **`r sprintf("%.2f×", occ_orf_ratio)`** |
+
+## §4b — Paired Kozak PWM at ref AUG vs TD2 ATG
+
+The "ref > TD2 (% of all)" column counts pairs where the ref-AUG Kozak score
+exceeds TD2's — pooled over all pairs including ties (broad scope has many
+pairs where TD2 == ref AUG, distance 0). The "% of non-tied" column drops
+ties so the directional preference is unobscured. The paired-Wilcoxon p-value
+is computed on the raw score vector, ignoring ties as `wilcox.test` does.
+
+| Scope | n | ref > TD2 | ties | ref > TD2 (% of all) | ref > TD2 (% of non-tied) | Paired-Wilcoxon p |
+|---|---|---|---|---|---|---|
+| Broad | `r format(broad_n_kozak, big.mark=",")` | `r format(broad_n_ref_gt, big.mark=",")` | `r format(broad_n_ref_eq, big.mark=",")` | `r sprintf("%.1f%%", 100 * broad_n_ref_gt / broad_n_kozak)` | `r sprintf("%.1f%%", 100 * broad_n_ref_gt / broad_n_nontied)` | `r format_p(broad_koz_w$p.value)` |
+| Occult-PTC | `r format(occ_n_kozak, big.mark=",")` | `r format(occ_n_ref_gt, big.mark=",")` | `r format(occ_n_ref_eq, big.mark=",")` | `r sprintf("%.1f%%", 100 * occ_n_ref_gt / occ_n_kozak)` | `r sprintf("%.1f%%", 100 * occ_n_ref_gt / occ_n_nontied)` | `r format_p(occ_koz_w$p.value)` |
+
+## §4c — TD2 ATG position relative to ref AUG
+
+| Scope | n | TD2 == ref | TD2 downstream | TD2 upstream | % downstream |
+|---|---|---|---|---|---|
+| Broad | `r format(nrow(broad_clean), big.mark=",")` | `r format(broad_pos_eq, big.mark=",")` | `r format(broad_pos_down, big.mark=",")` | `r format(broad_pos_up, big.mark=",")` | **`r sprintf("%.1f%%", broad_pos_pct_down)`** |
+| Occult-PTC | `r format(nrow(occ), big.mark=",")` | `r format(sum(occ$distance_nt == 0L), big.mark=",")` | `r format(occ_pos_down, big.mark=",")` | `r format(sum(occ$distance_nt < 0L), big.mark=",")` | **`r sprintf("%.1f%%", occ_pos_pct_down)`** |
+
+In the occult-PTC scope, **TD2 selects an ATG downstream of the ref-AUG in
+`r sprintf("%.1f%%", occ_pos_pct_down)` of pairs**, with a Kozak score lower
+than the ref-AUG in `r sprintf("%.1f%%", 100 * occ_n_ref_gt / occ_n_kozak)`
+of pairs (paired-Wilcoxon `r format_p(occ_koz_w$p.value)`). The TD2 ORF is
+`r sprintf("%.2f×", occ_orf_ratio)` LONGER than the ref-AUG-projected ORF
+(ratio of medians) — TD2 picks a downstream ATG that extends past the PTC into an
+in-frame coding region, producing a longer ORF that lacks the EJC-downstream
+stop that defines a PTC. Together these three signals describe TD2's
+PTC-avoidance bias: TD2 systematically routes around occult PTCs by picking a
+downstream ATG, even at the cost of a lower Kozak score.
+
+```{r sec4-supp, echo=FALSE, fig.cap="TD2BiasEvidence supplement — 2×3 layout: broad scope (row 1, n=819) + occult-PTC scope (row 2, n=348)", out.width="100%"}
+inc_fig(
+  c(file.path(FIG_ROOT, "figures/supplemental/SF34_TD2Bias_broad/figure_sf34.png"),
+    file.path(FIG_ROOT, "figures/supplemental/SF35_TD2Bias_occult/figure_sf35.png"))
+)
+```
+
+# §5 — Cumulative accounting [verification chokepoint]
+
+Recompute from §2 / §3 result objects so the totals in this report can be
+audited end-to-end without trusting upstream caches.
+
+```{r sec5-accounting, include=FALSE}
+secA_ptc_pos  <- length(ptc_pos_ids)
+secA_ptc_neg  <- length(ptc_neg_ids)
+secA_total    <- nrow(gencode_all3_c2)
+stopifnot(
+  "§2a NMD denominator drift"   = n_avail_nmd  == secA_total,
+  "§2a Control denominator drift" = n_avail_ctrl == nrow(gencode_all3_c4),
+  "§2a PTC+ + PTC- != Section A total" = secA_ptc_pos + secA_ptc_neg == secA_total,
+  "§2b mechanism table sum != unique direct attributions" =
+    sum(mech_tab$n) == n_unique_direct
+)
+
+get_n <- function(df, g) {
+  v <- df$n[df$group == g]
+  if (length(v) == 0L) 0L else v
+}
+secC_ptc_pos  <- get_n(sec3_class, "NMD+/PTC+")
+secC_ptc_neg  <- get_n(sec3_class, "NMD+/PTC-")
+secC_ref_abs  <- get_n(sec3_class, "Ref AUG absent")
+secC_total    <- nrow(refaug_matched_c2)
+stopifnot(
+  "§3 class sum != Section C total" =
+    secC_ptc_pos + secC_ptc_neg + secC_ref_abs == secC_total,
+  "§3a Control denominator != Section C total" =
+    length(sec_C_groups$Control) == secC_total
+)
+
+acct <- data.frame(
+  Scope = c("Section A (n=130)", "Section C (n=819)"),
+  PTC_pos = c(secA_ptc_pos, secC_ptc_pos),
+  PTC_neg = c(secA_ptc_neg, secC_ptc_neg),
+  Ref_AUG_absent = c(NA_integer_, secC_ref_abs),
+  Total = c(secA_total, secC_total),
+  PTC_pos_rate_pct = c(round(100 * secA_ptc_pos / secA_total, 1),
+                       round(100 * secC_ptc_pos / secC_total, 1))
+)
+```
+
+```{r sec5-acct-table, echo=FALSE}
+knitr::kable(acct,
+             caption = "Cumulative accounting at both canonical scopes",
+             col.names = c("Scope", "PTC+", "PTC−", "Ref AUG absent",
+                           "Total", "PTC+ rate (%)"))
+```
+
+- **Section A (n=`r secA_total`):** `r secA_ptc_pos` PTC+ and `r secA_ptc_neg` PTC− sum to `r secA_total`. PTC+ rate **`r round(100 * secA_ptc_pos / secA_total, 1)`%**.
+- **Section C (n=`r format(secC_total, big.mark=",")`):** `r format(secC_ptc_pos, big.mark=",")` PTC+, `r secC_ptc_neg` PTC−, and `r secC_ref_abs` Ref-AUG-absent sum to `r format(secC_total, big.mark=",")`. PTC+ rate **`r round(100 * secC_ptc_pos / secC_total, 1)`%**.
+
+**Why the two scopes give different PTC+ rates** is a methodological — not
+biological — divergence:
+
+| Difference | Section A | Section C |
+|---|---|---|
+| Cohort filter | all-3-ENST + coding-CDS (most stringent) | ENST-reference only (broader) |
+| PTC classifier | own-GENCODE-stop + 50-nt rule | ref-AUG-projected `category == "effectively_ptc"` |
+| Comparator CDS source | curated GENCODE | TD2 (heavily debiased via ref-AUG projection) |
+| Selection-on-PTC | none — every coding-CDS comparator measured | TR-category filter requires ref-AUG-traceable ORF — pairs where ref-AUG points at "no_downstream_ejc" or "truncated_no_ejc" classify as PTC− regardless of comparator's own stop |
+
+The Section C 90% PTC+ rate is enriched by the TR-category filter, which
+removes pairs where ref-AUG tracing finds no PTC and no stop near the EJC.
+The Section A 38% PTC+ rate has no such pre-filter: it's the raw PTC rate
+across all GENCODE-only NMD pairs. The two rates are not directly
+comparable. The point of measuring both is to show that the §2-§4 5'UTR /
+ORF / Kozak signals replicate at both scopes.
+
+# §6 — What is intentionally NOT in this Rmd
+
+These analyses remain in `05_final_report_mashr.Rmd` (legacy-bannered) or
+`06_orf_analysis_mashr.Rmd` (legacy-bannered) — they are retained for
+reproducibility of the prior submission and for sensitivity analyses:
+
+- Reclassification two-pass (TD2 → ref-AUG handoff at the old scope) — legacy
+  `05_final_report_mashr.Rmd`.
+- Per-cell-type PTC stratification at the old scope — legacy
+  `05_final_report_mashr.Rmd`.
+- "85% combined" framework — legacy `05_final_report_mashr.Rmd`.
+- n=1,904 / n=22,335 GENCODE-only 3'UTR outside-set — legacy
+  `05_final_report_mashr.Rmd`.
+- ORF / deep-learning model analyses — `06_orf_analysis_mashr.Rmd` (in this
+  repo, legacy). The canonical home of the manuscript deep-learning model is
+  the **linked repo `peter4244/NMD_orf_model_v5_4ct`**: `03_train.py`,
+  `config.yaml`, `model.py`, `METHODS.md`, plus DeepSHAP / KernelSHAP scripts.
+  The "ORF identification is the bottleneck" headline result lives there.
+
+Cross-cell-type consistency checks are out of scope for this Rmd; per-CT
+mashr CSVs in `shortread_dge/mashr/` and `isocall_dge/mashr/` are the source
+of truth for CT-stratified numbers.

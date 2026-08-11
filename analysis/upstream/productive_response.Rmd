@@ -1,0 +1,2141 @@
+---
+title: "Productive output response to NMD inhibition"
+author: "Yul Leshem"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document: { toc: true, toc_float: true, df_print: paged, code_folding: hide, number_sections: true }
+---
+
+Code location: `/udd/reyle/nmd_lungcells_2026/code/final/productive_response.Rmd`
+
+```{r setup, include=FALSE}
+.nmd_root <- local({ d <- getwd(); while (!file.exists(file.path(d, "config", "paths.yml"))) {
+  p <- dirname(d); if (identical(p, d)) stop("repo root not found"); d <- p }; d })
+source(file.path(.nmd_root, "R", "load_config.R")); .P <- nmd_paths(.nmd_root)
+source(file.path(.nmd_root, "R", "claim_emit.R"))  # Phase 2 claim-value emission
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE, fig.width=11, fig.height=5, dpi=110)
+options(bitmapType="cairo")  # (dropped a Channing-only .libPaths prepend)
+```
+
+```{r libs}
+suppressPackageStartupMessages({
+  library(data.table); library(dplyr); library(tidyr); library(tibble)
+  library(ggplot2); library(scales); library(knitr); library(limma); library(edgeR)
+})
+select <- dplyr::select; filter <- dplyr::filter; rename <- dplyr::rename; count <- dplyr::count
+```
+
+# Overview and conventions
+
+This document builds the **custom NMD-anchored normalization** for the productive-output analysis,
+then walks the per-gene quantities through their distributions, modeling (limma/mashr), a
+reproducibility battery, the up/down model, pathways, and the two-program model, across the four
+primary lung cell types (AT2, LAE, FB, MV). The DGEList stores the original ct codes `AT` (= AT2)
+and `DD` (= LAE); we relabel to display names right after loading and use AT2 / LAE throughout.
+
+**Variable glossary (no cryptic abbreviations).** Every per-gene quantity below is a mean across
+that cell type's donors:
+
+| name | meaning |
+|---|---|
+| `prodCPM_DMSO`     | productive CPM, DMSO |
+| `unprodCPM_DMSO`   | unproductive CPM, DMSO |
+| `prodCPM_SMG_raw`  | productive CPM, SMG1i (raw, whole-library) |
+| `unprodCPM_SMG`    | unproductive CPM, SMG1i |
+| `prodCPM_SMG_adj`  | productive CPM, SMG1i (**custom-adjusted**: unproductive surge removed) |
+| `totalCPM_DMSO`    | `prodCPM_DMSO + unprodCPM_DMSO` (gene total, DMSO) |
+| `totalCPM_SMG`     | `prodCPM_SMG_raw + unprodCPM_SMG` (gene total, SMG1i) |
+| `prodfrac_DMSO`    | `prodCPM_DMSO / totalCPM_DMSO` (productive share, DMSO) |
+| `prodfrac_SMG`     | `prodCPM_SMG_raw / totalCPM_SMG` (productive share, SMG1i) |
+| `custom`           | adjusted productive log2FC = `log2((prodCPM_SMG_adj+1)/(prodCPM_DMSO+1))` — **surge removed** |
+| `Kitagawa`         | raw productive log2FC = `log2((prodCPM_SMG_raw+1)/(prodCPM_DMSO+1))` — surge included |
+| `prod_shift_adj`   | **productive-only output shift** = `(prodCPM_SMG_adj − prodCPM_DMSO)/totalCPM_DMSO` — fixed DMSO denominator, surge removed |
+| `prodfrac_change`  | `prodfrac_SMG − prodfrac_DMSO` — productive *share* change (**includes** the unproductive surge) |
+| `dprod_adj`        | `prodCPM_SMG_adj − prodCPM_DMSO` (adjusted productive CPM change) |
+| `dprod_raw`        | `prodCPM_SMG_raw − prodCPM_DMSO` (raw productive CPM change) |
+| `unprod_gain`      | `unprodCPM_SMG − unprodCPM_DMSO` (the unproductive surge) |
+| `n_iso`            | isoforms per gene |
+
+**Other conventions:**
+
+- "NMD gene" = a gene with **≥1 mashr-confident unproductive isoform** (`lfsr<0.05 & posterior mean>0`).
+- "**change in productive**" always means the **adjusted** measure (`custom` in log space, or
+  `prod_shift_adj` / `dprod_adj` in CPM space) — i.e. the unproductive surge is removed.
+- Main figures show **NMD vs non-NMD**. The **uncertain ("unsure")** group is set aside to the supplement.
+- FB is treated as **provisional** (smaller effect sizes; fails part of the reproducibility battery) and
+  is excluded from the mechanism / Kitagawa summaries, which use AT2 / LAE / MV.
+- Every data-shaping step prints a `cat()` summary so the numbers are auditable inline.
+
+```{r params}
+OUT_DIR <- file.path(.P$OUT, "productive_response/basics_ordered")
+dir.create(OUT_DIR, recursive=TRUE, showWarnings=FALSE)
+DATE_STAMP   <- format(Sys.Date(), "%Y.%m.%d")
+CELL_TYPES   <- c("AT2","LAE","FB","MV")
+LFSR_NMD_THR    <- 0.05
+LFSR_UNSURE_THR <- 0.20
+FLOOR_BOTH <- 1; FLOOR_DMSO <- 2
+pass_floor <- function(td, ts) (td>=FLOOR_BOTH & ts>=FLOOR_BOTH) | (td>=FLOOR_DMSO)
+DROP_THR <- 0.3
+ct_colors  <- c(AT2="#e74c3c", LAE="#3498db", FB="#16a085", MV="#9b59b6")
+cat_colors <- c("NMD"="#c0392b","non-NMD"="#7f8c8d","unsure"="#e67e22")
+MAIN_CATS  <- c("NMD","non-NMD")
+
+# INPUTS. Every file below is BUILT BY THIS PIPELINE, so it is read from .P$OUT -- where the
+# producer writes it -- and not from the legacy tree where a pre-built copy also sits:
+#   dge_isoform_longread_filtered / mashr_isoform_*   Isoform_Level_Quantification.Rmd
+#   mashr_gene/*                                      NMD_shortread_dge_fullmodel_2026.5.5.Rmd
+# .P$SQANTI is NOT legacy despite the name -- it resolves inside the deposit.
+#
+# NO FALLBACK TO .P$FIGDATA / .P$MASHR_*, deliberately. A read that quietly uses a retained
+# copy when the producer has not run is the exact defect this project is documenting: the
+# published pair counts came from a structures.rds that was silently stale, dropping 3.5% of
+# the universe with nothing to show for it. A missing input must fail loudly, so run_order is
+# enforced by the filesystem rather than by remembering.
+MASH_ISO_DIR  <- file.path(.P$OUT, "mashr_isoform")
+MASH_GENE_DIR <- file.path(.P$OUT, "mashr_gene")
+
+DGE_ISO_PATH  <- file.path(.P$OUT, "dge_isoform_longread_filtered_2026.3.3.rds")
+PM_ISO_PATH   <- file.path(MASH_ISO_DIR, "mashr_isoform_posterior_means_2026.3.10.csv")
+LFSR_ISO_PATH <- file.path(MASH_ISO_DIR, "mashr_isoform_lfsr_2026.3.10.csv")
+SQANTI_PATH   <- file.path(.P$SQANTI, "nmd_lungcells_classification.txt")
+SR_DIR        <- MASH_GENE_DIR
+SR_PM_PATH    <- file.path(SR_DIR, "mashr_posterior_means_2026.3.10.csv")
+SR_LFSR_PATH  <- file.path(SR_DIR, "mashr_lfsr_2026.3.10.csv")
+```
+
+# Step 1 — Load, classify, annotate
+
+```{r load}
+dge_iso  <- readRDS(DGE_ISO_PATH)
+pm_iso   <- read.csv(PM_ISO_PATH,   check.names=FALSE, stringsAsFactors=FALSE)
+lfsr_iso <- read.csv(LFSR_ISO_PATH, check.names=FALSE, stringsAsFactors=FALSE)
+colnames(pm_iso)[1] <- "isoform_id"; colnames(lfsr_iso)[1] <- "isoform_id"
+
+iso_col  <- intersect(c("isoform_id","isoform","txid","transcript_id"), colnames(dge_iso$genes))[1]
+gene_col <- intersect(c("gene_id","associated_gene","ensembl_gene_id","gene_id_ens115_sqanti"), colnames(dge_iso$genes))[1]
+sym_col  <- intersect(c("hgnc_symbol","gene_name","external_gene_name","symbol"), colnames(dge_iso$genes))[1]
+iso2gene <- data.frame(isoform_id=dge_iso$genes[[iso_col]], gene_id=dge_iso$genes[[gene_col]],
+                       hgnc_symbol=dge_iso$genes[[sym_col]], stringsAsFactors=FALSE)
+n_iso_tab <- iso2gene %>% count(gene_id, name="n_iso")
+
+samples <- as.data.frame(dge_iso$samples)
+ct_col    <- intersect(c("ct","cell_type"), colnames(samples))[1]
+trt_col   <- intersect(c("treatment","trt"), colnames(samples))[1]
+donor_col <- intersect(c("id","sample_id","donor","subject_id","donor_id","subject","patient"), colnames(samples))[1]
+samples$cell_type <- as.character(samples[[ct_col]]); samples$treatment <- as.character(samples[[trt_col]])
+samples$sample_id <- as.character(samples[[donor_col]])
+# relabel internal codes to display names AFTER loading (rows aligned to counts by rowname)
+samples$cell_type[samples$cell_type=="AT"] <- "AT2"
+samples$cell_type[samples$cell_type=="DD"] <- "LAE"
+samples <- samples[samples$cell_type %in% CELL_TYPES, ]
+counts_iso <- dge_iso$counts[, rownames(samples)]
+
+cat(sprintf("Loaded: %d isoforms x %d samples; %d genes (%d multi-isoform).\n",
+            nrow(counts_iso), ncol(counts_iso), nrow(n_iso_tab), sum(n_iso_tab$n_iso>1)))
+cat("Samples per CT x treatment:\n"); print(table(samples$cell_type, samples$treatment))
+
+resolve_mash_col <- function(df, ct){ cn<-colnames(df); if (ct %in% cn) return(ct)
+  h<-cn[grepl(paste0("_in_",ct,"$"),cn)]; if(length(h)==1) return(h)
+  h<-cn[grepl(paste0("^",ct,"[._:-]"),cn)]; if(length(h)==1) return(h); stop("no mash col ",ct) }
+```
+
+```{r pc-annot}
+sq <- fread(SQANTI_PATH, select=c("isoform","associated_gene","coding"))
+gcs <- sq %>% inner_join(iso2gene %>% select(isoform_id, gene_id) %>% distinct(),
+                         by=c("isoform"="isoform_id")) %>%
+  group_by(gene_id) %>% summarise(is_pc = sum(coding=="coding")>0, .groups="drop")
+PC_GENES <- gcs$gene_id[gcs$is_pc]
+iso2gene <- iso2gene %>% left_join(gcs, by="gene_id")
+cat(sprintf("Protein-coding genes (>=1 coding isoform in SQANTI): %d\n", length(PC_GENES)))
+```
+
+```{r helpers}
+# ---- shared helpers (defined ONCE here; referenced throughout) ----
+suppressPackageStartupMessages({ library(org.Hs.eg.db); library(AnnotationDbi) })
+
+svf <- function(x) sub("\\..*$","", x)          # strip Ensembl version suffix
+
+# GO term(s) -> SYMBOL (entrez route)  and  GO term(s) -> ENSEMBL
+go_to_symbols <- function(go_ids){
+  e <- unique(unlist(AnnotationDbi::mget(go_ids, org.Hs.egGO2ALLEGS, ifnotfound=NA)))
+  unique(na.omit(AnnotationDbi::mapIds(org.Hs.eg.db, keys=e, column="SYMBOL",
+                                       keytype="ENTREZID", multiVals="first")))
+}
+go_genes <- function(go_ids){
+  e <- tryCatch(unique(unlist(AnnotationDbi::mget(go_ids, org.Hs.egGO2ALLEGS))),
+                error=function(...) character(0))
+  unique(na.omit(AnnotationDbi::mapIds(org.Hs.eg.db, keys=e, column="ENSEMBL",
+                                       keytype="ENTREZID", multiVals="first")))
+}
+
+# genes (gene_id) with >=1 isoform significantly UP (NMD up-call) / DOWN in a cell type
+nmd_iso_genes <- function(ct){
+  l <- lfsr_iso[[resolve_mash_col(lfsr_iso,ct)]]; p <- pm_iso[[resolve_mash_col(pm_iso,ct)]]
+  unique(iso2gene$gene_id[iso2gene$isoform_id %in%
+           lfsr_iso$isoform_id[!is.na(l)&!is.na(p)&l<LFSR_NMD_THR&p>0]])
+}
+down_iso_genes <- function(ct){
+  l <- lfsr_iso[[resolve_mash_col(lfsr_iso,ct)]]; p <- pm_iso[[resolve_mash_col(pm_iso,ct)]]
+  unique(iso2gene$gene_id[iso2gene$isoform_id %in%
+           lfsr_iso$isoform_id[!is.na(l)&!is.na(p)&l<LFSR_NMD_THR&p<0]])
+}
+
+# one-sided Fisher with safe fallback; and a set-enrichment wrapper given a background
+safe_fisher <- function(hit, inset){
+  tab <- table(factor(hit, c(FALSE,TRUE)), factor(inset, c(FALSE,TRUE)))
+  tryCatch(fisher.test(tab, alternative="greater"),
+           error=function(e) list(estimate=NA_real_, p.value=NA_real_))
+}
+test_set <- function(hit_syms, set_syms, bg_syms){
+  if (length(hit_syms) < 3) return(data.frame(n_in=sum(hit_syms %in% set_syms), OR=NA, p=NA))
+  ft <- safe_fisher(bg_syms %in% hit_syms, bg_syms %in% set_syms)
+  data.frame(n_in=sum(hit_syms %in% set_syms), OR=round(as.numeric(ft$estimate),2), p=signif(ft$p.value,3))
+}
+sym_of <- function(g) iso2gene$hgnc_symbol[match(g, iso2gene$gene_id)]
+
+# Kitagawa level/composition decomposition for a base-like df
+kitagawa_decomp <- function(df){
+  df %>% dplyr::mutate(
+    T_d = prodCPM_DMSO + unprodCPM_DMSO,
+    T_s = prodCPM_SMG_raw + unprodCPM_SMG,
+    f_d = prodCPM_DMSO / T_d,
+    f_s = prodCPM_SMG_raw / T_s,
+    dP  = prodCPM_SMG_raw - prodCPM_DMSO,
+    level       = ((f_s + f_d)/2) * (T_s - T_d),
+    composition = ((T_s + T_d)/2) * (f_s - f_d),
+    driver = ifelse(abs(composition) > abs(level), "composition-dominated", "level-dominated"))
+}
+
+# Kitagawa decomposition on significant NMD genes, built once (FB excluded: provisional CT).
+# References prod_dir_mashr and base, which are created in later steps (resolved at call time).
+kit_nmd_table <- function(exclude_fb = TRUE){
+  d <- prod_dir_mashr %>% dplyr::filter(dir %in% c("up","down"), gene_category=="NMD")
+  if (exclude_fb) d <- d %>% dplyr::filter(ct != "FB")
+  d %>% dplyr::left_join(base %>% dplyr::select(ct, gene_id, prodCPM_DMSO, prodCPM_SMG_raw,
+                          unprodCPM_DMSO, unprodCPM_SMG), by=c("ct","gene_id")) %>%
+    kitagawa_decomp()
+}
+
+# mechanism split for productive-direction genes (needs sr_logFC, prodfrac_DMSO/SMG joined)
+classify_mech <- function(df, dir=c("down","up")){
+  dir <- match.arg(dir)
+  if (dir=="down")
+    df %>% dplyr::mutate(prodfrac_change = prodfrac_SMG - prodfrac_DMSO,
+      mechanism = dplyr::case_when(
+        !is.na(sr_logFC) & sr_logFC < -0.2                            ~ "transcriptional",
+        prodfrac_change < -0.10 & (is.na(sr_logFC) | sr_logFC > -0.1) ~ "composition",
+        TRUE                                                          ~ "mixed"))
+  else
+    df %>% dplyr::mutate(prodfrac_change = prodfrac_SMG - prodfrac_DMSO,
+      mechanism = dplyr::case_when(
+        !is.na(sr_logFC) & sr_logFC > 0.2                            ~ "transcriptional",
+        prodfrac_change > 0.10 & (is.na(sr_logFC) | sr_logFC < 0.1)  ~ "composition",
+        TRUE                                                         ~ "mixed"))
+}
+
+# ---- theme gene-sets (built once) + reusable enrichment (used by S6 / S7) ----
+THEME_SETS <- list(
+  "Mitotic cell cycle" = go_to_symbols("GO:0000278"),
+  "DNA replication"    = go_to_symbols("GO:0006260"),
+  "DNA repair"         = go_to_symbols("GO:0006281"),
+  "RNA splicing"       = go_to_symbols("GO:0008380"),
+  "SR/hnRNP factors"   = c(paste0("SRSF",1:12),
+                           paste0("HNRNP",c("A1","A2B1","A3","C","D","F","H1","K","L","M","U")),
+                           "TRA2A","TRA2B","RBM39","PTBP1","PTBP2","U2AF1","U2AF2"),
+  "ISR/UPR"            = go_to_symbols(c("GO:0006986","GO:0140467")))
+theme_enrichment <- function(trans_g, comp_g, universe_g, sets = THEME_SETS){
+  bg <- unique(na.omit(sym_of(universe_g)))
+  dplyr::bind_rows(lapply(names(sets), function(s){
+    t <- test_set(unique(na.omit(sym_of(trans_g))), sets[[s]], bg)
+    c <- test_set(unique(na.omit(sym_of(comp_g))),  sets[[s]], bg)
+    data.frame(theme=s, trans_OR=t$OR, trans_p=t$p, trans_n=t$n_in,
+               comp_OR=c$OR, comp_p=c$p, comp_n=c$n_in) }))
+}
+```
+
+# Step 2 — Custom NMD-anchored normalization (equations)
+
+The whole-library CPM denominator is inflated by the unproductive surge under SMG1i, which makes
+every other isoform look artificially smaller. The custom normalization removes exactly that
+artifact by **pinning each unproductive isoform to the DMSO proportion of its gene's productive
+compartment**, then rescaling the library.
+
+**Raw CPM** for isoform $i$ in sample $s$:
+$$\text{CPM}_{i,s} = 10^6\cdot\frac{c_{i,s}}{\sum_j c_{j,s}}$$
+
+**Productive compartment of gene $g$ at DMSO** (sum over productive isoforms, mean across DMSO replicates) — this is `prodCPM_DMSO`:
+$$\texttt{prodCPM\_DMSO}_g = \sum_{i\,\in\,\mathrm{prod}(g)} \overline{\text{CPM}}^{DMSO}_i$$
+
+**DMSO share** of each unproductive isoform within its gene's productive compartment:
+$$\text{share}_i = \frac{\overline{\text{CPM}}^{DMSO}_i}{\texttt{prodCPM\_DMSO}_g}$$
+
+**Adjusted unproductive CPM** under SMG1i sample $s$ (anchorable isoforms re-pinned to the DMSO share
+of the *current* productive compartment; non-anchorable isoforms held at their DMSO mean):
+$$\widetilde{u}_{i,s} = \text{share}_i \cdot \Big(\textstyle\sum_{j\in\mathrm{prod}(g)}\text{CPM}^{SMG1i}_{j,s}\Big)$$
+
+**Library rescale** so each adjusted SMG1i library sums to $10^6$:
+$$\lambda_s = \frac{10^6}{\sum_i \widetilde{\text{CPM}}_{i,s}},\qquad
+\text{CPM}^{adj}_{i,s} = \widetilde{\text{CPM}}_{i,s}\cdot \lambda_s$$
+
+**Per-gene productive quantities** (summed over a gene's productive isoforms, mean across donors):
+`prodCPM_DMSO`, `prodCPM_SMG_raw` (from raw SMG1i CPM), and `prodCPM_SMG_adj` (from the adjusted CPM above).
+
+```{r custom-build}
+build_adj <- function(ct) {
+  l <- lfsr_iso[[resolve_mash_col(lfsr_iso, ct)]]; p <- pm_iso[[resolve_mash_col(pm_iso, ct)]]
+  is_unprod <- !is.na(l)&!is.na(p)&l<LFSR_NMD_THR&p>0
+  is_unsure <- !is.na(l)&!is.na(p)&l>=LFSR_NMD_THR&l<LFSR_UNSURE_THR&p>0
+  is_down   <- !is.na(l)&!is.na(p)&l<LFSR_NMD_THR&p<0
+  cls <- setNames(ifelse(is_unprod,"unprod","prod"), lfsr_iso$isoform_id)
+  uns <- setNames(is_unsure, lfsr_iso$isoform_id)
+  dwn <- setNames(is_down,   lfsr_iso$isoform_id)
+  cs <- rownames(samples)[samples$cell_type==ct]; cnt <- counts_iso[, cs, drop=FALSE]
+  trt <- setNames(samples[cs,"treatment"], cs); donor <- setNames(samples[cs,"sample_id"], cs)
+  rawcpm <- sweep(cnt, 2, colSums(cnt), "/") * 1e6
+  ids <- rownames(rawcpm); gene <- iso2gene$gene_id[match(ids, iso2gene$isoform_id)]
+  class_v <- cls[ids]
+  unsure_v <- uns[ids]; unsure_v[is.na(unsure_v)] <- FALSE
+  down_v   <- dwn[ids]; down_v[is.na(down_v)] <- FALSE
+  anchor <- !is.na(gene) & !grepl("::", gene, fixed=TRUE) & !is.na(class_v)
+  dmso <- cs[trt[cs]=="DMSO"]; smg <- cs[trt[cs]=="Smg1i"]
+  dmso_mean <- rowMeans(rawcpm[, dmso, drop=FALSE])
+  prod_idx  <- anchor & class_v=="prod"
+  Pdmso     <- tapply(dmso_mean[prod_idx], gene[prod_idx], sum)
+  iu <- which(anchor & class_v=="unprod"); pg <- Pdmso[gene[iu]]
+  hp <- !is.na(pg) & pg > 0; share <- ifelse(hp, dmso_mean[iu]/pg, NA_real_)
+  ia <- iu[hp]; ina <- iu[!hp]
+  adj <- rawcpm; rescale <- setNames(numeric(length(smg)), smg)
+  for (s in smg) {
+    col <- rawcpm[, s]; Pgs <- tapply(col[prod_idx], gene[prod_idx], sum); nc <- col
+    nc[ia] <- Pgs[gene[ia]] * share[hp]; nc[ina] <- dmso_mean[ina]; nc[!is.finite(nc)] <- 0
+    f <- 1e6/sum(nc); rescale[s] <- f; adj[, s] <- nc * f
+  }
+  list(rawcpm=rawcpm, adj=adj, gene=gene, class_v=class_v, unsure_v=unsure_v, down_v=down_v,
+       anchor=anchor, trt=trt, donor=donor, rescale=rescale)
+}
+
+process_ct <- function(ct) {
+  o <- build_adj(ct); k <- o$anchor; fk <- paste(o$gene[k], o$class_v[k], sep="|||")
+  rawf <- rowsum(o$rawcpm[k,,drop=FALSE], fk); adjf <- rowsum(o$adj[k,,drop=FALSE], fk)
+  fm <- data.frame(feature=rownames(rawf)); fm$gene <- sub("\\|\\|\\|.*$","",fm$feature); fm$class <- sub("^.*\\|\\|\\|","",fm$feature)
+  sm <- data.frame(sample=colnames(rawf), donor=o$donor[colnames(rawf)], trt=o$trt[colnames(rawf)])
+  melt <- function(m,v){d<-as.data.frame(m); d$feature<-rownames(m); pivot_longer(d,-feature,names_to="sample",values_to=v)}
+  long <- melt(adjf,"adj") %>% left_join(melt(rawf,"raw"), by=c("feature","sample")) %>%
+    left_join(fm, by="feature") %>% left_join(sm, by="sample")
+  # per-donor gene-level columns (clear names)
+  dm <- long %>% filter(trt=="DMSO") %>% select(gene,class,donor,cpm=adj) %>%
+    pivot_wider(names_from=class, values_from=cpm, values_fill=0) %>%
+    rename(prodCPM_DMSO=prod, unprodCPM_DMSO=unprod)
+  sg <- long %>% filter(trt=="Smg1i") %>% select(gene,class,donor,adj,raw) %>%
+    pivot_wider(names_from=class, values_from=c(adj,raw), values_fill=0) %>%
+    rename(prodCPM_SMG_adj=adj_prod, unprodCPM_SMG_adj=adj_unprod,
+           prodCPM_SMG_raw=raw_prod, unprodCPM_SMG=raw_unprod)
+  nmd_g <- unique(o$gene[o$anchor & o$class_v=="unprod"])
+  unsure_g <- setdiff(unique(o$gene[o$anchor & (o$unsure_v | o$down_v)]), nmd_g)
+  full_join(dm, sg, by=c("gene","donor")) %>%
+    mutate(ct=ct, gene_category = case_when(gene %in% nmd_g ~ "NMD", gene %in% unsure_g ~ "unsure", TRUE ~ "non-NMD"))
+}
+
+gene_sample <- bind_rows(lapply(CELL_TYPES, process_ct)) %>%
+  left_join(iso2gene %>% select(gene_id, hgnc_symbol, is_pc) %>% distinct(), by=c("gene"="gene_id")) %>%
+  rename(gene_id = gene)
+cat(sprintf("Per-gene-per-donor rows assembled: %d\n", nrow(gene_sample)))
+```
+
+**Derived per-gene quantities** (means across donors). Totals and fractions:
+$$\texttt{totalCPM\_DMSO}=\texttt{prodCPM\_DMSO}+\texttt{unprodCPM\_DMSO},\quad
+\texttt{totalCPM\_SMG}=\texttt{prodCPM\_SMG\_raw}+\texttt{unprodCPM\_SMG}$$
+$$\texttt{prodfrac\_DMSO}=\frac{\texttt{prodCPM\_DMSO}}{\texttt{totalCPM\_DMSO}},\qquad
+\texttt{prodfrac\_SMG}=\frac{\texttt{prodCPM\_SMG\_raw}}{\texttt{totalCPM\_SMG}}$$
+
+Productive-**output** measures (unproductive surge removed via the adjustment):
+$$\underbrace{\texttt{custom}=\log_2\frac{\texttt{prodCPM\_SMG\_adj}+1}{\texttt{prodCPM\_DMSO}+1}}_{\text{adjusted productive log2FC}}\qquad
+\underbrace{\texttt{prod\_shift\_adj}=\frac{\texttt{prodCPM\_SMG\_adj}-\texttt{prodCPM\_DMSO}}{\texttt{totalCPM\_DMSO}}}_{\text{productive-only shift, fixed DMSO denominator}}$$
+
+Productive-**share** / raw comparators (unproductive surge included):
+$$\underbrace{\texttt{Kitagawa}=\log_2\frac{\texttt{prodCPM\_SMG\_raw}+1}{\texttt{prodCPM\_DMSO}+1}}_{\text{raw whole-library log2FC}}\qquad
+\underbrace{\texttt{prodfrac\_change}=\texttt{prodfrac\_SMG}-\texttt{prodfrac\_DMSO}}_{\text{productive share change (incl. surge)}}$$
+
+```{r base-build}
+base <- gene_sample %>%
+  filter(!is.na(prodCPM_DMSO), !is.na(prodCPM_SMG_raw)) %>%
+  mutate(across(c(prodCPM_DMSO,unprodCPM_DMSO,prodCPM_SMG_raw,unprodCPM_SMG,prodCPM_SMG_adj),
+                ~dplyr::coalesce(.x,0))) %>%
+  group_by(ct, gene_id, hgnc_symbol, is_pc, gene_category) %>%
+  summarise(prodCPM_DMSO    = mean(prodCPM_DMSO),
+            unprodCPM_DMSO  = mean(unprodCPM_DMSO),
+            prodCPM_SMG_raw = mean(prodCPM_SMG_raw),
+            unprodCPM_SMG   = mean(unprodCPM_SMG),
+            prodCPM_SMG_adj = mean(prodCPM_SMG_adj), .groups="drop") %>%
+  mutate(totalCPM_DMSO = prodCPM_DMSO + unprodCPM_DMSO,
+         totalCPM_SMG  = prodCPM_SMG_raw + unprodCPM_SMG) %>%
+  filter(pass_floor(totalCPM_DMSO, totalCPM_SMG)) %>%
+  mutate(
+    # productive OUTPUT (unproductive surge removed)
+    custom         = log2((prodCPM_SMG_adj + 1)/(prodCPM_DMSO + 1)),
+    prod_shift_adj = (prodCPM_SMG_adj - prodCPM_DMSO)/totalCPM_DMSO,
+    dprod_adj      = prodCPM_SMG_adj - prodCPM_DMSO,
+    # raw / share comparators (surge included)
+    Kitagawa        = log2((prodCPM_SMG_raw + 1)/(prodCPM_DMSO + 1)),
+    dprod_raw       = prodCPM_SMG_raw - prodCPM_DMSO,
+    prodfrac_DMSO   = prodCPM_DMSO   / totalCPM_DMSO,
+    prodfrac_SMG    = prodCPM_SMG_raw / totalCPM_SMG,
+    prodfrac_change = prodfrac_SMG - prodfrac_DMSO,   # NEGATIVE = productive SHARE lower in SMG1i
+    # unproductive surge
+    unprod_gain     = unprodCPM_SMG - unprodCPM_DMSO) %>%
+  left_join(n_iso_tab, by="gene_id")
+
+cat("Genes per CT by category (after expression floor):\n")
+print(base %>% count(ct, gene_category) %>% pivot_wider(names_from=gene_category, values_from=n, values_fill=0))
+cat(sprintf("\nMedian custom (adjusted productive log2FC, NMD) per CT: %s\n",
+    paste(sprintf("%s=%.3f", CELL_TYPES,
+      sapply(CELL_TYPES, function(c) median(base$custom[base$ct==c & base$gene_category=="NMD"]))), collapse="  ")))
+cat(sprintf("Median prod_shift_adj (productive-only shift, NMD) per CT: %s\n",
+    paste(sprintf("%s=%.4f", CELL_TYPES,
+      sapply(CELL_TYPES, function(c) median(base$prod_shift_adj[base$ct==c & base$gene_category=="NMD"]))), collapse="  ")))
+fwrite(base, file.path(OUT_DIR, paste0("base_custom_", DATE_STAMP, ".csv")))
+```
+
+```{r cat-defs}
+cat_defs <- tibble::tribble(
+  ~gene_category, ~isoform_level_filter, ~used_in,
+  "NMD",      "≥1 isoform with mashr lfsr<0.05 & pm>0 (confident unproductive / NMD up-call)", "main + supplement",
+  "non-NMD",  "no isoform with any significant or borderline change (clean control)",          "main + supplement",
+  "unsure",   "NOT NMD, but ≥1 isoform borderline-up (0.05≤lfsr<0.20 & pm>0) OR significantly DOWN (lfsr<0.05 & pm<0)", "SUPPLEMENT ONLY")
+kable(cat_defs, caption="Gene-category filters.")
+```
+
+# Step 3 — Distributions of every computed variable
+
+CPM-type variables are strictly non-negative and heavily right-skewed, so they are shown on
+`log10(x+1)`; change/difference variables on their natural (signed) scale. Each panel is faceted
+by cell type and colored by gene class (**NMD vs non-NMD** in main; **unsure** added in the supplement).
+
+```{r dist-helper}
+within_sd <- function(x, k=3){ m <- mean(x, na.rm=TRUE); s <- sd(x, na.rm=TRUE); is.finite(x) & abs(x - m) <= k*s }
+
+plot_dist <- function(df, var, title, xlab, cats=MAIN_CATS, logx=FALSE, xlim=NULL, vline=NULL, trim_sd=NULL){
+  d <- df %>% filter(gene_category %in% cats) %>% mutate(.v = .data[[var]]) %>% filter(is.finite(.v))
+  if (logx){ d$.v <- log10(d$.v + 1); xlab <- paste0("log10(", xlab, " + 1)") }
+  sub <- NULL
+  if (!is.null(trim_sd)){
+    n0 <- nrow(d)
+    d  <- d %>% group_by(ct) %>% filter(within_sd(.v, trim_sd)) %>% ungroup()
+    sub <- sprintf("display trimmed to ±%g SD of the per-cell-type mean (%d of %d points removed for the plot only)",
+                   trim_sd, n0 - nrow(d), n0)
+  }
+  g <- ggplot(d, aes(.v, fill=gene_category, colour=gene_category)) +
+    geom_density(alpha=0.30, linewidth=0.5) +
+    facet_wrap(~ct, nrow=1, scales="free_y") +
+    scale_fill_manual(values=cat_colors, name=NULL) + scale_colour_manual(values=cat_colors, name=NULL) +
+    labs(x=xlab, y="density", title=title, subtitle=sub) +
+    theme_bw(base_size=11) + theme(legend.position="top", strip.background=element_rect(fill="grey92"))
+  if (!is.null(vline)) g <- g + geom_vline(xintercept=vline, linetype=2, colour="grey40")
+  if (!is.null(xlim))  g <- g + coord_cartesian(xlim=xlim)
+  g
+}
+med_tab <- function(df, var, cats=MAIN_CATS){
+  df %>% filter(gene_category %in% cats) %>% group_by(ct, gene_category) %>%
+    summarise(n=n(), median=round(median(.data[[var]], na.rm=TRUE),3),
+              q25=round(quantile(.data[[var]],.25,na.rm=TRUE),3),
+              q75=round(quantile(.data[[var]],.75,na.rm=TRUE),3), .groups="drop") %>%
+    pivot_wider(names_from=gene_category, values_from=c(n, median, q25, q75))
+}
+```
+
+## 3.1 Productive-only output shift (adjusted; the unproductive response removed)
+
+`prod_shift_adj = (prodCPM_SMG_adj − prodCPM_DMSO) / totalCPM_DMSO`. Numerator is the **adjusted**
+productive CPM change (surge removed); denominator is **fixed at the DMSO gene total**. −0.10 means
+productive output fell by 10% of baseline total; ~0 means preserved.
+
+```{r dist-prodshift, fig.height=4}
+print(plot_dist(base, "prod_shift_adj",
+  "Productive-only output shift (negative = productive output lower in SMG1i)",
+  xlab="change in productive output (fraction of DMSO gene total)",
+  xlim=c(-0.5,0.5), vline=0))
+kable(med_tab(base, "prod_shift_adj"),
+  caption="Productive-only output shift (adjusted numerator, fixed DMSO denominator).")
+cat(sprintf("NMD genes with prod_shift_adj<0 (productive output lower in SMG1i) per CT: %s\n",
+  paste(sprintf("%s=%.1f%%", CELL_TYPES,
+    sapply(CELL_TYPES, function(c){x<-base$prod_shift_adj[base$ct==c&base$gene_category=="NMD"];100*mean(x<0)})), collapse="  ")))
+```
+
+## 3.1b Productive-share change — for contrast (this one INCLUDES the unproductive surge)
+
+```{r dist-prodfrac, fig.height=4}
+print(plot_dist(base, "prodfrac_change",
+  "Productive-SHARE change (negative = share lower in SMG1i; INCLUDES unproductive surge)",
+  xlab="change in productive fraction of the gene",
+  xlim=c(-0.75,0.5), vline=0))
+xo <- base$prodfrac_change[base$gene_category %in% MAIN_CATS]
+cat(sprintf("prodfrac_change display window [-0.75, 0.5]: %.2f%% of genes fall outside (%.2f%% below -0.75, %.2f%% above 0.5); data clipped for the view only.\n",
+            100*mean(xo < -0.75 | xo > 0.5, na.rm=TRUE),
+            100*mean(xo < -0.75, na.rm=TRUE), 100*mean(xo > 0.5, na.rm=TRUE)))
+kable(med_tab(base, "prodfrac_change"),
+  caption="Productive-share change (includes the unproductive surge via the growing denominator).")
+```
+
+## 3.2 CPM of DMSO productive (`prodCPM_DMSO`)
+
+```{r dist-prodDMSO, fig.height=4}
+print(plot_dist(base, "prodCPM_DMSO", "DMSO productive CPM", xlab="productive CPM (DMSO)", logx=TRUE))
+kable(med_tab(base, "prodCPM_DMSO"), caption="DMSO productive CPM by class.")
+```
+
+## 3.3 CPM of SMG1i productive — raw (`prodCPM_SMG_raw`)
+
+```{r dist-prodSMGraw, fig.height=4}
+print(plot_dist(base, "prodCPM_SMG_raw", "SMG1i productive CPM (raw)", xlab="productive CPM (SMG1i, raw)", logx=TRUE))
+kable(med_tab(base, "prodCPM_SMG_raw"), caption="Raw SMG1i productive CPM by class.")
+```
+
+## 3.4 CPM of SMG1i productive — adjusted (`prodCPM_SMG_adj`)
+
+```{r dist-prodSMGadj, fig.height=4}
+print(plot_dist(base, "prodCPM_SMG_adj", "SMG1i productive CPM (custom-adjusted)", xlab="productive CPM (SMG1i, adjusted)", logx=TRUE))
+kable(med_tab(base, "prodCPM_SMG_adj"), caption="Adjusted SMG1i productive CPM by class.")
+cat("Note: prodCPM_SMG_adj > prodCPM_SMG_raw on average because rescaling redistributes the CPM the unproductive surge had stolen.\n")
+```
+
+## 3.5 Change in productive (CPM, adjusted) `dprod_adj = prodCPM_SMG_adj − prodCPM_DMSO`
+
+```{r dist-dprod, fig.height=4}
+print(ggplot(base %>% filter(gene_category %in% MAIN_CATS),
+       aes(gene_category, dprod_adj, fill=gene_category)) +
+  geom_hline(yintercept=0, colour="grey40") +
+  geom_boxplot(outlier.size=0.3, outlier.alpha=0.2, width=0.6, colour="grey25") +
+  facet_wrap(~ct, nrow=1) + coord_cartesian(ylim=c(-25, 25)) +
+  scale_fill_manual(values=cat_colors, guide="none") +
+  labs(x=NULL, y="change in productive CPM (SMG1i − DMSO, adjusted)",
+       title="Change in productive (adjusted CPM), NMD vs non-NMD") +
+  theme_bw(base_size=11) + theme(strip.background=element_rect(fill="grey92")))
+kable(med_tab(base, "dprod_adj"), caption="Change in productive (adjusted CPM) by class.")
+```
+
+## 3.6 Other variables (unproductive, totals, log2FC, isoform count)
+
+```{r dist-others, fig.height=4}
+print(plot_dist(base, "unprodCPM_DMSO", "Unproductive CPM at DMSO", xlab="unproductive CPM (DMSO)", logx=TRUE))
+print(plot_dist(base, "unprodCPM_SMG",  "Unproductive CPM at SMG1i", xlab="unproductive CPM (SMG1i)", logx=TRUE))
+print(plot_dist(base, "unprod_gain",    "Unproductive gain (SMG1i − DMSO)", xlab="change in unproductive CPM", vline=0, xlim=c(0, 25)))
+print(plot_dist(base, "custom",         "Adjusted productive log2FC", xlab="productive log2 fold-change (adjusted)", xlim=c(-2,2), vline=0))
+print(plot_dist(base, "totalCPM_DMSO",  "Total gene CPM at DMSO", xlab="total gene CPM (DMSO)", logx=TRUE))
+print(plot_dist(base, "n_iso",          "Isoforms per gene", xlab="isoforms per gene", xlim=c(0,40)))
+kable(med_tab(base, "unprod_gain"), caption="Unproductive gain (unprodCPM_SMG − unprodCPM_DMSO) by class.")
+kable(med_tab(base, "custom"),      caption="Adjusted productive log2FC by class.")
+```
+
+# Step 4 — FIGURE R1: productive change, NMD vs non-NMD
+
+```{r R1, fig.height=4}
+t_med <- base %>% filter(gene_category %in% MAIN_CATS) %>%
+  group_by(ct, gene_category) %>%
+  summarise(n=n(), median_custom_log2FC=round(median(custom),3),
+            pct_down_0.3=round(100*mean(custom < -DROP_THR),1),
+            pct_up_0.3  =round(100*mean(custom >  DROP_THR),1), .groups="drop")
+kable(t_med %>% pivot_wider(names_from=gene_category,
+        values_from=c(n, median_custom_log2FC, pct_down_0.3, pct_up_0.3)),
+      caption="TABLE R1. Median adjusted productive log2FC (custom), NMD vs matched non-NMD.")
+
+# ── Claim 3.2.4, first half — the four per-cell-type medians ────────────────────────────
+# MEDIAN OF THE ADJUSTED log2 FOLD CHANGE among NMD-category genes, one value per cell type. The
+# published signs matter and are emitted as given: AT2 +0.14, LAE -0.04, FB +0.10, MV +0.05.
+MED_POP <- paste("genes in the NMD category with an adjusted productive log2 fold change, one",
+                 "median per cell type; the adjustment is the productive-output correction, so",
+                 "this is not a raw SMG1i/DMSO fold change. Matched non-NMD genes are tabulated",
+                 "alongside but are NOT part of this median")
+for (.ct in c("AT2","LAE","FB","MV")) {
+  .i <- which(t_med$ct == .ct & t_med$gene_category == "NMD")
+  if (length(.i) != 1L) next
+  claim_emit("3.2.4", sprintf("median adjusted productive log2FC, NMD genes, %s", .ct),
+             t_med$median_custom_log2FC[.i],
+             published = switch(.ct, AT2 = "0.14", LAE = "-0.04", FB = "0.10", MV = "0.05", NULL),
+             n = t_med$n[.i], population = MED_POP)
+}
+print(ggplot(base %>% filter(gene_category %in% MAIN_CATS),
+       aes(gene_category, custom, fill=gene_category)) +
+  geom_hline(yintercept=0, colour="grey40") +
+  geom_boxplot(outlier.size=0.3, outlier.alpha=0.2, width=0.6, colour="grey25") +
+  facet_wrap(~ct, nrow=1) + coord_cartesian(ylim=c(-1.2,1.2)) +
+  scale_fill_manual(values=cat_colors, guide="none") +
+  labs(x=NULL, y="productive log2FC (custom)", title="FIGURE R1. Productive output, NMD vs matched non-NMD") +
+  theme_bw(base_size=11) + theme(strip.background=element_rect(fill="grey92")))
+ggsave(file.path(OUT_DIR,"FIG_R1_productive_box.pdf"), width=10, height=4)
+```
+
+# Step 5 — Correlation: adjusted SMG1i vs DMSO (normalization sanity check)
+
+```{r R5-control-corr, fig.height=4}
+ctl_corr <- base %>% filter(gene_category=="non-NMD") %>% group_by(ct) %>%
+  summarise(n=n(),
+            pearson_log=round(cor(log2(prodCPM_DMSO+1), log2(prodCPM_SMG_adj+1)),4),
+            spearman=round(cor(prodCPM_DMSO, prodCPM_SMG_adj, method="spearman"),4),
+            slope_log=round(coef(lm(log2(prodCPM_SMG_adj+1) ~ log2(prodCPM_DMSO+1)))[2],3),
+            median_log2fc=round(median(custom),3),
+            pct_within_2fold=round(100*mean(abs(custom)<1),1), .groups="drop")
+kable(ctl_corr, caption="Control (non-NMD) genes: DMSO vs adjusted-SMG1i productive CPM. slope~1, r~1, median log2FC~0 => normalization leaves controls unchanged.")
+
+# ── Claim 3.2.2, second half — "non-NMD genes ... Spearman >= 0.96" ─────────────────────
+# THE PAPER STATES AN INEQUALITY OVER FOUR CELL TYPES, so the quantity that bears on it is the
+# MINIMUM, not a mean: ">= 0.96" is false if any single cell type falls below. The per-cell-type
+# values go out as support so a reader can see which one is closest to the bound.
+CTL_POP <- paste("non-NMD (control) genes, correlating productive CPM in DMSO against",
+                 "adjusted-SMG1i within each cell type, then taking the WORST cell type;",
+                 "Spearman on untransformed productive CPM")
+claim_emit("3.2.2", "lowest per-cell-type Spearman, control genes (paper states >= 0.96)",
+           min(ctl_corr$spearman), n = sum(ctl_corr$n), population = CTL_POP)
+for (.i in seq_len(nrow(ctl_corr))) {
+  claim_emit("3.2.2", sprintf("Spearman, control genes, %s", ctl_corr$ct[.i]),
+             ctl_corr$spearman[.i], n = ctl_corr$n[.i], population = CTL_POP)
+}
+print(ggplot(base %>% filter(gene_category=="non-NMD"), aes(log2(prodCPM_DMSO+1), log2(prodCPM_SMG_adj+1))) +
+  geom_abline(slope=1, intercept=0, linetype="dashed", colour="grey50") +
+  geom_point(alpha=0.10, size=0.4, colour="#7f8c8d") +
+  geom_smooth(method="lm", se=FALSE, colour="#c0392b", linewidth=0.6) +
+  facet_wrap(~ct, nrow=1) +
+  labs(x="log2(DMSO productive CPM + 1)", y="log2(adjusted SMG1i productive CPM + 1)",
+       title="Control genes on the identity line (normalization sanity check)") +
+  theme_bw(base_size=11) + theme(strip.background=element_rect(fill="grey92")))
+```
+
+# Step 6 — CPM-space relationships
+
+## 6.1 DMSO productive CPM vs change in productive (CPM)
+
+```{r R6-prodDMSO-vs-dprod, fig.height=4.5}
+d6a <- base %>% filter(gene_category %in% MAIN_CATS) %>% group_by(ct) %>%
+  filter(within_sd(dprod_adj, 3)) %>% ungroup()
+cat(sprintf("6.1 scatter: %d points beyond ±3 SD of dprod_adj removed for display.\n",
+            sum(base$gene_category %in% MAIN_CATS) - nrow(d6a)))
+print(ggplot(d6a, aes(log10(prodCPM_DMSO+1), dprod_adj, colour=gene_category)) +
+  geom_hline(yintercept=0, colour="grey70") +
+  geom_point(alpha=0.12, size=0.5) + geom_smooth(method="loess", se=FALSE, linewidth=0.7) +
+  facet_wrap(~ct, nrow=1) +
+  scale_colour_manual(values=cat_colors, name=NULL) +
+  labs(x="log10(DMSO productive CPM + 1)", y="change in productive (adjusted CPM)",
+       title="DMSO productive level vs change in productive",
+       subtitle="display trimmed to ±3 SD of change-in-productive (per cell type)") +
+  theme_bw(base_size=11) + theme(legend.position="top", strip.background=element_rect(fill="grey92")))
+```
+
+## 6.2 Unproductive gain (raw SMG1i) vs change in productive (CPM)
+
+```{r R6-unprodgain-vs-dprod, fig.height=4.5}
+d6b <- base %>% filter(gene_category=="NMD") %>% group_by(ct) %>%
+  filter(within_sd(unprod_gain, 3) & within_sd(dprod_adj, 3)) %>% ungroup()
+cat(sprintf("6.2 scatter: %d points beyond ±3 SD (of unprod_gain or dprod_adj) removed for display.\n",
+            sum(base$gene_category=="NMD") - nrow(d6b)))
+print(ggplot(d6b, aes(unprod_gain, dprod_adj)) +
+  geom_hline(yintercept=0, colour="grey70") + geom_vline(xintercept=0, colour="grey85") +
+  geom_point(alpha=0.15, size=0.5, colour="#c0392b") +
+  geom_smooth(method="lm", se=TRUE, colour="black", linewidth=0.7) +
+  facet_wrap(~ct, nrow=1, scales="free") +
+  labs(x="unproductive gain (raw CPM, SMG1i − DMSO)", y="change in productive (adjusted CPM)",
+       title="Unproductive gain vs productive change (NMD genes): flat/positive = no sibling-drop",
+       subtitle="display trimmed to ±3 SD (per cell type); slope table below uses ALL genes") +
+  theme_bw(base_size=11) + theme(strip.background=element_rect(fill="grey92")))
+slope_cpm <- base %>% filter(gene_category=="NMD") %>% group_by(ct) %>%
+  summarise(n=n(),
+    slope=round(coef(lm(dprod_adj ~ unprod_gain + log10(prodCPM_DMSO+1)))["unprod_gain"],4),
+    p=signif(summary(lm(dprod_adj ~ unprod_gain + log10(prodCPM_DMSO+1)))$coefficients["unprod_gain","Pr(>|t|)"],3),
+    rho=round(cor(unprod_gain, dprod_adj, method="spearman", use="complete.obs"),3), .groups="drop")
+kable(slope_cpm, caption="CPM-space slope of productive change on unproductive gain (NMD genes; controls for DMSO level). ~0/positive = decoupled.")
+```
+
+# Step 7 — Short-read induction loading (independent axis)
+
+```{r sr-load}
+sr_pm   <- fread(SR_PM_PATH); sr_lfsr <- fread(SR_LFSR_PATH)
+sr_id   <- intersect(c("gene_id","ensembl_gene_id_version"), colnames(sr_pm))[1]
+resolve_sr <- function(df, ct){ cn<-colnames(df); h<-cn[grepl(paste0("_in_",ct,"$"),cn)]
+  if(length(h)==1) return(h); if (ct %in% cn) return(ct); stop("no SR col ",ct) }
+sr_long <- bind_rows(lapply(CELL_TYPES, function(ct) data.frame(
+  gene_id=sr_pm[[sr_id]], ct=ct,
+  sr_logFC=sr_pm[[resolve_sr(sr_pm,ct)]], sr_lfsr=sr_lfsr[[resolve_sr(sr_lfsr,ct)]],
+  stringsAsFactors=FALSE))) %>%
+  mutate(sr_responsive = !is.na(sr_lfsr)&!is.na(sr_logFC)&sr_lfsr<0.05&sr_logFC>0)
+cat(sprintf("SR-induced (lfsr<0.05 & logFC>0) genes per CT: %s\n",
+    paste(sprintf("%s=%d", CELL_TYPES,
+      sapply(CELL_TYPES, function(c) sum(sr_long$sr_responsive[sr_long$ct==c], na.rm=TRUE))), collapse="  ")))
+```
+
+# Step 8 — FIGURE R5d: NMD genes split by SR induction, with non-NMD overlaid
+
+```{r R5d, fig.height=4.5}
+nmd_sr <- base %>% filter(gene_category=="NMD") %>%
+  inner_join(sr_long, by=c("gene_id","ct")) %>% filter(!is.na(sr_logFC)) %>%
+  mutate(sr = ifelse(sr_responsive,"SR NMD+","SR NMD-"))
+ctrl <- base %>% filter(gene_category=="non-NMD") %>% group_by(ct) %>%
+  summarise(ctrl=median(custom, na.rm=TRUE), .groups="drop")
+
+box_dat <- bind_rows(
+  nmd_sr %>% transmute(ct, custom, grp=sr),
+  base %>% filter(gene_category=="non-NMD") %>% transmute(ct, custom, grp="non-NMD")
+) %>% mutate(grp=factor(grp, levels=c("SR NMD+","SR NMD-","non-NMD")))
+print(ggplot(box_dat, aes(grp, custom, fill=grp)) +
+  geom_hline(yintercept=0, colour="grey85") +
+  geom_hline(data=ctrl, aes(yintercept=ctrl), colour="#2980b9", linetype="dashed") +
+  geom_boxplot(outlier.size=0.3, outlier.alpha=0.2, width=0.6, colour="grey25") +
+  facet_wrap(~ct, nrow=1) + coord_cartesian(ylim=c(-1.2,1.2)) +
+  scale_fill_manual(values=c("SR NMD+"="#c0392b","SR NMD-"="#e67e22","non-NMD"="#7f8c8d"), guide="none") +
+  labs(x=NULL, y="productive log2FC (custom)",
+       title="FIGURE R5d. NMD genes by SR induction, with non-NMD overlaid (blue dashed = non-NMD median)") +
+  theme_bw(base_size=11) + theme(strip.background=element_rect(fill="grey92")))
+
+dens_dat <- bind_rows(
+  nmd_sr %>% transmute(ct, custom, grp=sr),
+  base %>% filter(gene_category=="non-NMD") %>% transmute(ct, custom, grp="non-NMD")
+)
+print(ggplot(dens_dat, aes(custom, fill=grp, colour=grp)) +
+  geom_vline(xintercept=0, colour="grey70") + geom_density(alpha=0.25, linewidth=0.5) +
+  facet_wrap(~ct, nrow=1) + coord_cartesian(xlim=c(-1.5,1.5)) +
+  scale_fill_manual(values=c("SR NMD+"="#c0392b","SR NMD-"="#e67e22","non-NMD"="#7f8c8d"), name=NULL) +
+  scale_colour_manual(values=c("SR NMD+"="#c0392b","SR NMD-"="#e67e22","non-NMD"="#7f8c8d"), guide="none") +
+  labs(x="productive log2FC (custom)", title="Distribution: SR+ vs SR- NMD genes vs non-NMD") +
+  theme_bw(base_size=11) + theme(legend.position="top", strip.background=element_rect(fill="grey92")))
+
+kable(nmd_sr %>% group_by(ct, sr) %>% summarise(n=n(), median_custom=round(median(custom),3), .groups="drop") %>%
+        pivot_wider(names_from=sr, values_from=c(n, median_custom)) %>%
+        left_join(ctrl %>% rename(nonNMD_ctrl=ctrl), by="ct"),
+      caption="TABLE R5d. SR-called vs not within NMD genes, vs non-NMD baseline. SR- ~ non-NMD = induction-gating.")
+```
+
+# Step 9 — FIGURE R5a: productive output vs short-read induction quintile
+
+```{r R5a, fig.height=4.5}
+dose_nmd <- nmd_sr %>% group_by(ct) %>% mutate(q=ntile(sr_logFC,5)) %>%
+  group_by(ct,q) %>% summarise(median_sr_logFC=round(median(sr_logFC),3),
+                               custom=round(median(custom),3), class="NMD", .groups="drop")
+nonnmd_sr <- base %>% filter(gene_category=="non-NMD") %>%
+  inner_join(sr_long, by=c("gene_id","ct")) %>% filter(!is.na(sr_logFC))
+dose_non <- nonnmd_sr %>% group_by(ct) %>% mutate(q=ntile(sr_logFC,5)) %>%
+  group_by(ct,q) %>% summarise(median_sr_logFC=round(median(sr_logFC),3),
+                               custom=round(median(custom),3), class="non-NMD", .groups="drop")
+dose <- bind_rows(dose_nmd, dose_non)
+print(ggplot(dose, aes(factor(q), custom, group=class, colour=class)) +
+  geom_hline(yintercept=0, colour="grey85") +
+  geom_line(linewidth=1) + geom_point(size=2) + facet_wrap(~ct, nrow=1) +
+  scale_colour_manual(values=c("NMD"="#c0392b","non-NMD"="#7f8c8d"), name=NULL) +
+  labs(x="short-read induction quintile", y="median productive log2FC (custom)",
+       title="FIGURE R5a. Productive output rises monotonically with independent induction (NMD vs non-NMD)") +
+  theme_bw(base_size=11) + theme(legend.position="top", strip.background=element_rect(fill="grey92")))
+
+r5stats <- bind_rows(lapply(CELL_TYPES, function(ct_i){
+  d <- nmd_sr %>% filter(ct==ct_i); m <- lm(custom ~ sr_logFC, d); s <- summary(m)
+  data.frame(ct=ct_i, class="NMD", n=nrow(d), slope=round(coef(m)[2],3), R2=round(s$r.squared,3),
+             p=signif(s$coefficients[2,4],3), spearman=round(cor(d$custom,d$sr_logFC,method="spearman"),3))
+}))
+kable(r5stats, caption="TABLE R5a. Productive change (custom) ~ short-read induction, per CT (NMD genes).")
+
+sl <- bind_rows(lapply(CELL_TYPES, function(ct_i){
+  d <- base %>% filter(ct==ct_i, gene_category %in% MAIN_CATS) %>%
+    inner_join(sr_long, by=c("gene_id","ct")) %>% filter(!is.na(sr_logFC))
+  s <- summary(lm(custom ~ sr_logFC*gene_category, data=d))$coefficients
+  data.frame(ct=ct_i, slope_nonNMD=round(s["sr_logFC","Estimate"],3),
+             slope_diff_NMDvsNon=round(s[grep("sr_logFC:",rownames(s)),"Estimate"],3),
+             p_diff=signif(s[grep("sr_logFC:",rownames(s)),"Pr(>|t|)"],3))
+}))
+kable(sl, caption="TABLE R5b. Productive ~ induction slope by class. slope_diff >= 0 => NMD tracks induction at least as well as controls.")
+```
+
+# Step 10 — Kitagawa (raw) metric and decomposition (verified)
+
+```{r kitagawa-check}
+chk <- base %>% filter(gene_category %in% MAIN_CATS) %>%
+  kitagawa_decomp() %>%
+  mutate(resid = dP - (level + composition))
+cat(sprintf("Decomposition identity check: max |dP - (level+composition)| = %.3e (should be ~0)\n",
+            max(abs(chk$resid), na.rm=TRUE)))
+```
+
+```{r kitagawa-dist, fig.height=4}
+print(plot_dist(base, "Kitagawa", "Raw (Kitagawa) productive log2FC", xlab="productive log2 fold-change (raw)", xlim=c(-2,2), vline=0))
+kdiff <- base %>% filter(gene_category %in% MAIN_CATS) %>% group_by(ct, gene_category) %>%
+  summarise(n=n(), median=round(median(Kitagawa),3), mean=round(mean(Kitagawa),3),
+            sd=round(sd(Kitagawa),3), pct_pos=round(100*mean(Kitagawa>0),1), .groups="drop") %>%
+  pivot_wider(names_from=gene_category, values_from=c(n,median,mean,sd,pct_pos))
+kable(kdiff, caption="Kitagawa distribution stats. The peak at 0 reflects the buffered majority; medians/means/SD differ across CT and class.")
+```
+
+```{r kitagawa-decomp, fig.height=4}
+dec <- chk
+kable(dec %>% mutate(driver_cd=ifelse(abs(composition)>abs(level),"composition-driven","level-driven")) %>%
+        group_by(ct, gene_category) %>%
+        summarise(median_level=round(median(level),2), median_composition=round(median(composition),2),
+                  median_dP=round(median(dP),2),
+                  pct_composition_driven=round(100*mean(driver_cd=="composition-driven"),1), .groups="drop") %>%
+        pivot_wider(names_from=gene_category, values_from=c(median_level, median_composition, median_dP, pct_composition_driven)),
+      caption="TABLE. Kitagawa decomposition. Non-NMD composition ~0 confirms composition is the NMD-specific term.")
+decl <- dec %>% filter(gene_category=="NMD") %>% select(ct, level, composition) %>%
+  pivot_longer(c(level, composition), names_to="term", values_to="contribution")
+print(ggplot(decl, aes(contribution, fill=term)) + geom_vline(xintercept=0, colour="grey50") +
+  geom_density(alpha=0.5) + facet_wrap(~ct, nrow=1, scales="free_y") + coord_cartesian(xlim=c(-30,30)) +
+  scale_fill_manual(values=c("level"="#16a085","composition"="#8e44ad"), name=NULL) +
+  labs(x="contribution to productive change (CPM)", title="Level (output) vs composition (isoform shift), NMD genes") +
+  theme_bw(base_size=11) + theme(legend.position="top", strip.background=element_rect(fill="grey92")))
+fwrite(dec, file.path(OUT_DIR, paste0("kitagawa_decomposition_", DATE_STAMP, ".csv")))
+```
+
+# Step 11 — Per-gene significance: limma (custom CPM)
+
+```{r limma}
+fit_custom_limma <- function(ct){
+  o <- build_adj(ct)
+  prodk <- o$anchor & o$class_v=="prod"
+  pe <- rowsum(o$adj[prodk,,drop=FALSE], o$gene[prodk])
+  unprod_genes <- unique(o$gene[o$anchor & o$class_v=="unprod"])
+  unsure_genes <- setdiff(unique(o$gene[o$anchor & (o$unsure_v | o$down_v)]), unprod_genes)
+  cs <- colnames(pe)
+  samp <- data.frame(row.names=cs, treatment=relevel(factor(o$trt[cs]), ref="DMSO"),
+                     sample_id=factor(o$donor[cs]))
+  keep <- rowSums(pe >= 1) >= ceiling(ncol(pe)/2)
+  E <- log2(pe[keep,,drop=FALSE] + 1)
+  design <- model.matrix(~treatment, data=samp)
+  cf  <- limma::duplicateCorrelation(E, design, block=samp$sample_id)
+  fit <- limma::eBayes(limma::lmFit(E, design, block=samp$sample_id,
+                                    correlation=cf$consensus.correlation), trend=TRUE)
+  ci  <- grep("Smg1i", colnames(design)); tt <- limma::topTable(fit, coef=ci, number=Inf, sort.by="none")
+  bhat <- fit$coefficients[,ci]; se <- bhat/fit$t[,ci]
+  gc <- ifelse(rownames(tt) %in% unprod_genes, "NMD",
+        ifelse(rownames(tt) %in% unsure_genes, "unsure", "non-NMD"))
+  data.frame(gene_id=rownames(tt), ct=ct, logFC=tt$logFC, se=se[rownames(tt)],
+             P=tt$P.Value, adjP=tt$adj.P.Val,
+             gene_category=gc, stringsAsFactors=FALSE)
+}
+prod_dir <- bind_rows(lapply(CELL_TYPES, fit_custom_limma)) %>%
+  mutate(dir = case_when(adjP<0.05 & logFC>0 ~ "up", adjP<0.05 & logFC<0 ~ "down", TRUE ~ "ns")) %>%
+  left_join(iso2gene %>% select(gene_id, hgnc_symbol) %>% distinct(), by="gene_id")
+kable(prod_dir %>% filter(gene_category %in% MAIN_CATS) %>% count(ct, gene_category, dir) %>%
+        pivot_wider(names_from=dir, values_from=n, values_fill=0) %>% arrange(ct, gene_category),
+      caption="TABLE. Productive direction (limma-trend on custom CPM, donor-blocked). Per-CT power is LAE-driven (n=4 vs 3); see mashr for the powered cross-CT view.")
+fwrite(prod_dir, file.path(OUT_DIR, paste0("productive_direction_custom_", DATE_STAMP, ".csv")))
+```
+
+# Step 12 — Cross-cell-type significance: mashr
+
+```{r mashr}
+suppressPackageStartupMessages({ library(mashr); library(ashr) })
+all_genes <- unique(prod_dir$gene_id)
+bhat <- matrix(NA_real_, length(all_genes), length(CELL_TYPES), dimnames=list(all_genes, CELL_TYPES)); shat <- bhat
+for (ct in CELL_TYPES){ d <- prod_dir %>% filter(ct==!!ct)
+  bhat[d$gene_id, ct] <- d$logFC; shat[d$gene_id, ct] <- d$se }
+fin <- apply(shat,1,function(x) all(is.finite(x)&x>0)) & apply(bhat,1,function(x) all(is.finite(x)))
+bhat<-bhat[fin,,drop=FALSE]; shat<-shat[fin,,drop=FALSE]
+mi<-mash_set_data(bhat,shat); m1<-mash_1by1(mi); st<-get_significant_results(m1,0.05)
+set.seed(42); ri<-sample(nrow(bhat),min(20000,nrow(bhat)))
+Vh<-estimate_null_correlation_simple(mash_set_data(bhat[ri,,drop=FALSE],shat[ri,,drop=FALSE]))
+md<-mash_set_data(bhat,shat,V=Vh); Up<-if(length(st)>=5) cov_pca(md,npc=min(5,ncol(bhat)-1),subset=st) else list()
+m<-mash(md, Ulist=c(Up,cov_canonical(md)), outputlevel=2)
+pm<-get_pm(m); lf<-get_lfsr(m)
+prod_dir_mashr <- bind_rows(lapply(CELL_TYPES, function(ct)
+  data.frame(gene_id=rownames(pm), ct=ct, pm=pm[,ct], lfsr=lf[,ct], stringsAsFactors=FALSE))) %>%
+  mutate(dir=case_when(lfsr<0.05&pm>0~"up", lfsr<0.05&pm<0~"down", TRUE~"ns")) %>%
+  left_join(prod_dir %>% select(gene_id, ct, gene_category, hgnc_symbol), by=c("gene_id","ct"))
+kable(prod_dir_mashr %>% filter(gene_category %in% MAIN_CATS) %>% count(ct, gene_category, dir) %>%
+        pivot_wider(names_from=dir, values_from=n, values_fill=0) %>% arrange(ct, gene_category),
+      caption="TABLE. Productive direction after cross-CT mashr on custom effects (lfsr<0.05).")
+
+# ── Claim 3.2.5, and the second half of 3.2.4 ───────────────────────────────────────────
+# THE "ROUGHLY 83%" IS A MEDIAN ACROSS CELL TYPES, NOT A POOLED PROPORTION. Per cell type the
+# ns share is 82.9 / 93.8 / 59.8 / 83.9, whose median is 83.4 -- close to the published 83. The
+# POOLED proportion over all gene x cell-type rows is 79.7% (16,775/21,041). Both are emitted:
+# the median against the published value, the pooled one as support, because "roughly 83% of
+# genes" reads as pooled and is not. Note the spread -- FB at 59.8% is 24 points below the next
+# cell type, so a central summary of four such values conceals more than it conveys.
+NS_POP <- paste("NMD-category gene x cell-type rows after cross-cell-type mashr, counted as",
+                "not-significant at lfsr >= 0.05; the published figure is the MEDIAN of the four",
+                "per-cell-type shares, not a proportion pooled over rows")
+.ns <- sapply(CELL_TYPES, function(c) {
+  .i <- which(prod_dir_mashr$gene_category == "NMD" & prod_dir_mashr$ct == c)
+  100 * mean(prod_dir_mashr$dir[.i] == "ns")
+})
+# WHICH OF THESE TWO THE PAPER'S "80%" IS, decided by arithmetic rather than by proximity: the
+# POOLED share is 79.73 and the MEDIAN across cell types is 83.42, so 80 is the pooled one.
+# published= was on the median until 2026-08-08, which made a reproducing claim read as a 3.4-point
+# miss. Same shape as section 5's branch shares: right number, wrong row.
+claim_emit("3.2.4", "share of NMD genes with no significant productive change (%)",
+           median(.ns),
+           n = sum(prod_dir_mashr$gene_category == "NMD"), population = NS_POP)
+claim_emit("3.2.4", "same share, POOLED over gene x cell-type rows rather than median (%)",
+           100 * mean(prod_dir_mashr$dir[prod_dir_mashr$gene_category == "NMD"] == "ns"),
+           published = "80",
+           n = sum(prod_dir_mashr$gene_category == "NMD"), population = NS_POP)
+for (.c in CELL_TYPES) {
+  claim_emit("3.2.4", sprintf("share of NMD genes with no significant change, %s (%%)", .c),
+             .ns[[.c]], n = sum(prod_dir_mashr$gene_category == "NMD" & prod_dir_mashr$ct == .c),
+             population = NS_POP)
+}
+
+# 3.2.5 -- THE STATED RANGES SILENTLY EXCLUDE FB, WHICH IS THE TRUE MINIMUM ON BOTH ARMS.
+# Published: "88 (AT2) to 1337 (LAE) downregulated and 635 (MV) to 888 (LAE) upregulated". FB is
+# 11 down and 306 up, below both stated lower bounds. So each published endpoint is emitted
+# against its own value AND every cell type is emitted, which is what makes the omission visible
+# rather than requiring a reader to notice FB is absent from a sentence naming three cell types.
+DIR_POP <- paste("NMD-category genes with a significant productive change after cross-cell-type",
+                 "mashr (lfsr < 0.05), split by direction of the posterior mean, counted within",
+                 "each cell type")
+.n_dir <- function(c, d) sum(prod_dir_mashr$gene_category == "NMD" &
+                            prod_dir_mashr$ct == c & prod_dir_mashr$dir == d)
+for (.c in CELL_TYPES) {
+  claim_emit("3.2.5", sprintf("downregulated NMD genes, %s", .c), .n_dir(.c, "down"),
+             published = switch(.c, AT2 = "88", LAE = "1337", NULL),
+             n = sum(prod_dir_mashr$gene_category == "NMD" & prod_dir_mashr$ct == .c),
+             population = DIR_POP)
+  claim_emit("3.2.5", sprintf("upregulated NMD genes, %s", .c), .n_dir(.c, "up"),
+             published = switch(.c, MV = "635", LAE = "888", NULL),
+             n = sum(prod_dir_mashr$gene_category == "NMD" & prod_dir_mashr$ct == .c),
+             population = DIR_POP)
+}
+fwrite(prod_dir_mashr, file.path(OUT_DIR, paste0("productive_direction_mashr_custom_", DATE_STAMP, ".csv")))
+saveRDS(m, file.path(OUT_DIR, paste0("mashr_custom_", DATE_STAMP, ".rds")))
+```
+
+# Step 12b — Is the productive direction real, or just noise?
+
+Null: a gene's productive up/down direction is noise (its within-donor change has no real
+treatment effect; sign is random). We attack it several independent ways, all on the **adjusted**
+productive change (surge removed) and respecting donor pairing. The reproducibility battery figure
+collects the **four retained tests** (sign-flip permutation, cross-donor concordance, effect-size
+variance ratio, Storey π₀); the additional cross-platform, leave-one-donor-out, and Gaussian-mixture
+tests below are **exploratory and not reported** in the manuscript.
+
+```{r noise-helpers}
+if (!"P" %in% names(prod_dir)) prod_dir$P <- 2 * pnorm(-abs(prod_dir$logFC / prod_dir$se))
+
+if (requireNamespace("matrixStats", quietly=TRUE)) {
+  rowSds <- matrixStats::rowSds
+} else {
+  rowSds <- function(X){ n<-ncol(X); sqrt((rowMeans(X^2) - rowMeans(X)^2) * n/(n-1)) }
+}
+prod_logfc_mat <- function(ct_i, cats=MAIN_CATS){
+  M <- gene_sample %>% filter(ct==ct_i, gene_category %in% cats,
+        !is.na(prodCPM_DMSO), !is.na(prodCPM_SMG_adj)) %>%
+       mutate(D = log2((prodCPM_SMG_adj+1)/(prodCPM_DMSO+1))) %>%
+       select(gene_id, donor, D) %>%
+       tidyr::pivot_wider(names_from=donor, values_from=D) %>%
+       tibble::column_to_rownames("gene_id") %>% as.matrix()
+  M[rowSums(is.finite(M))==ncol(M), , drop=FALSE]
+}
+storey_pi0 <- function(p, lambda = 0.5){ p <- p[is.finite(p)]; min(1, mean(p > lambda)/(1 - lambda)) }
+```
+
+```{r leading-edge-check}
+upr_ens <- unique(na.omit(
+  AnnotationDbi::select(org.Hs.eg.db, keys="GO:0006986",
+                        keytype="GOALL", columns="ENSEMBL")$ENSEMBL))
+
+for (ct_i in CELL_TYPES) {
+  up_g <- prod_dir_mashr %>% filter(ct==ct_i, gene_category=="NMD", dir=="up") %>% pull(gene_id)
+  le   <- intersect(svf(up_g), upr_ens)
+  syms <- AnnotationDbi::mapIds(org.Hs.eg.db, keys=le, column="SYMBOL",
+                                keytype="ENSEMBL", multiVals="first")
+  cat(sprintf("%s — UPR productive-UP genes (%d): %s\n",
+              ct_i, length(le), paste(sort(na.omit(syms)), collapse=", ")))
+}
+le_all <- unique(unlist(lapply(CELL_TYPES, function(ct_i){
+  up_g <- prod_dir_mashr %>% filter(ct==ct_i, gene_category=="NMD", dir=="up") %>% pull(gene_id)
+  intersect(svf(up_g), upr_ens)
+})))
+cat("\nUnion UPR productive-UP genes:\n",
+    paste(sort(na.omit(AnnotationDbi::mapIds(org.Hs.eg.db, keys=le_all,
+          column="SYMBOL", keytype="ENSEMBL", multiVals="first"))), collapse=", "), "\n")
+```
+
+## TEST 1 — Sign-flip permutation test (per-gene) [retained]
+
+```{r noise-signflip}
+signflip_test <- function(ct_i, B = 2000, seed = 1){
+  M <- prod_logfc_mat(ct_i); n <- ncol(M); G <- nrow(M)
+  tstat  <- function(X) rowMeans(X) / (rowSds(X) / sqrt(n))
+  cutoff <- qt(0.975, n - 1)
+  obs    <- sum(abs(tstat(M)) >= cutoff, na.rm = TRUE)
+  set.seed(seed); null <- numeric(B)
+  for (b in 1:B){ S <- matrix(sample(c(-1,1), G*n, TRUE), G, n); null[b] <- sum(abs(tstat(M*S)) >= cutoff, na.rm=TRUE) }
+  data.frame(ct=ct_i, n_donor=n, n_genes=G, observed_sig=obs,
+             null_mean_sig=round(mean(null),1),
+             empirical_FDR=round(mean(null)/obs,4),
+             perm_p=round((sum(null>=obs)+1)/(B+1),4))
+}
+kable(bind_rows(lapply(CELL_TYPES, signflip_test)),
+  caption="TEST 1. Within-donor sign-flip permutation. FDR<<1 & perm_p~0 reject 'noise'.")
+```
+
+## TEST 2 — Cross-donor sign concordance [retained]
+
+```{r noise-concordance}
+kable(bind_rows(lapply(CELL_TYPES, function(ct_i){
+  M <- prod_logfc_mat(ct_i); n <- ncol(M); G <- nrow(M)
+  all_pos <- sum(rowSums(M>0)==n); all_neg <- sum(rowSums(M<0)==n)
+  bt <- binom.test(all_pos+all_neg, G, p=2^(1-n), alternative="greater")
+  data.frame(ct=ct_i, n_donor=n, n_genes=G, all_up=all_pos, all_down=all_neg,
+             observed_concordant=all_pos+all_neg, expected_under_noise=round(G*2^(1-n)),
+             p=signif(bt$p.value,3))
+})), caption="TEST 2. Cross-donor sign concordance vs binomial chance 2*(1/2)^n.")
+```
+
+## TEST 3 — Cross-platform concordance (exploratory)
+
+```{r noise-3-crossplatform}
+xp <- base %>% filter(gene_category=="non-NMD") %>%
+  inner_join(sr_long, by=c("gene_id","ct")) %>% filter(is.finite(custom), is.finite(sr_logFC))
+kable(xp %>% group_by(ct) %>% summarise(
+  n=n(), spearman=round(cor(custom, sr_logFC, method="spearman"),3),
+  sign_concordance=round(mean(sign(custom)==sign(sr_logFC)),3),
+  p=signif(cor.test(custom, sr_logFC, method="spearman")$p.value,3), .groups="drop"),
+  caption="TEST 3 (exploratory). Cross-platform concordance (non-NMD): long-read productive logFC vs short-read gene logFC.")
+```
+
+## TEST 4 — Leave-one-donor-out reproducibility (exploratory)
+
+```{r noise-4-loo}
+kable(bind_rows(lapply(CELL_TYPES, function(ct_i){
+  M <- prod_logfc_mat(ct_i)
+  d1 <- M[,1]; drest <- rowMeans(M[,-1,drop=FALSE])
+  data.frame(ct=ct_i, n_genes=nrow(M),
+             rho=round(cor(d1,drest,method="spearman"),3),
+             sign_concordance=round(mean(sign(d1)==sign(drest)),3),
+             p=signif(cor.test(d1,drest,method="spearman")$p.value,3))
+})), caption="TEST 4 (exploratory). Leave-one-donor-out reproducibility: donor 1 vs mean of the rest.")
+```
+
+## TEST 5 — Storey pi0 / calibrated FDR (limma moderated p-values) [retained]
+
+```{r noise-5-pi0}
+kable(bind_rows(lapply(CELL_TYPES, function(ct_i){
+  p <- prod_dir$P[prod_dir$ct==ct_i & prod_dir$gene_category %in% MAIN_CATS]; p <- p[is.finite(p)]
+  pi0 <- storey_pi0(p)
+  data.frame(ct=ct_i, n=length(p), pi0=round(pi0,3),
+             est_nonnull_fraction=round(1 - pi0, 3),
+             n_BH_FDR05=sum(p.adjust(p, "BH") < 0.05))
+})), caption="TEST 5. Storey pi0 (lambda=0.5): 1-pi0 = estimated fraction of genes with a real productive effect.")
+```
+
+## TEST 7 — Effect-size variance ratio (change distribution wider than noise) [retained]
+
+```{r noise-7-distribution-width}
+distrib_test <- function(ct_i, B = 200){
+  M <- prod_logfc_mat(ct_i); n <- ncol(M); G <- nrow(M)
+  eff <- rowMeans(M)
+  set.seed(1)
+  eff_null <- unlist(lapply(1:B, function(b){ S <- matrix(sample(c(-1,1), G*n, TRUE), G, n); rowMeans(M*S) }))
+  data.frame(ct=ct_i, var_obs=round(var(eff),4), var_null=round(var(eff_null),4),
+             var_ratio=round(var(eff)/var(eff_null),2),
+             ks_p=signif(ks.test(eff, sample(eff_null, min(length(eff_null),5e4)))$p.value,3))
+}
+kable(bind_rows(lapply(CELL_TYPES, distrib_test)),
+  caption="TEST 7. Per-gene mean productive log2FC vs the sign-flip null. var_ratio>1 + KS p<<0.05 = wider than noise.")
+```
+
+## TEST 12 — Single Gaussian vs mixture (exploratory)
+
+```{r noise-12-mixture, eval = requireNamespace("mclust", quietly=TRUE)}
+suppressPackageStartupMessages(library(mclust))
+res12 <- bind_rows(lapply(CELL_TYPES, function(ct_i){
+  x <- base$custom[base$ct==ct_i & base$gene_category %in% MAIN_CATS]; x <- x[is.finite(x)]
+  m1 <- mclust::densityMclust(x, G=1,   plot=FALSE, verbose=FALSE)
+  mk <- mclust::densityMclust(x, G=1:4, plot=FALSE, verbose=FALSE)
+  data.frame(ct=ct_i, n=length(x), best_G=mk$G,
+             BIC_1comp = round(max(m1$BIC), 1),
+             BIC_best  = round(max(mk$BIC), 1),
+             dBIC_best_minus_1 = round(max(mk$BIC) - max(m1$BIC), 1))
+}))
+kable(res12, caption="TEST 12 (exploratory). Single Gaussian vs mixture (mclust BIC; higher = better).")
+```
+
+## Reproducibility battery figure (four retained tests)
+
+```{r reproducibility-battery, fig.height=4.5}
+# Values computed from the retained test functions above (NOT hardcoded), so the figure
+# cannot drift from the tables. Saved to OUT_DIR alongside the other outputs.
+battery <- bind_rows(lapply(CELL_TYPES, function(ct_i){
+  M    <- prod_logfc_mat(ct_i); n <- ncol(M); G <- nrow(M)
+  sf   <- signflip_test(ct_i)$empirical_FDR                            # TEST 1
+  conc <- (sum(rowSums(M>0)==n) + sum(rowSums(M<0)==n)) / (G*2^(1-n))  # TEST 2 fold over expected
+  vr   <- distrib_test(ct_i)$var_ratio                                 # TEST 7 variance ratio
+  p    <- prod_dir$P[prod_dir$ct==ct_i & prod_dir$gene_category %in% MAIN_CATS]
+  nn   <- 1 - storey_pi0(p[is.finite(p)])                              # TEST 5 non-null fraction
+  data.frame(ct=ct_i,
+    `Sign-flip permutation\n(empirical FDR; pass <1)`  = round(sf,3),
+    `Cross-donor concordance\n(x expected; pass >1)`   = round(conc,2),
+    `Effect-size variance ratio\n(obs/null; pass >1)`  = round(vr,2),
+    `Storey non-null fraction\n(1-pi0; pass >0.1)`     = round(nn,3),
+    check.names=FALSE)
+}))
+long <- battery %>% pivot_longer(-ct, names_to="test", values_to="stat") %>%
+  mutate(pass = case_when(grepl("FDR", test) ~ stat < 1,
+                          grepl("Storey", test) ~ stat > 0.1,
+                          TRUE ~ stat > 1),
+         label = sprintf("%.2f", stat),
+         ct = factor(ct, levels=c("AT2","LAE","FB","MV")),
+         test = factor(test, levels=rev(unique(test))))
+p_batt <- ggplot(long, aes(ct, test, fill=pass)) +
+  geom_tile(color="white", linewidth=1.1) +
+  geom_text(aes(label=label), fontface="bold", size=3.6, color=ifelse(long$pass,"grey15","white")) +
+  scale_fill_manual(values=c(`TRUE`="#4393c3",`FALSE`="#d6604d"),
+                    labels=c(`TRUE`="meets criterion", `FALSE`="fails criterion"), name=NULL) +
+  scale_x_discrete(position="top") +
+  labs(title="Reproducibility of the productive (non-NMD) output response",
+       subtitle="Four retained tests; pass criterion in each row label. FB is the provisional cell type.",
+       x=NULL, y=NULL) +
+  theme_minimal(base_size=12) +
+  theme(panel.grid=element_blank(), axis.text.x.top=element_text(face="bold",size=12),
+        axis.text.y=element_text(size=9, lineheight=0.95), plot.title=element_text(face="bold"),
+        plot.subtitle=element_text(color="grey40", size=9.5), legend.position="top")
+ggsave(file.path(OUT_DIR, "reproducibility_battery.png"), p_batt, width=9, height=4.5, dpi=300, bg="white")
+print(p_batt)
+```
+
+# Step 13 — What makes a gene's productive output go up vs down?
+
+An **inferential (associational)** logistic regression — we read the **odds ratios / p-values**,
+estimated on **all** the data, so there is deliberately **no train/test split** (a split is the
+right tool only for a prediction claim, provided as a cross-validated AUC in §13.1).
+
+```{r updown-model}
+mdl <- prod_dir_mashr %>% filter(dir %in% c("up","down")) %>%
+  left_join(base %>% select(ct, gene_id, prodCPM_DMSO, unprodCPM_DMSO, unprodCPM_SMG,
+                            unprod_gain, totalCPM_DMSO, n_iso), by=c("ct","gene_id")) %>%
+  left_join(sr_long %>% select(ct, gene_id, sr_logFC), by=c("ct","gene_id")) %>%
+  mutate(up = as.integer(dir=="up"),
+         is_NMD = as.integer(gene_category=="NMD"),
+         log_expr       = log10(totalCPM_DMSO + 1),
+         log_unprodDMSO = log10(unprodCPM_DMSO + 1),
+         log_unprodSMG  = log10(unprodCPM_SMG + 1),
+         log_niso       = log10(n_iso + 1)) %>%
+  filter(is.finite(log_expr))
+cat(sprintf("Model rows: %d (up=%d, down=%d)\n", nrow(mdl), sum(mdl$up), sum(1-mdl$up)))
+
+fit_glm <- glm(up ~ is_NMD + log_expr + log_unprodDMSO + log_unprodSMG + unprod_gain + log_niso + ct,
+               data=mdl, family=binomial)
+co <- summary(fit_glm)$coefficients
+kable(data.frame(term=rownames(co), beta=round(co[,1],3),
+                 odds_ratio=round(exp(co[,1]),3), p=signif(co[,4],3)),
+      caption="TABLE. Logistic model: P(productive UP) across all genes (mashr-significant only).")
+
+mdl_sr <- mdl %>% filter(is.finite(sr_logFC))
+fit_glm_sr <- glm(up ~ is_NMD + log_expr + log_unprodDMSO + log_unprodSMG + unprod_gain + log_niso + sr_logFC + ct,
+                  data=mdl_sr, family=binomial)
+co2 <- summary(fit_glm_sr)$coefficients
+kable(data.frame(term=rownames(co2), beta=round(co2[,1],3),
+                 odds_ratio=round(exp(co2[,1]),3), p=signif(co2[,4],3)),
+      caption="TABLE. Same model + short-read induction. If sr_logFC dominates and is_NMD shrinks toward OR~1, productive direction is induction-gated.")
+```
+
+## 13.1 — Predictive check: cross-validated AUC (this one DOES use train/test)
+
+```{r updown-cv-auc}
+auc <- function(y, p){
+  r <- rank(p); n1 <- sum(y==1); n0 <- sum(y==0)
+  if (n1==0 || n0==0) return(NA_real_)
+  (sum(r[y==1]) - n1*(n1+1)/2) / (n1*n0)
+}
+cv_auc <- function(df, form, K=5, seed=1){
+  set.seed(seed); df <- df[is.finite(rowSums(model.matrix(form, df)[,-1,drop=FALSE])), , drop=FALSE]
+  fold <- sample(rep(1:K, length.out=nrow(df))); pred <- rep(NA_real_, nrow(df))
+  for (k in 1:K){
+    tr <- df[fold!=k,,drop=FALSE]; te <- df[fold==k,,drop=FALSE]
+    fit <- suppressWarnings(glm(form, data=tr, family=binomial))
+    pred[fold==k] <- predict(fit, newdata=te, type="response")
+  }
+  auc(df$up, pred)
+}
+auc_full  <- cv_auc(mdl_sr, up ~ is_NMD + log_expr + log_unprodDMSO + log_unprodSMG + unprod_gain + log_niso + sr_logFC + ct)
+auc_ind   <- cv_auc(mdl_sr, up ~ sr_logFC)
+auc_noind <- cv_auc(mdl_sr, up ~ is_NMD + log_expr + log_unprodDMSO + log_unprodSMG + unprod_gain + log_niso + ct)
+auc_nmd   <- cv_auc(mdl_sr, up ~ is_NMD)
+kable(data.frame(
+  model = c("full (all features + induction)","induction only (sr_logFC)",
+            "all features, NO induction","is_NMD only"),
+  cv_AUC = round(c(auc_full, auc_ind, auc_noind, auc_nmd), 3)),
+  caption="TABLE 13.1. 5-fold cross-validated AUC for predicting productive direction.")
+```
+
+## 13.2 — Separate "goes up" and "goes down" models (one-vs-rest)
+
+```{r updown-separate}
+mdl_all <- prod_dir_mashr %>%
+  filter(gene_category %in% MAIN_CATS) %>%
+  left_join(base %>% select(ct, gene_id, prodCPM_DMSO, unprodCPM_DMSO, unprodCPM_SMG,
+                            unprod_gain, totalCPM_DMSO, n_iso), by=c("ct","gene_id")) %>%
+  left_join(sr_long %>% select(ct, gene_id, sr_logFC), by=c("ct","gene_id")) %>%
+  mutate(is_NMD = as.integer(gene_category=="NMD"),
+         log_expr       = log10(totalCPM_DMSO + 1),
+         log_unprodDMSO = log10(unprodCPM_DMSO + 1),
+         log_unprodSMG  = log10(unprodCPM_SMG + 1),
+         log_niso       = log10(n_iso + 1),
+         goes_up   = as.integer(dir=="up"),
+         goes_down = as.integer(dir=="down")) %>%
+  filter(is.finite(log_expr))
+cat(sprintf("All-gene one-vs-rest set: n=%d (up=%d, down=%d, ns=%d)\n",
+    nrow(mdl_all), sum(mdl_all$goes_up), sum(mdl_all$goes_down), sum(mdl_all$dir=="ns")))
+
+run_or <- function(df, outcome){
+  f <- as.formula(paste(outcome,
+        "~ is_NMD + log_expr + log_unprodDMSO + log_unprodSMG + unprod_gain + log_niso + ct"))
+  co <- summary(glm(f, data=df, family=binomial))$coefficients
+  data.frame(term=rownames(co), beta=round(co[,1],3), odds_ratio=round(exp(co[,1]),3), p=signif(co[,4],3))
+}
+kable(run_or(mdl_all, "goes_up"),   caption="TABLE 13.2a. P(productive UP vs NOT up), one-vs-rest.")
+kable(run_or(mdl_all, "goes_down"), caption="TABLE 13.2b. P(productive DOWN vs NOT down), one-vs-rest.")
+cmp <- bind_rows(
+  run_or(mdl_all, "goes_up")   %>% filter(term=="is_NMD") %>% mutate(model="goes_up (vs rest)"),
+  run_or(mdl_all, "goes_down") %>% filter(term=="is_NMD") %>% mutate(model="goes_down (vs rest)")
+) %>% select(model, is_NMD_OR=odds_ratio, p)
+kable(cmp, caption="TABLE 13.2c. is_NMD odds ratio in each one-vs-rest model.")
+```
+
+# Step 14 — Is the dominant trend "NMD up -> productive up", and what confounds it?
+
+```{r nmd-up-confounders, eval = requireNamespace("org.Hs.eg.db", quietly=TRUE) && requireNamespace("AnnotationDbi", quietly=TRUE)}
+sf_ens <- go_genes("GO:0008380")                                  # splicing factors
+dn_ens <- go_genes(c("GO:0006281","GO:0006260","GO:0000278"))     # proliferation/DNA-repair (down program)
+
+nmd_feat <- prod_dir_mashr %>% filter(gene_category=="NMD", dir %in% c("up","down")) %>%
+  left_join(base %>% select(ct, gene_id, totalCPM_DMSO, unprod_gain), by=c("ct","gene_id")) %>%
+  left_join(sr_long %>% select(ct, gene_id, sr_logFC), by=c("ct","gene_id")) %>%
+  mutate(up=as.integer(dir=="up"), g0=svf(gene_id),
+         is_SF=as.integer(g0 %in% sf_ens), is_down_prog=as.integer(g0 %in% dn_ens),
+         log_expr=log10(totalCPM_DMSO+1)) %>% filter(is.finite(log_expr))
+cat(sprintf("NMD genes with a significant productive call: up=%d, down=%d\n",
+            sum(nmd_feat$up), sum(1-nmd_feat$up)))
+
+fit_nmd <- glm(up ~ sr_logFC + is_SF + is_down_prog + log_expr + unprod_gain,
+               data=nmd_feat %>% filter(is.finite(sr_logFC)), family=binomial)
+cn <- summary(fit_nmd)$coefficients
+kable(data.frame(term=rownames(cn), beta=round(cn[,1],3),
+                 odds_ratio=round(exp(cn[,1]),3), p=signif(cn[,4],3)),
+      caption="TABLE. Within NMD genes: predictors of productive UP. OR<1 (is_SF, is_down_prog) = confounders that PREVENT coupling; sr_logFC OR>1 = induction drives it.")
+
+enr <- nmd_feat %>% group_by(dir) %>%
+  summarise(n=n(), pct_SF=round(100*mean(is_SF),1), pct_down_prog=round(100*mean(is_down_prog),1),
+            median_sr_logFC=round(median(sr_logFC, na.rm=TRUE),3), .groups="drop")
+kable(enr, caption="TABLE. Feature rates among productive-UP vs productive-DOWN NMD genes.")
+```
+
+# Step 15 — Pathways (topGO, two GO-defined programs)
+
+```{r topgo, eval = requireNamespace("topGO", quietly=TRUE) && requireNamespace("org.Hs.eg.db", quietly=TRUE)}
+suppressPackageStartupMessages({ library(topGO); library(org.Hs.eg.db) })
+run_bp <- function(universe_ens, interesting_ens, label, topn=12){
+  m <- suppressMessages(AnnotationDbi::select(org.Hs.eg.db, keys=svf(unique(universe_ens)),
+        columns="ENTREZID", keytype="ENSEMBL"))
+  m <- m[!is.na(m$ENTREZID)&!duplicated(m$ENSEMBL),]; e <- setNames(m$ENTREZID,m$ENSEMBL)
+  uni<-unique(na.omit(e[svf(universe_ens)])); intr<-unique(na.omit(e[svf(interesting_ens)]))
+  if(length(intr)<5){cat(sprintf("\n[%s] %d mapped -- skipped\n",label,length(intr)));return(invisible(NULL))}
+  gl<-factor(as.integer(uni%in%intr),levels=c(0,1)); names(gl)<-uni
+  GOd<-suppressMessages(new("topGOdata",ontology="BP",allGenes=gl,annot=annFUN.org,
+        mapping="org.Hs.eg.db",ID="entrez",nodeSize=10))
+  tb<-GenTable(GOd,elimFisher=suppressMessages(runTest(GOd,algorithm="elim",statistic="fisher")),
+        orderBy="elimFisher",topNodes=topn)
+  cat(sprintf("\n=== %s (interesting=%d of universe=%d) ===\n",label,length(intr),length(uni)));print(tb)
+  invisible(tb)
+}
+go_collect <- list()
+for (ct_i in CELL_TYPES) for (cat_i in MAIN_CATS) for (dir_i in c("up","down")){
+  d <- prod_dir_mashr %>% filter(ct==ct_i, gene_category==cat_i)
+  tb <- run_bp(d$gene_id, d$gene_id[d$dir==dir_i], sprintf("[mashr] %s | %s | productive-%s", ct_i, cat_i, toupper(dir_i)))
+  if (!is.null(tb)) { tb$ct<-ct_i; tb$category<-cat_i; tb$direction<-dir_i; go_collect[[length(go_collect)+1]] <- tb }
+}
+go_all <- bind_rows(go_collect)
+go_all$elimFisher <- as.numeric(gsub("<","",go_all$elimFisher))
+fwrite(go_all, file.path(OUT_DIR, paste0("topgo_all_mashr_", DATE_STAMP, ".csv")))
+```
+
+```{r topgo-consensus, eval = exists("go_all") && nrow(go_all) > 0}
+consensus <- go_all %>% filter(elimFisher < 0.05) %>%
+  group_by(category, direction, GO.ID, Term) %>%
+  summarise(n_ct=n_distinct(ct), cts=paste(sort(unique(ct)), collapse=","),
+            min_p=signif(min(elimFisher),2), .groups="drop") %>%
+  filter(n_ct >= 2) %>% arrange(category, direction, desc(n_ct), min_p)
+kable(consensus, caption="TABLE. GO BP terms recurring in >=2 cell types (elim Fisher<0.05). NMD-UP = ISR/UPR program; *-DOWN = proliferation/DNA-repair program.")
+fwrite(consensus, file.path(OUT_DIR, paste0("topgo_consensus_", DATE_STAMP, ".csv")))
+```
+
+```{r two-program-GO, eval = requireNamespace("org.Hs.eg.db", quietly=TRUE) && requireNamespace("AnnotationDbi", quietly=TRUE), fig.height=4.5}
+up_go <- go_genes(c("GO:0006986","GO:0140467"))                 # ISR/UPR
+dn_go <- go_genes(c("GO:0006281","GO:0006260","GO:0000278"))    # DNA repair + replication + mitotic cell cycle
+both  <- intersect(up_go, dn_go); up_go <- setdiff(up_go, both); dn_go <- setdiff(dn_go, both)
+cat(sprintf("GO sets: up(ISR/UPR)=%d, down(prolif/DNA-repair)=%d, dropped overlap=%d\n",
+            length(up_go), length(dn_go), length(both)))
+pg <- base %>% mutate(g0=svf(gene_id),
+        program=case_when(g0 %in% up_go ~ "ISR/UPR (up)",
+                          g0 %in% dn_go ~ "Proliferation/DNA-repair (down)", TRUE ~ NA_character_)) %>%
+  filter(!is.na(program))
+kable(pg %>% group_by(ct, program) %>%
+        summarise(n=n(), median_custom=round(median(custom),3),
+                  p_vs_zero=signif(suppressWarnings(wilcox.test(custom)$p.value),3), .groups="drop") %>%
+        pivot_wider(names_from=program, values_from=c(n, median_custom, p_vs_zero)),
+      caption="TABLE. Productive log2FC for GO-defined ISR/UPR (up) vs proliferation/DNA-repair (down) gene sets, per CT.")
+print(ggplot(pg, aes(program, custom, fill=program)) +
+  geom_hline(yintercept=0, colour="grey40") +
+  geom_boxplot(outlier.size=0.3, outlier.alpha=0.3, width=0.6, colour="grey25") +
+  facet_wrap(~ct, nrow=1) + coord_cartesian(ylim=c(-1.2,1.2)) +
+  scale_fill_manual(values=c("ISR/UPR (up)"="#16a085","Proliferation/DNA-repair (down)"="#c0392b"), guide="none") +
+  labs(x=NULL, y="productive log2FC (custom)", title="Two opposing productive programs (GO-defined)") +
+  theme_bw(base_size=11) + theme(strip.background=element_rect(fill="grey92"), axis.text.x=element_text(angle=15, hjust=1)))
+```
+
+# Step 16 — Two transcriptional programs and their sharing
+
+```{r step16-setup}
+# DEPOSITED, NOT FETCHED (W345). This chunk called msigdbr(collection="H") at knit time, which
+# downloads MSigDB on first use and caches it under R_user_dir. That cache existed on ONE laptop,
+# was never on Explorer and is in no deposit, so the deposit-native rerun died here with
+# "RDS not found: msigdb.2026.1.Hs.H.rds". Same shape as the srsf8 Ensembl capture, and read the
+# same way. The producer is analysis/upstream/capture_msigdb_hallmark.R; it must never run here.
+hm_file <- file.path(.P$ANNOT, "msigdb_hallmark_H.tsv")
+if (!file.exists(hm_file))
+  stop("MSigDB hallmark table not found: ", hm_file,
+       "\n  regenerate with: Rscript analysis/upstream/capture_msigdb_hallmark.R --out ", hm_file)
+hm <- utils::read.delim(hm_file, comment.char = "#", stringsAsFactors = FALSE)
+stopifnot(all(c("gs_name", "gene_symbol") %in% names(hm)), nrow(hm) > 0)
+hset    <- function(nm) unique(hm$gene_symbol[hm$gs_name==nm])
+hm_list <- split(hm$gene_symbol, hm$gs_name)
+down_sets <- list(E2F=hset("HALLMARK_E2F_TARGETS"), G2M=hset("HALLMARK_G2M_CHECKPOINT"), DNArep=hset("HALLMARK_DNA_REPAIR"))
+nfkb_set  <- hset("HALLMARK_TNFA_SIGNALING_VIA_NFKB")
+fmt_p <- function(p) ifelse(is.na(p), NA, ifelse(p>=1e-3, formatC(p,format="f",digits=3), formatC(p,format="e",digits=1)))
+```
+
+## 16.1 DOWN program = E2F-driven cell-cycle/proliferation arrest
+
+```{r step16-1-down-thresholded}
+enrich_down_ct <- function(ct_i, class, set){
+  d <- prod_dir_mashr %>% filter(ct==ct_i, gene_category==class)
+  hit <- unique(d$hgnc_symbol[d$dir=="down"]); bg <- unique(d$hgnc_symbol)
+  ft <- safe_fisher(bg %in% hit, bg %in% set)
+  data.frame(n_down=length(hit), n_in_set=sum(hit %in% set), OR=round(as.numeric(ft$estimate),2), p=fmt_p(ft$p.value))
+}
+res_dn <- bind_rows(lapply(names(down_sets), function(prog)
+  bind_rows(lapply(CELL_TYPES, function(c) bind_rows(
+    cbind(ct=c, class="NMD",     prog=prog, enrich_down_ct(c,"NMD",     down_sets[[prog]])),
+    cbind(ct=c, class="non-NMD", prog=prog, enrich_down_ct(c,"non-NMD", down_sets[[prog]])))))))
+kable(res_dn, caption="TABLE 16.1a. Productive-DOWN genes vs E2F/G2M/DNA-repair (thresholded Fisher), by cell type and class.")
+```
+
+```{r step16-1-down-pooled}
+nn <- prod_dir_mashr %>% filter(gene_category=="non-NMD")
+nn_down <- unique(nn$hgnc_symbol[nn$dir=="down"]); nn_bg <- unique(nn$hgnc_symbol)
+for (prog in names(down_sets)) { ft <- safe_fisher(nn_bg %in% nn_down, nn_bg %in% down_sets[[prog]])
+  cat(sprintf("%-7s pooled non-NMD down: %d/%d in set, OR=%.2f, p=%s\n",
+              prog, sum(nn_down %in% down_sets[[prog]]), length(nn_down), ft$estimate, fmt_p(ft$p.value))) }
+```
+
+```{r step16-1-down-continuous}
+gsea_scan <- function(ct_i, class="non-NMD"){
+  d <- prod_dir_mashr %>% filter(ct==ct_i, gene_category==class, !is.na(pm)); d <- d[!duplicated(d$hgnc_symbol),]; med <- median(d$pm)
+  bind_rows(lapply(names(hm_list), function(s){ inset <- d$hgnc_symbol %in% hm_list[[s]]
+    if (sum(inset) < 10) return(NULL); w <- wilcox.test(d$pm[inset], d$pm[!inset])
+    data.frame(pathway=sub("HALLMARK_","",s), n_in=sum(inset), median_pm_in=round(median(d$pm[inset]),3),
+               dir=ifelse(median(d$pm[inset])<med,"DOWN","up"), p=w$p.value) })) %>%
+    arrange(p) %>% mutate(padj=signif(p.adjust(p,"BH"),3), p=fmt_p(p))
+}
+for (c in CELL_TYPES){ cat("\n==", c, "non-NMD — threshold-free Hallmark scan (top 8) ==\n"); print(head(gsea_scan(c), 8)) }
+```
+
+## 16.2 UP program = NF-κB/TNFα inflammatory (secondary)
+
+```{r step16-2-up-NFkB}
+gsea_one <- function(ct_i, class, set){
+  d <- prod_dir_mashr %>% filter(ct==ct_i, gene_category==class, !is.na(pm)); d <- d[!duplicated(d$hgnc_symbol),]
+  inset <- d$hgnc_symbol %in% set; w <- wilcox.test(d$pm[inset], d$pm[!inset])
+  data.frame(ct=ct_i, class=class, n_in=sum(inset), median_pm_in=round(median(d$pm[inset]),3),
+             dir=ifelse(median(d$pm[inset])>median(d$pm[!inset]),"UP","down"), p=fmt_p(w$p.value))
+}
+kable(bind_rows(lapply(CELL_TYPES, function(c) bind_rows(gsea_one(c,"non-NMD",nfkb_set), gsea_one(c,"NMD",nfkb_set)))),
+  caption="TABLE 16.2. HALLMARK_TNFA_SIGNALING_VIA_NFKB (continuous test on productive pm), by cell type and class.")
+```
+
+## 16.3 Cross-cell-type sharing of the up and down programs
+
+```{r step16-3-sharing}
+emat <- prod_dir %>% filter(gene_category %in% MAIN_CATS) %>%
+  select(ct, gene_id, logFC) %>%
+  tidyr::pivot_wider(names_from = ct, values_from = logFC) %>%
+  tibble::column_to_rownames("gene_id") %>% as.matrix()
+emat <- emat[rowSums(is.finite(emat)) == ncol(emat), , drop = FALSE]
+
+resp <- unique(prod_dir_mashr$gene_id[prod_dir_mashr$dir != "ns"])
+emat_resp <- emat[rownames(emat) %in% resp, , drop = FALSE]
+
+C   <- cor(emat_resp, method = "spearman", use = "pairwise.complete.obs")
+cdf <- as.data.frame(as.table(C)); names(cdf) <- c("CT1", "CT2", "rho")
+print(ggplot(cdf, aes(CT1, CT2, fill = rho)) +
+  geom_tile(colour = "white", linewidth = 0.8) +
+  geom_text(aes(label = sprintf("%.2f", rho)), fontface = "bold",
+            colour = ifelse(cdf$rho > 0.6, "white", "grey20")) +
+  scale_fill_gradient2(low = "#D73027", mid = "white", high = "#2166AC",
+                       midpoint = min(C), limits = c(min(C), 1), name = "Spearman") +
+  labs(title = "Pairwise correlation of the productive response across cell types",
+       subtitle = sprintf("unshrunken limma logFC; %d genes significant in >=1 cell type", nrow(emat_resp)),
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank(), axis.text = element_text(face = "bold")))
+```
+
+```{r picking-genes}
+isr_set <- c("ATF4","ATF3","DDIT3","CHAC1","TRIB3","ASNS","PSAT1","PHGDH","SHMT2","MTHFD2",
+             "SLC7A11","SLC7A5","SLC3A2","WARS","CEBPB","PPP1R15A","DDIT4","HERPUD1","HSPA5",
+             "XBP1","EIF2AK3","ATF6","DNAJB9","SDF2L1","MANF","CALR","PDIA4","SEC61B","SEL1L")
+
+up_fig <- base %>%
+  dplyr::filter(gene_category=="NMD", custom > 0.3, hgnc_symbol %in% isr_set) %>%
+  dplyr::mutate(
+    nmd_frac_DMSO = round(unprodCPM_DMSO/(prodCPM_DMSO + unprodCPM_DMSO), 3),
+    nmd_frac_SMG  = round(unprodCPM_SMG /(prodCPM_SMG_raw + unprodCPM_SMG), 3)) %>%
+  dplyr::left_join(sr_long %>% dplyr::select(ct, gene_id, sr_logFC), by=c("ct","gene_id")) %>%
+  dplyr::transmute(hgnc_symbol, ct,
+    prod_DMSO=round(prodCPM_DMSO,1), prod_SMG=round(prodCPM_SMG_raw,1),
+    unprod_DMSO=round(unprodCPM_DMSO,1), unprod_SMG=round(unprodCPM_SMG,1),
+    nmd_frac_DMSO, nmd_frac_SMG, custom=round(custom,2), sr_logFC=round(sr_logFC,2)) %>%
+  dplyr::arrange(dplyr::desc(nmd_frac_SMG))
+cat("ISR/UPR NMD-up genes, ranked by NMD-isoform visibility (nmd_frac_SMG):\n")
+print(head(as.data.frame(up_fig), 20), row.names=FALSE)
+
+# ── Claim 3.5.2 — SHMT2, and the cell type the sentence names is not the one it measured ──
+# ALL FOUR PUBLISHED VALUES ARE AT2 ROWS. The manuscript attributes them to MV. AT2 gives
+# prod_DMSO 86.5, prod_SMG 111.1, adjusted logFC 0.42, short-read logFC 0.56 -- exactly the four
+# quoted numbers; MV's are 44.1, 58.2, 0.39 and 1.16. Both cell types are emitted, AT2 against
+# the published values and MV as the comparator, so the mis-attribution is recorded rather than
+# resolved by picking whichever agrees.
+#
+# AND "SIGNIFICANTLY INCREASED" IS UNSUPPORTED IN EVERY CELL TYPE. SHMT2's lfsr is 0.058 in AT2
+# and does not reach the 0.05 threshold in any of the four, so the significance claim fails
+# regardless of which cell type the values belong to. The lfsr is emitted so that is checkable.
+SHMT2_POP <- paste("SHMT2 in the ISR/UPR gene panel: productive CPM under DMSO and raw SMG1i, the",
+                   "adjusted productive log2 fold change, and the short-read gene-level log2 fold",
+                   "change, one row per cell type; values are pre-rounded to the precision the",
+                   "manuscript quotes")
+.sh <- function(col, ctv) { .i <- which(up_fig$hgnc_symbol == "SHMT2" & up_fig$ct == ctv)
+                            if (length(.i)) as.numeric(up_fig[[col]][.i[1]]) else NA_real_ }
+for (.c in c("AT2", "MV")) {
+  # THE MIS-ATTRIBUTION IS RESOLVED, AND MEASUREMENT RESOLVED IT (2026-08-08). published= sat on
+  # AT2 while the manuscript sentence names MV -- so the claim was compared against AT2's own
+  # values and reported as reproducing, which is circular. Against MV, three of the four match
+  # EXACTLY (44.1, 0.39, 1.16) and the fourth does not (SMG1i 54.8 against the published 58.1).
+  # AT2's values are kept emitted, without a published counterpart, because the comparison that
+  # was made for weeks should stay visible next to the one that replaces it.
+  claim_emit("3.5.2", sprintf("SHMT2 productive CPM under DMSO, %s", .c), .sh("prod_DMSO", .c),
+             published = if (.c == "MV") "44.1" else NULL, population = SHMT2_POP)
+  claim_emit("3.5.2", sprintf("SHMT2 productive CPM under SMG1i, %s", .c), .sh("prod_SMG", .c),
+             published = if (.c == "MV") "58.1" else NULL, population = SHMT2_POP)
+  claim_emit("3.5.2", sprintf("SHMT2 adjusted productive log2FC, %s", .c), .sh("custom", .c),
+             published = if (.c == "MV") "0.39" else NULL, population = SHMT2_POP)
+  claim_emit("3.5.2", sprintf("SHMT2 short-read gene log2FC, %s", .c), .sh("sr_logFC", .c),
+             published = if (.c == "MV") "1.16" else NULL, population = SHMT2_POP)
+}
+# The significance test the sentence rests on, for every cell type.
+for (.c in CELL_TYPES) {
+  .i <- which(prod_dir_mashr$hgnc_symbol == "SHMT2" & prod_dir_mashr$ct == .c)
+  if (!length(.i)) next
+  claim_emit("3.5.2", sprintf("SHMT2 lfsr, %s (claim says 'significantly increased')", .c),
+             prod_dir_mashr$lfsr[.i[1]],
+             population = paste("lfsr from the cross-cell-type mashr on adjusted productive",
+                                "effects; the significance threshold used throughout is 0.05"))
+}
+
+sf_syms <- c(paste0("SRSF",1:12), paste0("HNRNP",c("A1","A2B1","C","D","K","L","M","U")),
+             "TRA2A","TRA2B","RBM39","PTBP1","PTBP2","U2AF1","U2AF2")
+ex_down <- prod_dir_mashr %>%
+  filter(gene_category=="NMD", dir=="down", hgnc_symbol %in% sf_syms) %>%
+  left_join(base %>% select(ct, gene_id, prodCPM_DMSO, prodCPM_SMG_adj, unprod_gain,
+                            custom, prodfrac_DMSO, prodfrac_SMG), by=c("ct","gene_id")) %>%
+  arrange(custom)
+cat("\nDOWN candidates (splicing factors, NMD susceptible, productive DOWN):\n")
+print(ex_down %>% transmute(hgnc_symbol, ct,
+  prod_DMSO=round(prodCPM_DMSO,1), prod_SMG_adj=round(prodCPM_SMG_adj,1),
+  unprod_gain=round(unprod_gain,1), custom_log2FC=round(custom,2),
+  prodfrac_DMSO=round(prodfrac_DMSO,2), prodfrac_SMG=round(prodfrac_SMG,2)) %>% head(12))
+
+# ── Claim 3.5.5 — SRSF2 in MV ───────────────────────────────────────────────────────────
+# THE VALUES ARE READ FROM THE UNROUNDED COLUMNS, not from the printed table above, which rounds
+# for display. The manuscript quotes "84 to 50 CPM" and "91% to 26%", i.e. rounded further than
+# the table; each emission declares the published figure at the precision the paper printed it, so
+# the comparison happens at that precision rather than at the code's.
+#
+# prodCPM_SMG_adj is the ADJUSTED SMG1i value, not the raw one -- the productive-output correction
+# is applied, which is what makes the adjusted logFC and this CPM pair internally consistent.
+SRSF2_POP <- paste("SRSF2 in MV: productive CPM under DMSO against ADJUSTED SMG1i, the adjusted",
+                   "productive log2 fold change, and the productive fraction (productive share of",
+                   "the gene's total CPM) before and after; one row, from the NMD-susceptible",
+                   "productive-down splicing-factor candidates")
+.sr2 <- function(col) { .i <- which(ex_down$hgnc_symbol == "SRSF2" & ex_down$ct == "MV")
+                        if (length(.i)) as.numeric(ex_down[[col]][.i[1]]) else NA_real_ }
+claim_emit("3.5.6", "SRSF2 productive CPM under DMSO, MV", .sr2("prodCPM_DMSO"),
+           published = "84", population = SRSF2_POP)
+claim_emit("3.5.6", "SRSF2 productive CPM under adjusted SMG1i, MV", .sr2("prodCPM_SMG_adj"),
+           published = "50", population = SRSF2_POP)
+claim_emit("3.5.6", "SRSF2 adjusted productive log2FC, MV", .sr2("custom"),
+           published = "-0.73", population = SRSF2_POP)
+claim_emit("3.5.6", "SRSF2 productive fraction under DMSO, MV (%)", 100 * .sr2("prodfrac_DMSO"),
+           published = "91", population = SRSF2_POP)
+claim_emit("3.5.6", "SRSF2 productive fraction under SMG1i, MV (%)", 100 * .sr2("prodfrac_SMG"),
+           published = "26", population = SRSF2_POP)
+```
+
+```{r dna-down-examples}
+dna_set <- unique(c(
+  go_to_symbols(c("GO:0006281","GO:0006260","GO:0006310")),       # DNA repair, replication, recombination
+  if (exists("down_sets")) down_sets$DNArep else character(0)))    # Hallmark DNA_REPAIR if Step 16 ran
+
+dna_down <- prod_dir_mashr %>%
+  dplyr::filter(gene_category=="NMD", dir=="down", hgnc_symbol %in% dna_set) %>%
+  dplyr::left_join(base %>% dplyr::select(ct, gene_id, prodCPM_DMSO, prodCPM_SMG_adj,
+        unprod_gain, custom, prodfrac_DMSO, prodfrac_SMG), by=c("ct","gene_id")) %>%
+  dplyr::left_join(sr_long %>% dplyr::select(ct, gene_id, sr_logFC, sr_lfsr), by=c("ct","gene_id")) %>%
+  classify_mech("down") %>%
+  dplyr::arrange(custom)
+
+cat(sprintf("DNA-repair/replication NMD genes with productive DOWN: %d gene-CT rows\n", nrow(dna_down)))
+print(head(dna_down %>% dplyr::transmute(hgnc_symbol, ct,
+  prod_DMSO=round(prodCPM_DMSO,1), prod_SMG=round(prodCPM_SMG_adj,1),
+  unprod_gain=round(unprod_gain,1), custom=round(custom,2),
+  prodfrac_DMSO=round(prodfrac_DMSO,2), prodfrac_SMG=round(prodfrac_SMG,2),
+  sr_logFC=round(sr_logFC,2), mechanism), 20), row.names=FALSE)
+
+# ── Claim 3.5.6 — PCNA in LAE ───────────────────────────────────────────────────────────
+# Read from the unrounded columns, same as SRSF2 above, with each published figure declared at the
+# precision the paper printed. Note the productive fraction: the code gives 99.5% -> 92.5% and the
+# manuscript prints "100% to 93%", so both endpoints are rounded UP -- the "100%" is not 100.
+#
+# CAVEAT ON THE ROW ITSELF, worth recording because it is a reproducibility hazard rather than a
+# value error: dna_set is a GO-derived union that also absorbs a Hallmark DNA-repair set
+# conditionally on whether an earlier step ran in the same session, so whether PCNA appears in
+# this table at all is session-order-dependent. The GO lookups are org.Hs.eg.db-version-dependent
+# as well (D25).
+PCNA_POP <- paste("PCNA in LAE: productive CPM under DMSO against ADJUSTED SMG1i, the adjusted",
+                  "productive log2 fold change, the productive fraction before and after, and the",
+                  "short-read gene-level log2 fold change; one row, from the NMD-susceptible",
+                  "productive-down DNA repair/replication candidates, a GO-derived set whose",
+                  "membership depends on the org.Hs.eg.db version")
+.pc <- function(col) { .i <- which(dna_down$hgnc_symbol == "PCNA" & dna_down$ct == "LAE")
+                       if (length(.i)) as.numeric(dna_down[[col]][.i[1]]) else NA_real_ }
+claim_emit("3.5.7", "PCNA productive CPM under DMSO, LAE", .pc("prodCPM_DMSO"),
+           published = "251", population = PCNA_POP)
+claim_emit("3.5.7", "PCNA productive CPM under adjusted SMG1i, LAE", .pc("prodCPM_SMG_adj"),
+           published = "130", population = PCNA_POP)
+claim_emit("3.5.7", "PCNA adjusted productive log2FC, LAE", .pc("custom"),
+           published = "-0.95", population = PCNA_POP)
+claim_emit("3.5.7", "PCNA productive fraction under DMSO, LAE (%)", 100 * .pc("prodfrac_DMSO"),
+           published = "100", population = PCNA_POP)
+claim_emit("3.5.7", "PCNA productive fraction under SMG1i, LAE (%)", 100 * .pc("prodfrac_SMG"),
+           published = "93", population = PCNA_POP)
+claim_emit("3.5.7", "PCNA short-read gene log2FC, LAE", .pc("sr_logFC"),
+           published = "-0.81", population = PCNA_POP)
+# "lost roughly half its productive output" -- a prose characterisation with no stored object, so
+# the ratio goes out as a supporting number rather than against the published 0.5.
+claim_emit("3.5.7", "PCNA productive CPM ratio, adjusted SMG1i over DMSO (paper says ~half)",
+           .pc("prodCPM_SMG_adj") / .pc("prodCPM_DMSO"), population = PCNA_POP)
+
+cat("\nMechanism tally among DNA-repair productive-down genes:\n")
+print(dna_down %>% dplyr::count(mechanism, name="n"))
+```
+
+```{r isopair-example-genes}
+suppressPackageStartupMessages({
+  library(ggplot2); library(dplyr); library(tidyr); library(tibble)
+  library(patchwork); library(Isopair); library(scales)
+})
+select <- dplyr::select; filter <- dplyr::filter   # re-assert dplyr masking (Isopair loads its own select/filter)
+MIN_FRAC <- 0.05; MIN_CPM  <- 1; MAX_ISO  <- 8
+## ---- the three examples: gene, CT (display code), and its story ----
+EXAMPLES <- tibble::tribble(
+  ~gene,    ~ct,   ~subtitle,
+  "SHMT2",  "MV",  "ISR/ATF4 induction overrides NMD: unproductive isoform surges to the majority, yet productive output still rises",
+  "SRSF2",  "MV",  "Splicing-factor autoregulation: unproductive isoform surges, productive output falls",
+  "PCNA",   "LAE", "Transcriptional repression: whole-gene output falls, isoform composition preserved")
+ct_disp <- c(AT2="AT2", LAE="LAE", FB="FB", MV="MV")
+
+COMBINED_GTF <- file.path(.P$DEPOSIT, "nmd_isocall_4ct.gtf.gz")
+OUT_DIR_EX <- file.path(.P$OUT, "productive_response/examples")
+dir.create(OUT_DIR_EX, recursive = TRUE, showWarnings = FALSE)
+
+EXON_HALFH <- 0.22
+BODY <- 10; HEADER <- 12; TAG_SIZE <- 14
+PAL_NMD   <- c("Unproductive" = "#c0392b", "Productive" = "#16a085")
+TREAT_COL <- c("DMSO" = "grey25", "Smg1i" = "#C0392B")
+
+make_example_fig <- function(EXAMPLE_GENE, EXAMPLE_CT, FIG_SUB) {
+  ctd <- ct_disp[[EXAMPLE_CT]]
+  gid <- iso2gene %>% filter(hgnc_symbol == EXAMPLE_GENE) %>% pull(gene_id) %>% unique()
+  if (length(gid) == 0) { cat(sprintf("** %s not found\n", EXAMPLE_GENE)); return(NULL) }
+  gid <- gid[1]
+  TARGETS <- iso2gene %>% filter(gene_id == gid) %>% pull(isoform_id) %>% unique()
+
+  iso_status <- data.frame(
+    isoform_id = lfsr_iso$isoform_id,
+    lfsr = lfsr_iso[[resolve_mash_col(lfsr_iso, EXAMPLE_CT)]],
+    pm   = pm_iso[[resolve_mash_col(pm_iso,   EXAMPLE_CT)]]) %>%
+    filter(isoform_id %in% TARGETS) %>%
+    mutate(nmd_class = ifelse(!is.na(lfsr) & !is.na(pm) & lfsr < LFSR_NMD_THR & pm > 0,
+                              "Unproductive", "Productive")) %>%
+    arrange(desc(nmd_class), isoform_id)
+
+  cs <- rownames(samples)[samples$cell_type == EXAMPLE_CT]
+  cpm_ct <- edgeR::cpm(counts_iso[, cs, drop = FALSE], log = FALSE)
+  keep <- rownames(cpm_ct)[rowMeans(cpm_ct[, , drop=FALSE]) >= 1]
+  iso_status <- iso_status %>% filter(isoform_id %in% keep)
+  if (nrow(iso_status) < 2) { cat(sprintf("** %s: <2 expressed isoforms\n", EXAMPLE_GENE)); return(NULL) }
+
+  structures <- parseIsoformStructures(COMBINED_GTF, isoform_ids = iso_status$isoform_id, verbose = FALSE)
+  iso_status <- iso_status %>% filter(isoform_id %in% structures$isoform_id)
+  ISOFORMS <- iso_status$isoform_id
+  strand <- structures$strand[1]
+  y_centers <- setNames(seq(length(ISOFORMS), 1L), ISOFORMS)
+
+  make_introns <- function(iso){ s<-structures[structures$isoform_id==iso,]
+    es<-s$exon_starts[[1]]; ee<-s$exon_ends[[1]]; o<-order(es); es<-es[o]; ee<-ee[o]
+    if(length(es)<=1L) return(NULL)
+    data.frame(isoform_id=iso, x=ee[-length(ee)], xend=es[-1L]) }
+  introns <- bind_rows(lapply(ISOFORMS, make_introns))
+  if (nrow(introns)) { introns$y <- y_centers[introns$isoform_id]; introns$yend <- introns$y }
+  make_chevrons <- function(intr, strand, arm_size=0.07, min_intron_bp=30){
+    if(is.null(intr)||nrow(intr)==0) return(NULL)
+    rng <- max(intr$xend)-min(intr$x); spacing <- max(rng*0.03, 200); arm_w_default <- spacing*0.3
+    out<-list()
+    for(i in seq_len(nrow(intr))){ a<-intr$x[i]; b<-intr$xend[i]; yv<-intr$y[i]; len<-b-a
+      if(len<min_intron_bp) next; arm_w<-min(arm_w_default,len*0.4)
+      nch<-max(1L,floor(len/spacing)); step<-len/(nch+1); cxs<-a+step*seq_len(nch)
+      for(cx in cxs){ if(strand=="+"){xs<-c(cx-arm_w,cx-arm_w)}else{xs<-c(cx+arm_w,cx+arm_w)}
+        out[[length(out)+1L]]<-data.frame(x=xs,xend=c(cx,cx),y=c(yv+arm_size,yv-arm_size),yend=c(yv,yv)) } }
+    if(length(out)) do.call(rbind,out) else NULL }
+  chevrons <- bind_rows(lapply(ISOFORMS, function(iso) make_chevrons(introns[introns$isoform_id==iso,], strand)))
+
+  regs <- bind_rows(lapply(ISOFORMS, function(iso){ s<-structures[structures$isoform_id==iso,]
+    data.frame(isoform_id=iso, xmin=s$exon_starts[[1]], xmax=s$exon_ends[[1]]) }))
+  regs$y_center <- y_centers[regs$isoform_id]
+  regs$nmd_class <- iso_status$nmd_class[match(regs$isoform_id, iso_status$isoform_id)]
+  regs$ymin <- regs$y_center - EXON_HALFH; regs$ymax <- regs$y_center + EXON_HALFH
+
+  x_min<-min(regs$xmin); x_max<-max(regs$xmax); x_buf<-max((x_max-x_min)*0.04,50)
+  label_df <- tibble(x=x_min-x_buf*1.5, y=y_centers[ISOFORMS], isoform_id=ISOFORMS) %>%
+    left_join(iso_status %>% select(isoform_id,nmd_class), by="isoform_id") %>% mutate(label=isoform_id)
+
+  p_A <- ggplot() +
+    { if (nrow(introns)) geom_segment(data=introns, aes(x,xend=xend,y=y,yend=yend), color="gray55", linewidth=0.4) } +
+    { if (!is.null(chevrons)&&nrow(chevrons)) geom_segment(data=chevrons, aes(x,xend=xend,y=y,yend=yend), color="gray55", linewidth=0.3) } +
+    geom_rect(data=regs, aes(xmin=xmin,xmax=xmax,ymin=ymin,ymax=ymax,fill=nmd_class), color="black", linewidth=0.3) +
+    scale_fill_manual(values=PAL_NMD, breaks=c("Unproductive","Productive"), name=NULL) +
+    geom_text(data=label_df, aes(x,y,label=label,colour=nmd_class), hjust=1, size=3.0, fontface="bold") +
+    scale_colour_manual(values=PAL_NMD, guide="none") +
+    scale_y_continuous(breaks=NULL, limits=c(min(y_centers)-0.5, max(y_centers)+0.5)) +
+    coord_cartesian(xlim=c(x_min-x_buf*4, x_max+x_buf), clip="off") +
+    labs(x=sprintf("Genomic position (%s strand)", strand), y=NULL,
+         title=sprintf("%s isoforms — structure and NMD status in %s", EXAMPLE_GENE, ctd)) +
+    theme_minimal() +
+    theme(panel.grid.major.y=element_blank(), panel.grid.minor=element_blank(),
+          legend.position="bottom", plot.title=element_text(size=HEADER,face="bold"),
+          plot.margin=margin(5,10,5,110))
+
+  cpmL <- edgeR::cpm(counts_iso[ISOFORMS, cs, drop=FALSE], log=TRUE, prior.count=1)
+  dcols <- cs[samples[cs,"treatment"]=="DMSO"]; scols <- cs[samples[cs,"treatment"]=="Smg1i"]
+  expr <- data.frame(isoform_id=rownames(cpmL),
+                     DMSO=rowMeans(cpmL[,dcols,drop=FALSE]),
+                     Smg1i=rowMeans(cpmL[,scols,drop=FALSE])) %>%
+    mutate(isoform_id=factor(isoform_id, levels=rev(ISOFORMS)))
+  expr_long <- expr %>% pivot_longer(c(DMSO,Smg1i), names_to="treatment", values_to="log2cpm")
+  yax_col <- PAL_NMD[iso_status$nmd_class[match(rev(ISOFORMS), iso_status$isoform_id)]]
+  p_B <- ggplot() +
+    geom_segment(data=expr, aes(x=DMSO,xend=Smg1i,y=isoform_id,yend=isoform_id), color="grey70", linewidth=0.8) +
+    geom_point(data=expr_long, aes(log2cpm,isoform_id,color=treatment), size=3) +
+    scale_color_manual(values=TREAT_COL, name=NULL) +
+    labs(x="log2(CPM)", y=NULL, title=paste0(EXAMPLE_GENE," expression in ",ctd),
+         subtitle="TMM-normalised; mean DMSO vs Smg1i") +
+    theme_minimal(base_size=BODY) +
+    theme(panel.grid.minor=element_blank(), panel.grid.major.y=element_blank(),
+          legend.position="top", plot.title=element_text(face="bold",size=HEADER),
+          plot.subtitle=element_text(color="gray30",size=BODY), axis.text.y=element_text(color=yax_col))
+
+  donors <- unique(samples[cs,"sample_id"])
+  cpm_lin <- edgeR::cpm(counts_iso[, cs, drop=FALSE], log=FALSE)
+  fc <- bind_rows(lapply(ISOFORMS, function(iso){
+    v <- vapply(donors, function(d){
+      dc <- rownames(samples)[samples$cell_type==EXAMPLE_CT & samples$sample_id==d & samples$treatment=="DMSO"]
+      sc <- rownames(samples)[samples$cell_type==EXAMPLE_CT & samples$sample_id==d & samples$treatment=="Smg1i"]
+      if (length(dc)!=1 || length(sc)!=1) return(NA_real_)
+      log2((cpm_lin[iso,sc]+1)/(cpm_lin[iso,dc]+1)) }, numeric(1))
+    v <- v[is.finite(v)]
+    data.frame(isoform_id=iso, logFC=mean(v), se=ifelse(length(v)>1, sd(v)/sqrt(length(v)), NA), n=length(v)) })) %>%
+    left_join(iso_status %>% select(isoform_id, nmd_class, lfsr), by="isoform_id") %>%
+    mutate(CI.L=logFC-1.96*se, CI.R=logFC+1.96*se,
+           isoform_id=factor(isoform_id, levels=rev(ISOFORMS)), sig=lfsr<0.05)
+  p_C <- ggplot(fc, aes(logFC, isoform_id)) +
+    geom_vline(xintercept=0, color="grey60", linetype="dashed") +
+    geom_pointrange(aes(xmin=CI.L, xmax=CI.R, color=nmd_class, shape=sig), size=0.5, linewidth=0.7) +
+    scale_color_manual(values=PAL_NMD, name=NULL) +
+    scale_shape_manual(values=c(`TRUE`=16,`FALSE`=1), breaks=c("TRUE","FALSE"),
+                       labels=c("lfsr < 0.05","n.s."), name=NULL) +
+    labs(x="Smg1i log2 fold-change (donor-paired, 95% CI)", y=NULL,
+         title=paste0("Smg1i effect on ",EXAMPLE_GENE," (",ctd,")"),
+         subtitle="per-isoform, donor-paired; colored by NMD class") +
+    theme_minimal(base_size=BODY) +
+    theme(panel.grid.minor=element_blank(), panel.grid.major.y=element_blank(),
+          legend.position="top", plot.title=element_text(face="bold",size=HEADER),
+          plot.subtitle=element_text(color="gray30",size=BODY))
+
+  bottom <- (p_B + labs(title=NULL,subtitle=NULL)) +
+            (p_C + labs(title=NULL,subtitle=NULL) +
+               theme(axis.text.y=element_blank(), axis.ticks.y=element_blank())) +
+            plot_layout(widths=c(1.25,1))
+  combined <- (p_A + labs(title=NULL,subtitle=NULL)) / bottom +
+    plot_layout(heights=c(1.55,1)) +
+    plot_annotation(tag_levels="A",
+      title=sprintf("%s in %s", EXAMPLE_GENE, ctd), subtitle=FIG_SUB) &
+    theme(plot.tag=element_text(face="bold",size=TAG_SIZE),
+          plot.title=element_text(face="bold",size=HEADER),
+          plot.subtitle=element_text(color="gray30",size=BODY),
+          plot.background=element_rect(color="grey25",fill=NA,linewidth=0.5),
+          plot.margin=margin(6,6,6,6))
+
+  ggsave(file.path(OUT_DIR_EX, sprintf("FIG_%s_%s.pdf", EXAMPLE_GENE, EXAMPLE_CT)),
+         combined, width=13, height=9, units="in")
+  ggsave(file.path(OUT_DIR_EX, sprintf("FIG_%s_%s.png", EXAMPLE_GENE, EXAMPLE_CT)),
+         combined, width=13, height=9, units="in", dpi=300)
+  print(combined)
+  cat(sprintf("Saved %s (%s): %d isoforms (%d unproductive)\n",
+              EXAMPLE_GENE, ctd, nrow(iso_status), sum(iso_status$nmd_class=="Unproductive")))
+  invisible(combined)
+}
+
+for (i in seq_len(nrow(EXAMPLES)))
+  make_example_fig(EXAMPLES$gene[i], EXAMPLES$ct[i], EXAMPLES$subtitle[i])
+```
+
+```{r specific-splicing}
+splice_set <- go_to_symbols(c("GO:0008380","GO:0000380","GO:0043484"))   # RNA splicing + reg. of AS
+sf_curated <- c(paste0("SRSF",1:12),
+                paste0("HNRNP",c("A1","A2B1","A3","C","D","F","H1","K","L","M","U")),
+                "TRA2A","TRA2B","RBM39","PTBP1","PTBP2","RBFOX2","CELF1","MBNL1")
+
+enrich_down_byset <- function(set,label) dplyr::bind_rows(lapply(CELL_TYPES,function(ct_i)
+  dplyr::bind_rows(lapply(MAIN_CATS,function(cl){
+    d   <- dplyr::filter(prod_dir_mashr, ct==ct_i, gene_category==cl)
+    hit <- unique(d$hgnc_symbol[d$dir=="down"]); bg <- unique(d$hgnc_symbol)
+    ft  <- safe_fisher(bg %in% hit, bg %in% set)
+    data.frame(set=label, ct=ct_i, class=cl, n_down=length(hit),
+               n_down_in_set=sum(hit %in% set),
+               OR=round(as.numeric(ft$estimate),2), p=signif(ft$p.value,3)) }))))
+kable(enrich_down_byset(splice_set,"RNA splicing (GO)"),
+      caption="Splicing-regulation genes enriched among productive-DOWN genes (one-sided Fisher).")
+kable(enrich_down_byset(sf_curated,"SR/hnRNP curated"),
+      caption="Curated SR/hnRNP factors enriched among productive-DOWN genes.")
+
+kable(prod_dir_mashr %>% dplyr::filter(hgnc_symbol %in% paste0("SRSF",1:12)) %>%
+        dplyr::group_by(ct) %>%
+        dplyr::summarise(n_SR_tested=dplyr::n_distinct(hgnc_symbol),
+                  n_SR_down=dplyr::n_distinct(hgnc_symbol[dir=="down"]),
+                  n_SR_up=dplyr::n_distinct(hgnc_symbol[dir=="up"]), .groups="drop"),
+      caption="Canonical SR proteins (SRSF1-12): productive direction per cell type.")
+
+# ── Claim 3.4.3 — "of the 12 canonical SR proteins" ─────────────────────────────────────
+# THE DENOMINATOR THE CODE TESTS IS 11, NOT 12, AND THE REASON IS NOT EXPRESSION. SRSF12 clears
+# the expression floor and IS tested by limma in AT2; it is dropped by mashr's COMPLETE-CASE
+# requirement -- a finite effect and positive SE in ALL FOUR cell types -- because it clears the
+# keep filter in AT2 only. So "the 12 canonical SR proteins" is the size of the query literal
+# paste0("SRSF", 1:12), while every count below is over the 11 that survive to be tested. Both
+# are emitted so the gap is on the record rather than resolved silently.
+#
+# The claim also asserts that EVERY significant change was a decrease, so the increase counts are
+# emitted too -- a claim of the form "all X were Y" is only checkable if not-Y is counted.
+SR_POP <- paste("canonical SRSF genes testable in ALL FOUR cell types after mashr's complete-case",
+                "filter (11 of the 12 queried; SRSF12 fails the keep filter outside AT2), counted",
+                "per cell type by productive direction at lfsr < 0.05")
+.srt <- prod_dir_mashr %>% dplyr::filter(hgnc_symbol %in% paste0("SRSF", 1:12)) %>%
+  dplyr::group_by(ct) %>%
+  dplyr::summarise(tested = dplyr::n_distinct(hgnc_symbol),
+                   down = dplyr::n_distinct(hgnc_symbol[dir == "down"]),
+                   up = dplyr::n_distinct(hgnc_symbol[dir == "up"]), .groups = "drop")
+claim_emit("3.4.3", "canonical SR proteins queried (the published denominator)",
+           length(paste0("SRSF", 1:12)), published = "12",
+           n = length(paste0("SRSF", 1:12)), population = SR_POP)
+claim_emit("3.4.3", "canonical SR proteins actually tested", max(.srt$tested),
+           n = max(.srt$tested), population = SR_POP)
+for (.i in seq_len(nrow(.srt))) {
+  .c <- as.character(.srt$ct[.i])
+  claim_emit("3.4.3", sprintf("SR proteins with a significant productive DECREASE, %s", .c),
+             .srt$down[.i],
+             published = switch(.c, LAE = "8", AT2 = "3", MV = "2", NULL),
+             n = .srt$tested[.i], population = SR_POP)
+  claim_emit("3.4.3", sprintf("SR proteins with a significant productive INCREASE, %s (claim says none)", .c),
+             .srt$up[.i], n = .srt$tested[.i], population = SR_POP)
+}
+
+kable(base %>% dplyr::filter(hgnc_symbol %in% sf_curated) %>%
+        dplyr::group_by(ct) %>%
+        dplyr::summarise(n=dplyr::n(), median_custom=round(median(custom),3),
+                  pct_down_0.3=round(100*mean(custom < -DROP_THR),1),
+                  wilcox_p=signif(suppressWarnings(wilcox.test(custom)$p.value),3), .groups="drop"),
+      caption="Productive log2FC of curated splicing factors per CT (median; Wilcoxon vs 0).")
+```
+
+# SUPPLEMENT
+
+## S0 — The uncertain group on every distribution
+
+```{r S0-unsure-dists, fig.height=4}
+ALL3 <- c("NMD","non-NMD","unsure")
+print(plot_dist(base, "custom",          "Adjusted productive log2FC — incl. unsure", xlab="productive log2 fold-change (adjusted)", cats=ALL3, xlim=c(-2,2), vline=0))
+print(plot_dist(base, "prod_shift_adj",  "Productive-only output shift (neg = lower in SMG1i) — incl. unsure", xlab="change in productive output (fraction of DMSO gene total)", cats=ALL3, xlim=c(-0.5,0.5), vline=0))
+print(plot_dist(base, "prodfrac_change", "Productive-SHARE change (incl. surge) — incl. unsure", xlab="change in productive fraction of the gene", cats=ALL3, xlim=c(-0.75,0.5), vline=0))
+print(plot_dist(base, "prodCPM_DMSO",    "DMSO productive CPM — incl. unsure",         xlab="productive CPM (DMSO)", cats=ALL3, logx=TRUE))
+print(plot_dist(base, "prodCPM_SMG_adj", "Adjusted SMG1i productive CPM — incl. unsure", xlab="productive CPM (SMG1i, adjusted)", cats=ALL3, logx=TRUE))
+kable(med_tab(base, "custom", cats=ALL3), caption="TABLE S0. Adjusted productive log2FC including the unsure group.")
+```
+
+```{r S0-unsure-box, fig.height=4}
+g3 <- base %>% mutate(gene_category=factor(gene_category, levels=c("NMD","unsure","non-NMD")))
+print(ggplot(g3, aes(gene_category, custom, fill=gene_category)) +
+  geom_hline(yintercept=0, colour="grey40") +
+  geom_boxplot(outlier.size=0.3, outlier.alpha=0.2, width=0.65, colour="grey25") +
+  facet_wrap(~ct, nrow=1) + coord_cartesian(ylim=c(-1.2,1.2)) +
+  scale_fill_manual(values=cat_colors, guide="none") +
+  labs(x=NULL, y="productive log2FC (custom)", title="FIGURE S0. Including the uncertain group") +
+  theme_bw(base_size=11) + theme(strip.background=element_rect(fill="grey92")))
+```
+
+## S1 — Concordance: custom vs raw (Kitagawa)
+
+```{r S1-concordance, fig.height=4}
+agree <- base %>% filter(gene_category %in% MAIN_CATS) %>% group_by(ct) %>%
+  summarise(n=n(), pearson=round(cor(custom, Kitagawa),3),
+            spearman=round(cor(custom, Kitagawa, method="spearman"),3),
+            median_custom_minus_Kitagawa=round(median(custom-Kitagawa),3), .groups="drop")
+kable(agree, caption="TABLE S1. Per-gene agreement between custom and raw (Kitagawa).")
+
+# ── Claim 3.2.2, first half — "Spearman >= 0.99 between adjusted and uncorrected" ────────
+# AN INEQUALITY OVER FOUR CELL TYPES, so the MINIMUM is the quantity that bears on it: ">= 0.99"
+# is false if any one cell type falls below. Per-cell-type values as support.
+AGREE_POP <- paste("genes in the NMD and matched non-NMD categories, correlating the ADJUSTED",
+                   "productive log2 fold change against the UNCORRECTED (Kitagawa) one within each",
+                   "cell type, then taking the worst cell type; Spearman")
+# INEQUALITY, so SUPPORT with the bound named -- the same convention the p-values follow. The
+# paper says ">= 0.99"; the minimum is 0.998, which satisfies it. Emitting against a point value
+# scored it as a disagreement at 2 dp, which is my error and not a finding about the paper.
+claim_emit("3.2.2", "lowest per-cell-type Spearman, adjusted vs uncorrected (paper states >= 0.99)",
+           min(agree$spearman), n = sum(agree$n), population = AGREE_POP)
+for (.i in seq_len(nrow(agree))) {
+  claim_emit("3.2.2", sprintf("Spearman adjusted vs uncorrected, %s", agree$ct[.i]),
+             agree$spearman[.i], n = agree$n[.i], population = AGREE_POP)
+}
+print(ggplot(base %>% filter(gene_category %in% MAIN_CATS), aes(Kitagawa, custom, colour=gene_category)) +
+  geom_abline(slope=1, intercept=0, linetype="dashed", colour="grey50") +
+  geom_point(alpha=0.1, size=0.4) + facet_wrap(~ct, nrow=1) +
+  coord_cartesian(xlim=c(-1.5,1.5), ylim=c(-1.5,1.5)) +
+  scale_colour_manual(values=cat_colors, name=NULL) +
+  labs(title="FIGURE S1. custom vs Kitagawa per gene (dashed = identity)") +
+  theme_bw(base_size=11) + theme(strip.background=element_rect(fill="grey92"), legend.position="top"))
+```
+
+## S2 — Down-isoform genes
+
+```{r S2-down, fig.height=4.5}
+down_tab <- bind_rows(lapply(CELL_TYPES, function(ct) data.frame(ct=ct, gene_id=down_iso_genes(ct), stringsAsFactors=FALSE)))
+grp_dn <- bind_rows(
+  base %>% transmute(ct, custom, group=gene_category),
+  base %>% inner_join(down_tab, by=c("ct","gene_id")) %>% transmute(ct, custom, group="down-isoform")
+) %>% mutate(group=factor(group, levels=c("NMD","unsure","non-NMD","down-isoform")))
+kable(grp_dn %>% group_by(ct, group) %>%
+        summarise(n=n(), median_custom=round(median(custom),3),
+                  pct_down_0.3=round(100*mean(custom < -DROP_THR),1), .groups="drop") %>%
+        pivot_wider(names_from=group, values_from=c(n, median_custom, pct_down_0.3)),
+      caption="TABLE S2. Productive change for categories + the down-isoform group (overlapping membership).")
+ov_tab <- bind_rows(lapply(CELL_TYPES, function(ct){
+  dn <- down_iso_genes(ct); nm <- nmd_iso_genes(ct); k <- length(intersect(dn, nm))
+  data.frame(ct=ct, n_down_gene=length(dn), n_down_with_NMD_iso=k,
+             pct_with_NMD_iso=round(100*k/length(dn),1), n_down_only=length(setdiff(dn,nm)))
+}))
+kable(ov_tab, caption="TABLE S2b. Of down-isoform genes, fraction also carrying an NMD (up) isoform vs down-only.")
+```
+
+```{r S2-down-topgo, eval = requireNamespace("topGO", quietly=TRUE) && requireNamespace("org.Hs.eg.db", quietly=TRUE)}
+if (exists("run_bp")) for (ct_i in CELL_TYPES){
+  uni <- base$gene_id[base$ct==ct_i]
+  run_bp(uni, intersect(down_iso_genes(ct_i), uni), sprintf("down-isoform | %s (all)", ct_i))
+  run_bp(uni, intersect(setdiff(down_iso_genes(ct_i), nmd_iso_genes(ct_i)), uni),
+         sprintf("down-isoform | %s (down-only)", ct_i))
+}
+```
+
+## S3 — Where do short-read DOWN-regulated genes land? (split by NMD-isoform status)
+
+```{r S3-sr-down-split, fig.height=4.5}
+sr_down <- sr_long %>% filter(!is.na(sr_lfsr), !is.na(sr_logFC), sr_lfsr<0.05, sr_logFC<0) %>%
+  select(ct, gene_id) %>% distinct()
+nmd_iso_tab <- bind_rows(lapply(CELL_TYPES, function(ct) data.frame(ct=ct, gene_id=nmd_iso_genes(ct), stringsAsFactors=FALSE)))
+sr_down_split <- sr_down %>%
+  mutate(has_nmd_iso = paste(ct,gene_id) %in% paste(nmd_iso_tab$ct, nmd_iso_tab$gene_id)) %>%
+  mutate(group = ifelse(has_nmd_iso, "SR-down (NMD-iso)", "SR-down (no NMD-iso)"))
+grp_sr <- bind_rows(
+  base %>% filter(gene_category %in% MAIN_CATS) %>% transmute(ct, custom, group=gene_category),
+  base %>% inner_join(sr_down_split %>% select(ct, gene_id, group), by=c("ct","gene_id")) %>%
+    transmute(ct, custom, group)
+) %>% mutate(group=factor(group, levels=c("NMD","non-NMD","SR-down (NMD-iso)","SR-down (no NMD-iso)")))
+kable(grp_sr %>% group_by(ct, group) %>%
+        summarise(n=n(), median_custom=round(median(custom),3),
+                  pct_down_0.3=round(100*mean(custom < -DROP_THR),1), .groups="drop") %>%
+        pivot_wider(names_from=group, values_from=c(n, median_custom, pct_down_0.3)),
+      caption="TABLE S3. SR-down genes split by NMD-isoform status vs NMD and non-NMD baselines.")
+print(ggplot(grp_sr, aes(group, custom, fill=group)) +
+  geom_hline(yintercept=0, colour="grey40") +
+  geom_boxplot(outlier.size=0.3, outlier.alpha=0.2, width=0.6, colour="grey25") +
+  facet_wrap(~ct, nrow=1) + coord_cartesian(ylim=c(-1.5,1.5)) +
+  scale_fill_manual(values=c("NMD"="#c0392b","non-NMD"="#7f8c8d",
+                             "SR-down (NMD-iso)"="#8e44ad","SR-down (no NMD-iso)"="#2980b9"), guide="none") +
+  labs(x=NULL, y="productive log2FC (custom)", title="FIGURE S3. SR down-regulated genes, split by NMD-isoform status") +
+  theme_bw(base_size=11) + theme(strip.background=element_rect(fill="grey92"), axis.text.x=element_text(angle=20, hjust=1)))
+```
+
+```{r S3-sr-down-topgo, eval = requireNamespace("topGO", quietly=TRUE) && requireNamespace("org.Hs.eg.db", quietly=TRUE)}
+if (exists("run_bp")) for (ct_i in CELL_TYPES){
+  uni <- base$gene_id[base$ct==ct_i]
+  run_bp(uni, intersect(sr_down_split$gene_id[sr_down_split$ct==ct_i & sr_down_split$has_nmd_iso],  uni), sprintf("SR-down NMD-iso | %s", ct_i))
+  run_bp(uni, intersect(sr_down_split$gene_id[sr_down_split$ct==ct_i & !sr_down_split$has_nmd_iso], uni), sprintf("SR-down no-NMD-iso | %s", ct_i))
+}
+```
+
+## S4 — Per-donor productive change with error bars
+
+```{r S4-perdonor-candidate, fig.height=4}
+perdonor <- gene_sample %>%
+  filter(gene_category %in% MAIN_CATS, !is.na(prodCPM_DMSO), !is.na(prodCPM_SMG_adj)) %>%
+  mutate(custom_d = log2((prodCPM_SMG_adj+1)/(prodCPM_DMSO+1)))
+pd_sum <- perdonor %>% group_by(ct, donor, gene_category) %>%
+  summarise(median_custom=median(custom_d, na.rm=TRUE), .groups="drop")
+print(ggplot(pd_sum, aes(gene_category, median_custom, colour=gene_category)) +
+  geom_hline(yintercept=0, colour="grey70") +
+  geom_point(position=position_jitter(width=0.12), size=2, alpha=0.8) +
+  stat_summary(fun=median, geom="crossbar", width=0.5, colour="black", linewidth=0.3) +
+  facet_wrap(~ct, nrow=1) +
+  scale_colour_manual(values=cat_colors, guide="none") +
+  labs(x=NULL, y="per-donor median productive log2FC (custom)",
+       title="S4. Per-donor productive change (each point = one donor)") +
+  theme_bw(base_size=11) + theme(strip.background=element_rect(fill="grey92")))
+```
+
+## S5 — Kitagawa on all significant NMD genes (FB excluded)
+
+```{r kitagawa-on-all}
+# General Kitagawa result: all significant NMD genes (up or down), mashr-called (AT2/LAE/MV)
+kit_nmd_table() %>% dplyr::count(driver) %>% dplyr::mutate(pct = round(100*n/sum(n),1))
+
+# ── Claim 3.3.2 — level vs composition across all significant NMD genes ─────────────────
+# FB IS EXCLUDED from every Kitagawa number in this report (kit_nmd_table's exclude_fb default),
+# and the manuscript's "across all NMD susceptible genes" does not say so. The shares are pooled
+# over gene x cell-type rows, not averaged over cell types -- a distinction that matters here
+# because 3.2.4 in the same section uses the average instead.
+KIT_POP <- paste("NMD-category genes with a significant productive change, classified by the",
+                 "Kitagawa decomposition into level-driven or composition-driven; AT2/LAE/MV only",
+                 "-- FB is EXCLUDED by kit_nmd_table(exclude_fb = TRUE), so no share here is over",
+                 "all four cell types, and the shares are POOLED over gene x cell-type rows rather",
+                 "than averaged across cell types")
+# THE LEVEL NAMES ARE "level-dominated" / "composition-dominated", set at :206 by
+# ifelse(abs(composition) > abs(level), ...). My first version matched the bare words "level" and
+# "composition" and every one of these six emissions returned NA -- which the checker reported as
+# six disagreements with the paper rather than as six broken call sites. A string match against a
+# factor level is exactly the kind of thing only a run can settle.
+#
+# That ifelse also yields NA when either input is missing, so NA IS A THIRD CATEGORY and the two
+# named shares need not sum to 100 -- which is why the published 99.2 + 0.3 falls short.
+.k <- kit_nmd_table() %>% dplyr::count(driver) %>% dplyr::mutate(pct = 100*n/sum(n))
+.kget <- function(d) { .i <- which(.k$driver == d); if (length(.i)) .k$pct[.i] else NA_real_ }
+claim_emit("3.3.2", "level-driven share of significant NMD genes (%)", .kget("level-dominated"),
+           published = "87.4", n = sum(.k$n), population = KIT_POP)
+claim_emit("3.3.2", "composition-driven share of significant NMD genes (%)", .kget("composition-dominated"),
+           published = "12.6", n = sum(.k$n), population = KIT_POP)
+```
+
+## S6 — Productive-DOWN: does it co-occur with a down-isoform, and which mechanism?
+
+```{r check-die-down}
+prod_down <- prod_dir_mashr %>% dplyr::filter(dir=="down") %>%
+  dplyr::select(ct, gene_id) %>% dplyr::distinct() %>% dplyr::mutate(prod_down=TRUE)
+down_iso <- dplyr::bind_rows(lapply(CELL_TYPES, function(ct)
+  data.frame(ct=ct, gene_id=down_iso_genes(ct), down_iso=TRUE)))
+
+cmp_di <- prod_dir_mashr %>% dplyr::select(ct, gene_id) %>% dplyr::distinct() %>%
+  dplyr::left_join(prod_down, by=c("ct","gene_id")) %>%
+  dplyr::left_join(down_iso,  by=c("ct","gene_id")) %>%
+  dplyr::mutate(prod_down=!is.na(prod_down), down_iso=!is.na(down_iso))
+
+xtab <- dplyr::bind_rows(lapply(CELL_TYPES, function(ct_i){
+  d <- cmp_di %>% dplyr::filter(ct==ct_i)
+  ft <- fisher.test(table(factor(d$prod_down,c(F,T)), factor(d$down_iso,c(F,T))), alternative="greater")
+  data.frame(ct=ct_i, n=nrow(d),
+             prod_down=sum(d$prod_down), down_iso=sum(d$down_iso),
+             both=sum(d$prod_down & d$down_iso),
+             prod_down_only=sum(d$prod_down & !d$down_iso),
+             down_iso_only=sum(!d$prod_down & d$down_iso),
+             pct_proddown_with_downiso=round(100*mean(d$down_iso[d$prod_down]),1),
+             OR=round(as.numeric(ft$estimate),2), p=signif(ft$p.value,3))
+}))
+print(xtab, row.names=FALSE)
+
+mech <- cmp_di %>% dplyr::filter(prod_down) %>%
+  dplyr::left_join(base %>% dplyr::select(ct,gene_id,unprod_gain,custom,prodfrac_DMSO,prodfrac_SMG),
+                   by=c("ct","gene_id")) %>%
+  dplyr::left_join(sr_long %>% dplyr::select(ct,gene_id,sr_logFC), by=c("ct","gene_id")) %>%
+  dplyr::mutate(group=ifelse(down_iso,"prod-down WITH down-isoform","prod-down WITHOUT down-isoform")) %>%
+  dplyr::group_by(group) %>%
+  dplyr::summarise(n=dplyr::n(),
+            median_sr_logFC=round(median(sr_logFC,na.rm=TRUE),2),
+            median_unprod_gain=round(median(unprod_gain,na.rm=TRUE),2),
+            median_prodfrac_drop=round(median(prodfrac_SMG-prodfrac_DMSO,na.rm=TRUE),3),
+            .groups="drop")
+print(mech, row.names=FALSE)
+```
+
+## S6b — Down-arm mechanism split (transcriptional vs composition; AT2/LAE/MV)
+
+```{r down-arm-mechanism}
+# classify productive-down genes once (FB excluded: provisional CT)
+pd_mech <- prod_dir_mashr %>% dplyr::filter(dir=="down", ct != "FB") %>%
+  dplyr::left_join(base %>% dplyr::select(ct,gene_id,prodfrac_DMSO,prodfrac_SMG), by=c("ct","gene_id")) %>%
+  dplyr::left_join(sr_long %>% dplyr::select(ct,gene_id,sr_logFC), by=c("ct","gene_id")) %>%
+  classify_mech("down")
+cat("Down-arm mechanism split:\n")
+print(pd_mech %>% dplyr::count(mechanism) %>% dplyr::mutate(pct = round(100*n/sum(n),1)))
+
+trans_g    <- pd_mech %>% dplyr::filter(mechanism=="transcriptional") %>% dplyr::pull(gene_id) %>% unique()
+comp_g     <- pd_mech %>% dplyr::filter(mechanism=="composition")     %>% dplyr::pull(gene_id) %>% unique()
+universe_g <- unique(prod_dir_mashr$gene_id[prod_dir_mashr$ct != "FB"])
+cat(sprintf("transcriptional=%d | composition=%d | universe=%d\n", length(trans_g), length(comp_g), length(universe_g)))
+cat("\nTheme enrichment: transcriptional vs composition productive-down genes\n")
+print(theme_enrichment(trans_g, comp_g, universe_g), row.names=FALSE)
+
+# ── Claims 3.4.2 and 3.4.5 — theme enrichment, and two defects in the sentences ──────────
+# THE UNIVERSE IS THE FOUR-CELL-TYPE COMPLETE-CASE SET, which is not what it looks like. FB rows
+# are dropped above, but universe_g comes from prod_dir_mashr, and mashr requires a finite effect
+# and positive SE in ALL FOUR cell types -- so the gene set is the INTERSECTION of the four
+# per-cell-type limma keep sets (9,196 genes of a 14,558 union). FB's expression filter therefore
+# gates membership even though FB is excluded from the analysis, and ~5,362 genes tested in at
+# least one of AT2/LAE/MV never enter the background.
+#
+# AND THE TWO ARMS ARE NOT A PARTITION: 8 gene_ids appear in BOTH trans_g and comp_g, because
+# unique() collapses gene x cell type and a gene can be transcriptional in one cell type and
+# composition in another. "transcriptional vs composition" reads as exclusive and is not.
+#
+# The background also collapses gene_ids to HGNC symbols before the Fisher table, so the hit set
+# entering the 2x2 is smaller than length(trans_g) -- the counts are emitted both ways below.
+.te <- theme_enrichment(trans_g, comp_g, universe_g)
+.teget <- function(col, th) { .i <- which(.te$theme == th)
+                              if (length(.i)) as.numeric(.te[[col]][.i]) else NA_real_ }
+THEME_POP <- paste("one-sided Fisher test for enrichment of a theme among productive-down genes of",
+                   "one mechanism, against the background of genes testable in ALL FOUR cell types",
+                   "(mashr complete-case, so FB gates membership despite FB rows being excluded);",
+                   "hit sets and background are HGNC symbols collapsed from gene ids, and the two",
+                   "mechanism arms OVERLAP rather than partitioning. Theme membership for the GO",
+                   "sets is built at run time from org.Hs.eg.db, so it is version-dependent; the",
+                   "SR/hnRNP set is a hardcoded literal with no such dependency")
+claim_emit("3.4.2", "odds ratio, composition genes x RNA splicing", .teget("comp_OR","RNA splicing"),
+           published = "2.6", n = length(universe_g), population = THEME_POP)
+claim_emit("3.4.2", "odds ratio, composition genes x SR/hnRNP factors",
+           .teget("comp_OR","SR/hnRNP factors"), published = "6.8",
+           n = length(universe_g), population = THEME_POP)
+# Both p-values are published as the inequality p < 10^-3, so they are supporting numbers with
+# the threshold named rather than compared to a point value.
+claim_emit("3.4.2", "Fisher p, composition x RNA splicing (paper states p < 1e-3)",
+           .teget("comp_p","RNA splicing"), n = length(universe_g), population = THEME_POP)
+claim_emit("3.4.2", "Fisher p, composition x SR/hnRNP (paper states p < 1e-3)",
+           .teget("comp_p","SR/hnRNP factors"), n = length(universe_g), population = THEME_POP)
+# The word "specifically" needs the OTHER arm to be unremarkable, so it is emitted too.
+claim_emit("3.4.2", "odds ratio, TRANSCRIPTIONAL genes x RNA splicing (tests 'specifically')",
+           .teget("trans_OR","RNA splicing"), n = length(universe_g), population = THEME_POP)
+claim_emit("3.4.2", "odds ratio, TRANSCRIPTIONAL genes x SR/hnRNP (tests 'specifically')",
+           .teget("trans_OR","SR/hnRNP factors"), n = length(universe_g), population = THEME_POP)
+claim_emit("3.4.2", "genes in both mechanism arms (the arms are not exclusive)",
+           length(intersect(trans_g, comp_g)), n = length(universe_g), population = THEME_POP)
+
+# 3.4.5 -- ONE ODDS RATIO IS QUOTED FOR TWO THEMES. "DNA replication and repair (OR 2.1)": the
+# 2.1 is DNA REPLICATION alone. DNA REPAIR is a separate, weaker enrichment and the sentence
+# never gives it a number. Both are emitted, plus the composition-arm values, because "instead"
+# asserts the contrast rather than just the enrichment.
+claim_emit("3.4.5", "odds ratio, transcriptional genes x DNA replication",
+           .teget("trans_OR","DNA replication"), published = "2.1",
+           n = length(universe_g), population = THEME_POP)
+claim_emit("3.4.5", "odds ratio, transcriptional genes x DNA REPAIR (the theme with no quoted OR)",
+           .teget("trans_OR","DNA repair"), n = length(universe_g), population = THEME_POP)
+claim_emit("3.4.5", "Fisher p, transcriptional x DNA replication (paper states p < 1e-3)",
+           .teget("trans_p","DNA replication"), n = length(universe_g), population = THEME_POP)
+claim_emit("3.4.5", "odds ratio, COMPOSITION genes x DNA replication (tests 'instead')",
+           .teget("comp_OR","DNA replication"), n = length(universe_g), population = THEME_POP)
+claim_emit("3.4.5", "odds ratio, COMPOSITION genes x DNA repair (tests 'instead')",
+           .teget("comp_OR","DNA repair"), n = length(universe_g), population = THEME_POP)
+if (exists("run_bp")) { run_bp(universe_g, trans_g, "TRANSCRIPTIONAL productive-down (GO BP)")
+                        run_bp(universe_g, comp_g,  "COMPOSITION productive-down (GO BP)") }
+```
+
+```{r kitagawa-proof}
+# Kitagawa driver split by direction (AT2/LAE/MV)
+kit_nmd_table() %>% dplyr::count(dir, driver) %>%
+  dplyr::group_by(dir) %>% dplyr::mutate(pct=round(100*n/sum(n),1)) %>% dplyr::ungroup()
+
+# ── Claim 3.3.6 — the same split restricted to productive-DOWN genes ────────────────────
+# DENOMINATOR IS THE DOWN ARM ONLY, not all significant genes: the group_by(dir) above makes each
+# direction sum to 100% separately. So 32.1% composition and 67.9% level are shares OF THE DOWN
+# ARM, and pairing either with 3.3.2's whole-arm figures would compare different denominators.
+.kd <- kit_nmd_table() %>% dplyr::count(dir, driver) %>% dplyr::group_by(dir) %>%
+  dplyr::mutate(pct = 100*n/sum(n)) %>% dplyr::ungroup()
+.kdget <- function(d, dr) { .i <- which(.kd$dir == d & .kd$driver == dr)
+                            if (length(.i)) .kd$pct[.i] else NA_real_ }
+DOWN_POP <- paste("NMD-category genes whose productive output significantly DECREASED, classified",
+                  "level- or composition-driven; AT2/LAE/MV only (FB excluded); denominator is the",
+                  "down arm alone, not all significant genes")
+claim_emit("3.3.6", "composition-driven share of productive-DOWN NMD genes (%)",
+           .kdget("down","composition-dominated"), published = "32.1",
+           n = sum(.kd$n[.kd$dir == "down"]), population = DOWN_POP)
+claim_emit("3.3.6", "level-driven share of productive-DOWN NMD genes (%)",
+           .kdget("down","level-dominated"), published = "67.9",
+           n = sum(.kd$n[.kd$dir == "down"]), population = DOWN_POP)
+```
+
+## S7 — Up-arm mechanism split + decomposition + theme enrichment
+
+```{r up-arm-stuff}
+## ---- 1) mechanism classification of productive-UP genes (AT2/LAE/MV) ----
+pu <- prod_dir_mashr %>% dplyr::filter(dir=="up", ct != "FB") %>%
+  dplyr::left_join(base %>% dplyr::select(ct,gene_id,prodfrac_DMSO,prodfrac_SMG), by=c("ct","gene_id")) %>%
+  dplyr::left_join(sr_long %>% dplyr::select(ct,gene_id,sr_logFC), by=c("ct","gene_id")) %>%
+  classify_mech("up")
+cat("Up-arm mechanism split:\n")
+print(pu %>% dplyr::count(mechanism) %>% dplyr::mutate(pct = round(100*n/sum(n),1)))
+
+## ---- 2) Kitagawa decomposition on productive-UP genes ----
+cat("\nKitagawa decomposition (productive-UP):\n")
+print(kit_nmd_table() %>% dplyr::filter(dir=="up") %>%
+  dplyr::count(driver) %>% dplyr::mutate(pct=round(100*n/sum(n),1)))
+
+# ── Claim 3.3.4 — the up arm ────────────────────────────────────────────────────────────
+# Denominator is the UP arm alone, same construction as 3.3.6's down arm. Note 99.2 + 0.3 does
+# not reach 100: a third driver category carries the remainder, so "almost entirely level-driven
+# (99.2% level, 0.3% composition)" omits it rather than the two being complementary.
+.ku <- kit_nmd_table() %>% dplyr::filter(dir == "up") %>% dplyr::count(driver) %>%
+  dplyr::mutate(pct = 100*n/sum(n))
+.kuget <- function(d) { .i <- which(.ku$driver == d); if (length(.i)) .ku$pct[.i] else NA_real_ }
+UP_POP <- paste("NMD-category genes whose productive output significantly INCREASED, classified",
+                "level- or composition-driven; AT2/LAE/MV only (FB excluded); denominator is the",
+                "up arm alone")
+claim_emit("3.3.4", "level-driven share of productive-UP NMD genes (%)", .kuget("level-dominated"),
+           published = "99.7", n = sum(.ku$n), population = UP_POP)
+claim_emit("3.3.4", "composition-driven share of productive-UP NMD genes (%)",
+           .kuget("composition-dominated"), published = "0.3", n = sum(.ku$n), population = UP_POP)
+claim_emit("3.3.4", "share of productive-UP NMD genes in neither named category (%)",
+           100 - sum(.kuget("level-dominated"), .kuget("composition-dominated"), na.rm = TRUE),
+           n = sum(.ku$n), population = UP_POP)
+
+## ---- 3) theme enrichment: transcriptional-up vs composition-up ----
+trans_g    <- pu %>% dplyr::filter(mechanism=="transcriptional") %>% dplyr::pull(gene_id) %>% unique()
+comp_g     <- pu %>% dplyr::filter(mechanism=="composition")     %>% dplyr::pull(gene_id) %>% unique()
+universe_g <- unique(prod_dir_mashr$gene_id[prod_dir_mashr$ct != "FB"])
+cat(sprintf("\ntranscriptional-up=%d | composition-up=%d | universe=%d\n", length(trans_g), length(comp_g), length(universe_g)))
+# up arm adds the NF-kB set to the shared theme list
+sets_up <- c(THEME_SETS, list("NF-kB/TNFA (GO)" = go_to_symbols(c("GO:0051092","GO:0034612"))))
+cat("\nTheme enrichment: transcriptional-up vs composition-up\n")
+print(theme_enrichment(trans_g, comp_g, universe_g, sets_up), row.names=FALSE)
+if (exists("run_bp")) { run_bp(universe_g, trans_g, "TRANSCRIPTIONAL productive-UP (GO BP)")
+  if (length(comp_g) >= 5) run_bp(universe_g, comp_g, "COMPOSITION productive-UP (GO BP)")
+  else cat(sprintf("\nComposition-up group too small for topGO (n=%d)\n", length(comp_g))) }
+```
+
+```{r session}
+sessionInfo()
+```
