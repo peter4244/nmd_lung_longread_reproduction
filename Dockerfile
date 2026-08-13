@@ -365,6 +365,23 @@ RUN if [ "$WITH_MODEL" = "true" ]; then \
         echo "WARNING: model environment SKIPPED via --build-arg WITH_MODEL=false. Section 5 cannot run in this image."; \
     fi
 
+# IMPORT WHAT WAS INSTALLED. A solve can succeed, an install can succeed, and the result can still
+# be unimportable -- so an install check is not an environment check, exactly as renv::restore()'s
+# exit code is not a check that 187 packages load. This exists because on 2026-08-12 the file
+# pinned shap 0.46 against numpy 2.4: both resolved, both installed, `docker build` exited 0, and
+# `import shap` raised `TypeError: Converting np.inexact or np.floating to a dtype not allowed`.
+# The image built cleanly and could not run the DeepSHAP or KernelSHAP steps -- the two steps the
+# model environment exists for.
+#
+# Import the packages the SHIPPED CODE actually imports, not a token one. Anything cheap to add
+# here is cheaper than a reader discovering it four steps into a cluster run.
+RUN /opt/conda/envs/nmd_figures/bin/python -c \
+      "import matplotlib, numpy, pandas, scipy, seaborn, logomaker; print('figures env: imports OK')" \
+ && if [ "$WITH_MODEL" = "true" ]; then \
+        /opt/conda/envs/nmd_model/bin/python -c \
+          "import torch, shap, h5py, numpy, pandas, yaml, tqdm; print('model env: imports OK')"; \
+    fi
+
 # The chain rewrites the leading `python3`/`Rscript` of each step command through these, which
 # is what lets one image serve steps that expect different interpreters (tools/run_chain.py,
 # resolve_interpreters). Pointing PYTHON at the figures environment is the deliberate default:

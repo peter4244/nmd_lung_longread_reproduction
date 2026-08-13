@@ -41,7 +41,26 @@ dependencies:
   # attribution in the §5 report come from it. It was absent from every shipped environment while
   # the model repository's own environment.yml carried it, so a reader who built from this file
   # got an ImportError at the DeepSHAP step.
-  - shap=0.46.*
+  #
+  # 0.51, NOT 0.46, AND THE WRONG PIN WAS UNINSTALLABLE-BY-IMPORT RATHER THAN UNINSTALLABLE.
+  # This line was added on 2026-08-12 to close that missing-shap finding, and the version was taken
+  # from the model repository's environment.yml instead of being read off the environment this file
+  # documents. Every other pin here was captured from that environment on 2026-08-03; this one was
+  # not, and it was the one that broke.
+  #
+  # 0.46 RESOLVES, INSTALLS, AND THEN CANNOT BE IMPORTED under the numpy pinned six lines above:
+  # shap 0.46 bundles a copy of scikit-image's _colorconv, which calls np.dtype(np.floating), and
+  # numpy 2.x raises `TypeError: Converting np.inexact or np.floating to a dtype not allowed`. So
+  # `docker build` exits 0 and the image cannot run the DeepSHAP or KernelSHAP steps. An install
+  # check cannot see this; only an import can.
+  #
+  # Verified against the environment of record on 2026-08-13:
+  #   conda list -p /home/p.castaldi/.conda/envs/nmd_model
+  #   -> shap 0.51.0 cpu_py311hd1d3739_0 conda-forge, and `import shap` succeeds under numpy 2.4.3
+  #
+  # The Dockerfile now IMPORTS both environments after creating them, for the same reason the R
+  # side loads all 187 packages rather than trusting renv::restore()'s exit code.
+  - shap=0.51.*
   - pip:
       # BOTH INDEXES ARE REQUIRED AND THIS FILE HAD ONLY THE FIRST UNTIL 2026-08-12, WHICH MADE IT
       # UNINSTALLABLE. `--index-url` REPLACES PyPI rather than adding to it, so pip could see only
