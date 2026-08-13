@@ -321,6 +321,68 @@ interpretability export, and the §5 figure scripts read those. This chain rebui
 deposit-native tree and derive the window from `paths_config.py --selected-tag` instead of
 repeating a literal. The command each runs is shown so the page can be read without a cluster.
 
+#### The environment for this section is NOT the container, and §2 does not tell you that
+
+**The `slurm_*_dn.sh` wrappers run `$PY <script>` directly on the cluster host. They never invoke
+the container.** §2 calls the container "the validated route" and it is — for the R side. It is
+not what the Python steps here use, and nothing on this page said so until 2026-08-12. A reader
+who followed §2, obtained `nmd_1.2.sif`, and then submitted a wrapper was running neither the
+image they had just built nor anything the page had described.
+
+So this section needs **two** environments, and you must supply the first one yourself:
+
+**Python (steps 2, 4, 5, 6) — a host interpreter with `torch`, `shap` and `h5py`.** Build it from
+**this repository's** `environment-model.yml`:
+
+```bash
+conda env create -f environment-model.yml          # the file carries `name: nmd_model`
+export PY="$(conda run -n nmd_model which python)"
+```
+
+**`conda`, not `micromamba`.** Explorer has `conda` on `PATH` and has neither `micromamba` nor
+`mamba` — checked 2026-08-12. `mamba` is much faster where it exists, but an instruction naming a
+tool the target cluster does not carry fails at the reader's first command.
+
+**If the solve cannot reach the channel, check whether your network blocks Anaconda before you
+debug the environment file.** Both files use `conda-forge`, which is hosted at
+`conda.anaconda.org`, and a number of institutions block that domain over Anaconda's commercial
+licensing terms. On a blocked network micromamba retries eight times and then reports
+`Download error (35) SSL connect error` and `Subdir conda-forge/noarch not loaded!`, which reads
+like a corrupt package cache — its own message suggests `mamba clean -a` — and is nothing of the
+kind. Measured on 2026-08-12: `conda.anaconda.org` and `repo.anaconda.com` both timed out on one
+institutional VPN while `p3m.dev`, `github.com` and `pypi.org` all answered normally, and all four
+answered off it. That is what makes it diagnosable: **the R half of this build will succeed while
+the Python half fails**, because the R packages come from P3M and only the conda step touches
+Anaconda.
+
+**Use that file and not the model repository's `environment.yml`**, which is a different and looser
+specification of the same environment — it pins `pytorch` and `pytorch-cuda=11.8` by name rather
+than by version. `environment-model.yml` was read off the Explorer environment that actually
+produced the §5 numbers and pins every version. Two files describing one environment is a trap we
+have not yet closed; until we do, this is the one of record.
+
+`PY` is the documented override and every `_dn` wrapper honours it. **Set it explicitly rather
+than relying on the default**, which is the authoring account's conda path
+(`/home/p.castaldi/.conda/envs/nmd_model/bin/python`). On a shared cluster that path may well be
+*executable by you* — group traversal is enough — in which case the wrapper silently runs someone
+else's environment and reports success. Confirm what you actually got:
+
+```bash
+echo "$PY"; "$PY" -c "import sys, torch; print(sys.prefix, torch.__version__)"
+```
+
+**And note the guard cannot catch this for you.** The wrappers test `[ -x "$PY" ]` —
+*executability, not capability*. A bare `python3` on `PATH` passes it, the job starts, and it dies
+at `import torch`, which reads like a broken installation rather than a wrong interpreter.
+
+**R (steps 1 and 8) — the container.** These need R 4.5.2 with `Isopair`, `ORFik`, `rmarkdown` and
+pandoc, which is what the image is for. Run them through it, with the full invocation from §2:
+
+```bash
+apptainer exec --containall --nv --bind "$REPO":/work --bind "$DEPOSIT":/deposit --pwd /work \
+  nmd_1.2.sif Rscript <script>
+```
+
 **Three result directories, two of them traps:**
 
 | directory | what it is |

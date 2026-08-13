@@ -71,6 +71,25 @@
 
 ARG TARGETPLATFORM=linux/amd64
 
+# MICROMAMBA AS A NAMED, PLATFORM-PINNED STAGE. Both pins are load-bearing and neither was here
+# before 2026-08-12.
+#
+# --platform: this was `COPY --from=mambaorg/micromamba:latest` inline, with no platform. Every
+# other image here is pinned to linux/amd64, but an unpinned COPY --from resolves to the BUILD
+# HOST's architecture -- so on an ARM machine it copied an arm64 binary into an amd64 image, and
+# the next step died with `micromamba: not found`. The file is present and is a perfectly good
+# 22 MB ELF; it is the wrong ELF, and "not found" is what exec reports for that.
+#
+# THE PART WORTH RECORDING: this recipe built successfully on an ARM laptop on 2026-08-06 and
+# again on 2026-08-10 with this defect fully present. Those builds found an amd64 micromamba
+# already in the local image cache and copied that. Wiping the VM forced a fresh pull, the pull
+# resolved to arm64, and the latent defect surfaced. So two successful builds were never evidence
+# the recipe was correct -- they were evidence the cache was warm.
+#
+# :latest -> 2.9.0: an unpinned tag in a recipe whose entire purpose is reproducing an
+# environment. The version that this pin was tested against is the one recorded here.
+FROM --platform=linux/amd64 mambaorg/micromamba:2.9.0 AS micromamba
+
 # R 4.5.2 EXACTLY, because renv.lock pins it and renv warns on a mismatch. rocker/r-ver is
 # preferred over the Bioconductor image for precisely that reason: the Bioconductor image is
 # keyed to a release (3.22) and tracks whatever R patch that release carries, which is not a
@@ -113,7 +132,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libglpk-dev libgsl-dev libgit2-dev libxt-dev \
         git ca-certificates curl bzip2 \
         fonts-liberation \
+        libmagick++-dev \
     && rm -rf /var/lib/apt/lists/*
+# libmagick++-dev is for the R `magick` package, added 2026-08-12 with the six packages installed
+# further down. Without it magick fails to CONFIGURE, and the R error names a header rather than a
+# Debian package, which is a long way from "apt-get install libmagick++-dev".
 
 # fonts-liberation IS ABOVE, AND IT IS THE ONE THING THE RECIPE DID NOT BUILD.
 #
@@ -286,16 +309,46 @@ RUN R -q -e 'pkgs <- names(renv::lockfile_read("/tmp/renv.lock")$Packages); \
 # Their versions are therefore NOT reproducible from renv.lock and must not be described as
 # such. Recorded as: version unknown at publication because the package was never present;
 # current CRAN installed here.
-RUN R -q -e 'install.packages(c("hexbin", "mclust"), repos = "https://cloud.r-project.org"); \
-             for (p in c("hexbin", "mclust")) if (!requireNamespace(p, quietly = TRUE)) \
-               stop("failed to install ", p); \
-             cat("hexbin", as.character(packageVersion("hexbin")), \
-                 " mclust", as.character(packageVersion("mclust")), "\n")'
+# SIX MORE, ADDED 2026-08-12, AND THE SAME REASONING APPLIES TO ALL OF THEM. They are loaded by
+# shipped code with library() and appear in no environment file, found on the first publish where
+# the documentation check could actually fail. Three of them -- fgsea, pathview and tidyverse --
+# are recorded in ENVIRONMENT.md's version table AS PART OF THE ENVIRONMENT OF RECORD, which is
+# the sharp end of this: we documented the versions that produced the results and never put them
+# in the lockfile, so the container restored its 187 packages, the completeness guard above
+# passed, and this code still could not run. The guard checks only what renv.lock NAMES.
+#
+#   fgsea      Gene-Level_DGE_Summary_mashR.Rmd, interpret_isoform_patterns_mashr   [Bioconductor]
+#   pathview   Figures/make_pathway_allct.R                                          [Bioconductor]
+#   tidyverse  Isoform-Level_DIE_Summary_p1.Rmd, die_mashr_enrichment_part2
+#   xgboost    isopair_wrapper/05_final_report_mashr.Rmd
+#   openxlsx   build_manuscript_tables.R
+#   magick     Figures/make_panels.R  -- needs libmagick++-dev, added to the apt layer above
+#
+# P3M repos, not cloud.r-project.org, because two are Bioconductor and the CRAN mirror cannot
+# resolve them. Same pinned snapshot the restore uses, so these land at the same vintage.
+ARG P3M_SNAPSHOT_EXTRA=2026-03-10
+RUN P3M="https://p3m.dev/cran/__linux__/noble/${P3M_SNAPSHOT_EXTRA}"; \
+    BIO="https://p3m.dev/bioconductor/__linux__/noble/packages/${BIOC_VERSION}"; \
+    R -q -e "pkgs <- c('hexbin','mclust','fgsea','pathview','tidyverse','xgboost','openxlsx','magick'); \
+             install.packages(pkgs, repos = c(P3M = '${P3M}', \
+                                              P3MBioc = paste0('${BIO}', '/bioc'), \
+                                              P3MBiocAnn = paste0('${BIO}', '/data/annotation'), \
+                                              CRAN = 'https://cloud.r-project.org', \
+                                              BioCsoft = 'https://bioconductor.org/packages/${BIOC_VERSION}/bioc')); \
+             miss <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]; \
+             if (length(miss)) stop('failed to install: ', paste(miss, collapse = ', ')); \
+             for (p in pkgs) cat(p, as.character(packageVersion(p)), '\n')"
 
 # --- Python -----------------------------------------------------------------------------
 # micromamba as a single static binary from its own image — no installer script, no download
-# URL to rot, and it resolves the two environment files exactly as conda would.
-COPY --from=mambaorg/micromamba:latest /bin/micromamba /usr/local/bin/micromamba
+# URL to rot, and it resolves the two environment files exactly as conda would. The stage is
+# declared at the top of this file with an explicit --platform; see the comment there for why
+# copying from an unpinned image reference is not the same thing.
+COPY --from=micromamba /bin/micromamba /usr/local/bin/micromamba
+
+# Fail HERE if the binary cannot execute, rather than three steps later with `micromamba: not
+# found`, which reads like a PATH problem and is not one.
+RUN micromamba --version
 ENV MAMBA_ROOT_PREFIX=/opt/conda
 
 # Both environments, kept separate for the reason environment-figures.yml gives: they ran

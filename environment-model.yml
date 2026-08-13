@@ -43,5 +43,28 @@ dependencies:
   # got an ImportError at the DeepSHAP step.
   - shap=0.46.*
   - pip:
+      # BOTH INDEXES ARE REQUIRED AND THIS FILE HAD ONLY THE FIRST UNTIL 2026-08-12, WHICH MADE IT
+      # UNINSTALLABLE. `--index-url` REPLACES PyPI rather than adding to it, so pip could see only
+      # the PyTorch index. torch 2.5.1+cu121 pins `nvidia-cudnn-cu12==9.1.0.70` exactly, and that
+      # index carries 9.0.0.312 and 9.1.1.17 and not 9.1.0.70 -- the wheel exists on PyPI, where pip
+      # was not allowed to look. The install died with:
+      #
+      #     ERROR: No matching distribution found for nvidia-cudnn-cu12==9.1.0.70
+      #
+      # which names a CUDA library and reads like a GPU or platform problem. It is neither: it is an
+      # index-configuration problem, and the marker in the message (platform_machine == "x86_64")
+      # actively points the reader at their architecture, which is fine.
+      #
+      # HOW IT SURVIVED: the authoring environment predates this file -- environment-model.yml was
+      # CAPTURED from a working conda env on 2026-08-03 rather than used to build one -- so nobody
+      # had ever run it. It first ran on 2026-08-12, in the Docker build, and failed immediately.
+      # A conda dry-run does NOT catch this: `micromamba create --dry-run` resolves the conda solve
+      # and never executes the pip section, so this file "solved" cleanly while being uninstallable.
+      #
+      # Verified with full dependency resolution, not a dry run:
+      #   pip install --dry-run --index-url .../cu121 --extra-index-url https://pypi.org/simple \
+      #       torch==2.5.1+cu121
+      #   -> Would install ... nvidia-cudnn-cu12-9.1.0.70 ... torch-2.5.1+cu121
       - --index-url https://download.pytorch.org/whl/cu121
+      - --extra-index-url https://pypi.org/simple
       - torch==2.5.1+cu121
