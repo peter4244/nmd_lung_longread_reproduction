@@ -382,6 +382,28 @@ RUN /opt/conda/envs/nmd_figures/bin/python -c \
           "import torch, shap, h5py, numpy, pandas, yaml, tqdm; print('model env: imports OK')"; \
     fi
 
+# AND THE SAME CHECK FOR R, RUN THROUGH BARE `Rscript` ON PURPOSE. Every command in
+# REPRODUCTION.md is written as bare `Rscript`, so that is what has to work -- not the absolute
+# path we happen to know. This is deliberately not `/usr/local/bin/Rscript`: resolving it the way
+# the documentation does is the entire point of the check.
+#
+# It exists because on 2026-08-13 a SUCCESSFUL build shipped an image where bare `Rscript` resolved
+# to conda's R, whose only library holds pROC and none of the 187 packages, while the system R held
+# the 187 and not pROC. Neither could render the section 5 report, and a reader following the page
+# got "there is no package called 'Isopair'" on a machine where it was plainly installed. Nothing
+# in the build noticed, because the R restore guard ran BEFORE the conda environments existed and
+# therefore before PATH changed under it.
+#
+# Ordering note: this must stay AFTER the conda environments are created, or it tests a PATH that
+# the finished image will not have.
+RUN Rscript -e 'need <- c("Isopair","ORFik","edgeR","mashr","pROC","ggseqlogo","rmarkdown"); \
+                miss <- need[!vapply(need, requireNamespace, logical(1), quietly = TRUE)]; \
+                if (length(miss)) stop("bare Rscript resolves to an R that is missing: ", \
+                                       paste(miss, collapse = ", "), \
+                                       " -- .libPaths() = ", paste(.libPaths(), collapse = " ; "), \
+                                       " -- which Rscript = ", Sys.which("Rscript")); \
+                cat("bare Rscript: resolves to the analysis library, all", length(need), "present\n")'
+
 # The chain rewrites the leading `python3`/`Rscript` of each step command through these, which
 # is what lets one image serve steps that expect different interpreters (tools/run_chain.py,
 # resolve_interpreters). Pointing PYTHON at the figures environment is the deliberate default:

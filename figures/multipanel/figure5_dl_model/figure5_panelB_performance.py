@@ -1,13 +1,25 @@
 """
 Figure 5 Panel B — Held-out model performance: ROC curve with PR-curve inset.
 
-Best NMD-prediction model (ATG=500, STOP=500), evaluated on the
-chr-1/3/5/7 paralog-free holdout test set. AUC and AUPRC annotated; PR
-curve shown as an inset in the lower-right quadrant of the ROC.
+The deposited NMD-prediction model — 1000nt windows around the start and stop sites, member
+seed 42 — evaluated on the chr-1/3/5/7 paralog-free holdout test set. AUC and AUPRC annotated;
+PR curve shown as an inset in the lower-right quadrant of the ROC.
+
+THIS HEADER SAID "(ATG=500, STOP=500)" UNTIL 2026-08-13 AND THE FIGURE WAS NEVER WRONG. 500/500
+was the original window sweep's selection; 1000/1000 was re-selected on the deposit-native
+universe on 2026-08-04 and is what the manuscript reports. The panel has been drawing the
+deposited model all along — its own input records `window_nt = 1000` — so only this description
+was stale. Stated rather than silently corrected because a caption naming the wrong model in a
+main-text figure script is the closest thing in this repository to an error in the paper.
 
 Data:
   ./data/panelB_predictions.tsv   — per-test-transcript (label, prob)
-  ./data/panelB_metrics.tsv       — n_test, n_nmd, auprc (and auc for cross-check)
+  ./data/panelB_metrics.tsv       — n_test, n_nmd, auc, auprc, window_nt, split
+                                    Currently: n_test 10,522 · n_nmd 2,405 · AUC 0.9257 ·
+                                    AUPRC 0.8175 · window_nt 1000 · split test_clean, which is
+                                    the deposited checkpoint to the precision the manuscript
+                                    states. window_nt is carried IN THE DATA — read it from
+                                    there rather than restating a number in prose.
 
 Style: publications overlay — drops bbox_inches="tight"; validator wired
 into main().

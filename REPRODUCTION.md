@@ -458,15 +458,39 @@ python evaluate.py --config config_dn.yaml --results-dir results_deposit_h5_2026
 **6 — the interpretation layer**, which runs over the full cohort, not the test split.
 
 ```bash
-sbatch slurm_uorf_dn.sh              # infer_uorf_attention.py ONLY — then compute_uorf_attention_metrics.R
+sbatch slurm_uorf_dn.sh              # infer_uorf_attention.py ONLY — see the follow-up below
 sbatch slurm_deepshap_joint_dn.sh    # deepshap.py --branches joint, 5 runs
 sbatch slurm_deepshap_structural_dn.sh
+sbatch slurm_deepshap_atgstop_dn.sh  # --branches atg stop → deepshap_all_orfs_summary_*
+sbatch slurm_interpret_dn.sh         # 04_interpret_attention.py, 05_interpret_structural.py → attention_*
+sbatch slurm_export_motif_logos_dn.sh  # export_joint_motif_logos.py → motif_logo_{atg,stop}_joint_*
 sbatch slurm_kernel_shap_dn.sh       # 11_kernel_shap_branches.py
 sbatch slurm_export_chain_dn.sh      # 06_, 07_, 08_, 09_ GC/junction/polyA, 09b_, 09c_, 09d_
 ```
 
-`slurm_deepshap_all_dn.sh` does joint, structural and `atg stop` in one job. The five DeepSHAP runs
-vary the background seed; the replicate mean and sd are the uncertainty statement.
+**Three of those were missing from this list until 2026-08-14, and they are exactly the producers
+of the seven interpretation files that then look "absent".** `slurm_deepshap_atgstop_dn.sh`,
+`slurm_interpret_dn.sh` and `slurm_export_motif_logos_dn.sh` are not optional extras: nothing else
+writes `deepshap_all_orfs_summary_*`, the four `attention_*` outputs, or the joint motif logos. A
+reader who ran only the six previously listed here would finish the step with those files missing
+and no command having failed.
+
+**`slurm_uorf_dn.sh` RUNS INFERENCE ONLY. The metrics are a second command**, and it must wait for
+that job to finish — it consumes what the job writes:
+
+```bash
+# AFTER slurm_uorf_dn.sh completes. --results-dir is required: the script defaults to the
+# published run, so omitting it silently reads the wrong vintage (see the flags note below).
+Rscript compute_uorf_attention_metrics.R --results-dir results_deposit_h5_2026-08-04
+```
+
+Without it `uorf_attention_metrics.tsv` is never written, and step 8 stops on the missing file.
+`slurm_uorf_dn.sh` names this script in a comment at its foot but has no runnable invocation of it,
+which is why the gap was invisible: every command in the step reported success.
+
+`slurm_deepshap_all_dn.sh` does joint, structural and `atg stop` in one job — use it *instead of*
+those three, not in addition. The five DeepSHAP runs vary the background seed; the replicate mean
+and sd are the uncertainty statement.
 
 **7 — the final evaluation. Run once, and last.**
 
@@ -484,19 +508,60 @@ allowed to touch chr1/3/5/7, and the metrics JSON records `evaluation_class=fina
 transcripts under their own `test_paralog` label. It is the split the manuscript describes;
 `--split test` is a different population and gives different numbers.
 
-**8 — the report and the §5 figure data.**
+**8 — the §5 figure data.**
+
+**THIS STEP RUNS FROM THIS REPOSITORY, NOT THE MODEL REPOSITORY.** Steps 2–7 are `sbatch` from
+the model repo; this one is an `Rscript` from the reproduction tree. The paths below are the only
+thing that still points at the model repo.
 
 ```bash
-NMD_RESULTS_DIR=results_deposit_h5_2026-08-04 \
-  Rscript -e 'rmarkdown::render("<model repo>/orf_model_report_v5.Rmd",
-                                knit_root_dir = normalizePath("<model repo>"))'
-
 # Both variables are required. MODEL_RESULTS is the model's own results; FEATURES is what
 # export_rds.R wrote with --results-dir. SF40's data_export.R needs the same one.
+# --data-dir IS REQUIRED IN A CLEAN ROOM. nmd_data_dir() falls back to .P$OUT/data_mashr, which
+# exists in the authoring tree and does not exist in a fresh checkout; it fails loudly rather
+# than falling back to another vintage, so the step stops here without it.
 NMD_MODEL_RESULTS=<model repo>/results_deposit_h5_2026-08-04 \
 NMD_FEATURES=<model repo>/results_deposit_h5_2026-08-04 \
-  Rscript figures/multipanel/figure5_dl_model/data_export_refaug.R
+  Rscript figures/multipanel/figure5_dl_model/data_export_refaug.R \
+    --data-dir <path to data_mashr>
 ```
+
+**`<path to data_mashr>` DEPENDS ON YOUR LAYOUT, AND THE TWO LAYOUTS DIFFER IN A WAY THAT BITES.**
+If §3 built it in-tree it is `tmp/out/data_mashr`. If it was staged *beside* the repository rather
+than inside it — which is how the clean room handed to an outside account was arranged — then it is
+an absolute path, **and `--bind "$REPO":/work` does not reach it**: a sibling directory is outside
+the bound tree, so inside the container the path resolves to nothing. Bind it explicitly and pass
+the container-side path:
+
+```bash
+apptainer exec --containall --bind "$REPO":/work --bind "$DATA_MASHR":/data_mashr --pwd /work … \
+  Rscript figures/multipanel/figure5_dl_model/data_export_refaug.R --data-dir /data_mashr
+```
+
+Bind the **directory**, never a file inside it — Apptainer refuses a bind destination that does not
+exist, where Docker creates one, so a file-level bind that works locally fails in the `.sif`.
+
+**`orf_model_report_v5.Rmd` USED TO BE THE FIRST COMMAND HERE AND HAS BEEN REMOVED. It cannot
+run on this chain, and it could never have run on it.** That report describes the **initial
+window sweep** — a 3×4 grid of twelve trained models — and reads
+`metrics_atg{A}_stop{S}.json`, one per cell, plus about fifty interpretation files named after
+the sweep's winner, `atg500_stop500`.
+
+This chain trains **one** configuration, the selected `atg1000_stop1000`, and names its outputs
+`metrics_<tag>_seed<N>_<split>.json`. So none of the twelve exist, `metrics_list` comes back
+empty, and the render died on `object 'auprc' not found` — a message that names neither the
+absent files nor the reason. Measured 2026-08-13, job 9162085. The report now stops at that
+point with an error that explains itself.
+
+**The two are different runs over different universes, not a current version and a stale one.**
+The sweep selected 500/500 on the published universe; 1000/1000 was re-selected on the
+deposit-native universe on 2026-08-04. A reader who "corrects" the report's 500 to 1000 will
+point every one of those fifty reads at files that do not exist.
+
+Rendering it needs the sweep tree, which this chain does not build and the deposit does not
+carry. **If you want that report, you have to run the sweep first**, which is a separate and
+much larger job than §5.7. Nothing else in §5 depends on it: `data_export_refaug.R` above is
+what feeds Figure 5.
 
 **Flags whose omission fails silently or late:**
 
@@ -506,10 +571,12 @@ NMD_FEATURES=<model repo>/results_deposit_h5_2026-08-04 \
   `best_model_{tag}.pt`. Omit it and the step dies with `FileNotFoundError` *after* training has
   succeeded. `--member-seed` names the checkpoint; `--seed` is the RNG seed.
 - **`--results-dir` is not optional, and not only for the training scripts.** `export_rds.R`,
-  `infer_uorf_attention.py`, `compute_uorf_attention_metrics.R` and `orf_model_report_v5.Rmd` all
-  default to the published run, so omitting it reads or writes the wrong vintage silently.
-- **The report takes `NMD_RESULTS_DIR`, not a flag** — `rmarkdown::render()` does not pass
-  arguments through to the document.
+  `infer_uorf_attention.py` and `compute_uorf_attention_metrics.R` all default to the published
+  run, so omitting it reads or writes the wrong vintage silently.
+- **`orf_model_report_v5.Rmd` defaults to the published run too, and for it that default is
+  correct** — it describes the initial window sweep, which only the published tree holds. It
+  takes `NMD_RESULTS_DIR` rather than a flag, because `rmarkdown::render()` does not pass
+  arguments through to the document. It is not part of this chain; see step 8.
 - **DeepSHAP cannot run deterministically.** `shap`'s DeepLIFT routes MaxPool gradients through
   `max_unpool1d`, which has no deterministic kernel, so it needs `NMD_ALLOW_NONDETERMINISM=1`.
   The five replicates are the uncertainty statement instead.

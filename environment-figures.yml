@@ -65,10 +65,26 @@ name: nmd_figures
 channels:
   - conda-forge
 dependencies:
-  # r-proc IS REQUIRED to render the §5 model report: orf_model_report_v5.Rmd calls pROC for
-  # its ROC curves. It was in neither renv.lock nor this file, so the report could not render
-  # from any shipped environment.
-  - r-proc
+  # pROC IS REQUIRED to render the §5 model report -- orf_model_report_v5.Rmd calls it for the ROC
+  # curves -- BUT IT DOES NOT BELONG HERE, AND PUTTING IT HERE MADE THINGS WORSE. That is recorded
+  # rather than quietly deleted, because the diagnosis was right and only the remedy was wrong.
+  #
+  # `r-proc` was added to this file on 2026-08-12 because pROC was in neither renv.lock nor here.
+  # Installing it via conda pulls conda's own r-base, and this environment goes FIRST on PATH, so
+  # in the built image `R` and `Rscript` resolved to /opt/conda/envs/nmd_figures/bin/R -- an R whose
+  # only library is the conda one. Measured in the image built 2026-08-13:
+  #
+  #   /usr/local/bin/Rscript            -> Isopair, ORFik, edgeR ... yes;  pROC, ggseqlogo NO
+  #   nmd_figures/bin/Rscript           -> pROC 1.19.0.1 yes;  everything else NO
+  #
+  # So NEITHER R could render the report, and a reader typing bare `Rscript` got the one with no
+  # analysis packages at all -- "there is no package called 'Isopair'" on a machine where it is
+  # plainly installed. The same shape as the $PY trap on the cluster: the right thing exists and
+  # the default resolution finds the wrong one.
+  #
+  # pROC and ggseqlogo are now installed into the SYSTEM R alongside hexbin/mclust/fgsea, which is
+  # where every other package absent from renv.lock already goes. Removing r-proc from here removes
+  # conda's r-base, which ends the shadowing.
   - python=3.12.12
   - pandoc=3.8.3
   - pip
