@@ -10,12 +10,24 @@ is defect C40 of the redesign spec. This script is that missing producer, and it
 reader can fetch from Zenodo.
 
 UNIVERSE (D77/D74). Interpretation quantities -- Panels C and D -- are computed over ALL isoforms,
-train and held-out pooled, which is the universe D77 selects. This CHANGES THE PANELS' MEANING
-relative to the published figure: the published branch percentages (60.7 / 28.8 / 10.5) are
-NMD-only, because 11_kernel_shap_branches.py:562-566 computes that block over `nmd` and the
-manuscript never says so. Both universes are written out (`_nmd` variants) so the choice is visible
-and reversible rather than baked in silently. Panel B is held-out test only -- pooling train and
-held-out is legitimate for interpretation and never for a performance number.
+train and held-out pooled, which is the universe D77 selects. Both universes are written out
+(`_nmd` variants) so the choice is visible and reversible rather than baked in silently. Panel B is
+held-out test only -- pooling train and held-out is legitimate for interpretation and never for a
+performance number.
+
+AND THE POOLED UNIVERSE IS THE MANUSCRIPT'S, WHICH THIS COMMENT PREVIOUSLY DENIED. It said the
+published branch percentages were "60.7 / 28.8 / 10.5 ... NMD-only", and that the pooled universe
+therefore CHANGED the panels' meaning relative to the published figure. Both halves were wrong.
+Measured 2026-08-15 against kernel_shap_branch_atg1000_stop1000_seed42_all.tsv in the deposit: the
+paper's Figure 5C reports 54.6 / 31.4 / 14.0, and the pooled universe gives 54.64 / 31.41 / 13.95
+over n=41,776 -- an exact reproduction. The NMD-only subset gives 59.01 / 29.43 / 11.56 over
+n=9,321 and is NOT the paper's number.
+
+60.7 / 28.8 / 10.5 is real but belongs to the SUPERSEDED 500nt model, NMD-only, n=2,268 --
+reproduced exactly from results_4ct/kernel_shap_branch_atg500_stop500.tsv and from
+model.published_superseded_2026-07-28/. Calling it "the published percentages" here sent a reader
+to compare the current figure against a retired one. Corrected rather than deleted, because the
+number exists and will be found again.
 
 WHAT IT DOES NOT COVER, so a gap is not mistaken for completeness:
   SF38     -- needs selected_orfs.tsv, an Explorer file. See task #6.
