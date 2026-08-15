@@ -32,9 +32,19 @@ $STOP_CODON_DIR if the outputs are elsewhere; absent them, 5.3.3 is skipped and 
 
 AGGREGATION. Branch shares use mean_of_abs: mean |SHAP| per branch, divided by the summed
 per-branch means. That is the aggregation 11_kernel_shap_branches.py:562-566 implements, read out
-of the producer rather than guessed -- and note that block computes over NMD ONLY, which is why the
-published 60.7 / 28.8 / 10.5 matches the NMD-only universe and not the all-isoform one. Both are
-emitted, per D78, so a value can never be read without the set it was computed over.
+of the producer rather than guessed. All universes are emitted, per D78, so a value can never be
+read without the set it was computed over.
+
+THIS PARAGRAPH USED TO SAY the published 60.7 / 28.8 / 10.5 "matches the NMD-only universe and not
+the all-isoform one". That stopped being true when the manuscript moved universes on 2026-08-08,
+and the note at the 5.1.4 emit below has recorded the move correctly ever since -- so this file
+disagreed with itself for a week, header against body. The paper reports the ALL-isoform universe:
+54.6 / 31.4 / 14.0 over n=41,776, which reproduces from the deposit as 54.64 / 31.41 / 13.95.
+60.7 / 28.8 / 10.5 is the SUPERSEDED 500nt model, NMD-only, n=2,268.
+
+Kept rather than deleted because the same stale claim also stood in
+figures/multipanel/figure5_dl_model/data_export_deposit.py, and a reader who trusts a docstring
+over the code it heads reaches for the retired figure. That happened.
 
 USAGE
     python analysis/section5/derive_section5_numbers.py            # emit
