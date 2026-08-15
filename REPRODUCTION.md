@@ -521,6 +521,16 @@ for f in figure5_panel[B-G]*.py; do python3 "$f"; done
 python3 figure5_composite.py            # assembles the seven panel PNGs
 ```
 
+**Panels C and D will not match the published figure as rendered, and that is deliberate.** The
+exporter writes each of them twice — `panelC_branch_importance.tsv` over **all isoforms, train and
+held-out pooled**, and `panelC_branch_importance_nmd.tsv` over **NMD isoforms only**. The published
+branch percentages (60.7 / 28.8 / 10.5) are the NMD-only population, because
+`11_kernel_shap_branches.py` computes that block over `nmd` and the manuscript does not say so. The
+panel script reads the *unsuffixed*, pooled file. So a reader who renders Panel C and compares it
+to the paper sees a mismatch that is a difference of population, not of result — compare against
+the `_nmd` variant instead. Panel B is held-out test only; pooling train and held-out is legitimate
+for interpretation and never for a performance number.
+
 **Three exporters write Panel G inputs and only one can be right for a given panel.**
 `data_export_deposit.py` writes the `_v1` names that `figure5_panelG_uorf_attention.py` actually
 reads; `data_export_refaug.R` (§5.7 step 8) writes the `_refaug` variants that SF40 consumes;
@@ -547,6 +557,22 @@ done   # then run the single figure script in each directory
 
 Of these fifteen, six ship a `data_export.R` — SF27, SF28, SF29, SF30, SF31 and SF40; the rest
 read a sibling's exports or the deposit directly.
+
+**SF43 is the exception: it has no `data_export.R` and needs a chain run first.**
+`figure_s_model_comparison.py` reads `metrics_summary_<date>.tsv` and
+`per_isoform_scores_<date>.tsv`, which nothing in `figures/` produces — they come from
+`analysis/predictor_comparison/`, run in order:
+
+```bash
+Rscript analysis/predictor_comparison/01_extract_our_isoforms.R
+Rscript analysis/predictor_comparison/02_score_nmdetective_b.R
+Rscript analysis/predictor_comparison/03_score_nmdep_rule_baseline.R
+Rscript analysis/predictor_comparison/04_compute_metrics.R
+```
+
+**Mind the datestamp.** `04_compute_metrics.R` names its outputs from a `DATESTAMP` variable, while
+`figure_s_model_comparison.py` and `nmd_predictor_comparison.Rmd` each hardcode a different date.
+If SF43 reports a missing input, that mismatch is the first thing to check.
 
 ## What is verified, and what is not
 

@@ -18,8 +18,12 @@ and reversible rather than baked in silently. Panel B is held-out test only -- p
 held-out is legitimate for interpretation and never for a performance number.
 
 WHAT IT DOES NOT COVER, so a gap is not mistaken for completeness:
-  Panel G  -- needs tx_summary.tsv, a stage C output (D105), not a deposit file.
   SF38     -- needs selected_orfs.tsv, an Explorer file. See task #6.
+
+Panel G WAS listed here as uncovered, on the grounds that it needed tx_summary.tsv, a stage C
+output rather than a deposit file. That is no longer true: it now reads the deposited
+uorf_attention_metrics.tsv instead, and is produced by this script. The line is corrected rather
+than deleted because "not covered" and "covered" are the two answers a reader acts on differently.
 
 USAGE
     python figures/multipanel/figure5_dl_model/data_export_deposit.py
