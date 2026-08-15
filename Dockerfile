@@ -1,73 +1,36 @@
 # The environment this paper's analyses run in — built from renv.lock and the two conda
 # environment files, which are the recipes; this is the thing that proves they work.
 #
-# WHY THIS FILE EXISTS AT ALL. REPRODUCTION.md says a lockfile that has never been restored
-# is an assertion. Building this image restores all 187 R packages and either succeeds or
-# fails loudly, which is the whole point: it is the first guard in this repository that can
-# actually fail on an environment claim. W292 stays open until it has been built and the
-# chain has run inside it.
+# Building this image restores all 189 R packages in renv.lock and both conda environments, and
+# either succeeds or fails loudly — a lockfile that has never been restored is an assertion.
 #
-# WHY IT IS BUILT LOCALLY AND NOT ON THE CLUSTER. Rootless image building on Explorer is
-# blocked by site configuration, measured 2026-08-03: podman has no /etc/subuid range, so
-# even with the vfs driver on local disk it dies at `lchown /etc/shadow: invalid argument`;
-# apptainer gets further and then fails with `exec /.singularity.d/libs/fakeroot failed`.
-# Neither is fixable without an administrator. Apptainer can CONSUME an image perfectly well
-# though, so building here and converting sidesteps both:
+# You do not need to build it to reproduce the paper. Fetch nmd_1.3.sif from the Zenodo record
+# instead; see ENVIRONMENT.md.
 #
 #     docker build --platform linux/amd64 -t nmd:1.0 .
 #     docker save nmd:1.0 -o nmd.tar
-#     apptainer build nmd.sif docker-archive://nmd.tar     # on Explorer, no root needed
+#     apptainer build nmd.sif docker-archive://nmd.tar     # on a cluster, no root needed
 #
-# THE CONVERSION IS MEASURED, NOT ASSUMED (2026-08-05, on Explorer). Unprivileged
-# `apptainer build` from a docker archive works there. Three site-level findings that cost real
-# time to discover and are invisible from the Dockerfile alone:
+# THREE THINGS THAT WILL BITE YOU, each measured. BUILD_NOTES.md has the detail.
 #
-#   1. `--no-home --cleanenv` DOES NOT ISOLATE $HOME on Explorer. /etc/apptainer/apptainer.conf
-#      sets `mount home = yes` at SITE level, which those flags do not override. This matters
-#      because Explorer has a ~/R/x86_64-pc-linux-gnu-library that would silently SHADOW the
-#      image's packages -- the pinned environment defeated by a stray user library, with no
-#      error. A flag that looks like it prevents this and does not is worse than no flag.
-#      Use `--containall` plus explicit `--bind` for what the pipeline actually needs; both the
-#      isolation and the required reads/writes were verified.
-#   2. /tmp on the LOGIN NODE does not persist between an scp and a later ssh. It is not a safe
-#      staging path for the tarball. (Separately: never use shared /tmp on Explorer at all --
-#      a redirect there once collided with another user's file.)
-#   3. `docker save` of a PULLED multi-arch image yields a multi-manifest tarball that Apptainer
-#      refuses: "must specify a digest - layout contains multiple images". A LOCALLY BUILT image
-#      saves with exactly one manifest and converts cleanly, so nmd:1.0 is fine -- but adding
-#      `--provenance` or SBOM attestations to the build reintroduces extra manifests and breaks
-#      the conversion. That failure would surface much later and look unrelated to this file.
+#   1. Build LOCALLY and convert on the cluster — rootless image building is blocked by site
+#      configuration on Explorer, and is not fixable without an administrator.
+#   2. `docker save` of a PULLED multi-arch image yields a multi-manifest tarball Apptainer
+#      refuses. Save a LOCALLY BUILT image; `--provenance` and SBOM attestations reintroduce
+#      the extra manifests.
+#   3. ON APPLE SILICON, USE ROSETTA, NOT QEMU — qemu MISCOMPILES. gcc itself segfaults partway
+#      through a source build, which reads like a flaky package rather than a broken toolchain.
+#      `colima stop && colima start --vz-rosetta`, or Docker Desktop Settings > General.
 #
-# WHY linux/amd64 EXPLICITLY. The authoring laptop is arm64 and Explorer is x86_64. Left to
-# default, a build here produces an arm64 image that cannot run there and that most readers
-# cannot run either. Building amd64 on an arm64 host uses emulation, which is slow for
-# COMPILATION but cheap for downloads — which is why the binary package repository below
-# matters more than it looks.
+# --platform linux/amd64 is explicit because an arm64 build runs on neither the cluster nor most
+# readers' machines. Ncpus = 1 below is what keeps the build inside a small host's memory; raise
+# it on a larger machine.
 #
-# IF YOU BUILD THIS ON APPLE SILICON, USE ROSETTA, NOT QEMU. This is not a performance
-# preference; qemu MISCOMPILES. Measured here 2026-08-05: with Colima on `vmType: vz` and
-# `rosetta: false`, amd64 emulation falls back to qemu binfmt and gcc died with
-# `Segmentation fault (core dumped)` compiling globals.o for vctrs 0.7.2 — gcc itself crashing,
-# not the package failing to build. Any of the ~33 source builds can hit it, so the symptom
-# moves around and reads like a flaky package rather than a broken toolchain.
+# The analysis code and the data deposit are deliberately NOT in the image — it is the
+# environment and nothing else, so it cannot carry a stale copy of the code. Both bind-mount at
+# run time:
 #
-#     colima stop && colima start --vz-rosetta        # then rebuild
-#
-# Docker Desktop has the equivalent switch under Settings > General ("Use Rosetta for
-# x86_64/amd64 emulation"). A native x86_64 host needs none of this.
-#
-# THE HOST ALSO NEEDS MEMORY, AND THE AUTHORING LAPTOP BARELY HAD IT. 8 GB total RAM, all 8
-# allocated to the VM, is where the FIRST failure came from: four concurrent C++ compiles
-# exhausted it. Ncpus = 1 below is what makes that survivable, and it is why this build is
-# slow rather than parallel. On a machine with real memory, raise it.
-#
-# WHAT IS DELIBERATELY NOT IN THE IMAGE: the analysis code and the data deposit. The image is
-# the environment and nothing else, so re-running does not mean rebuilding, and so the image
-# cannot silently carry a stale copy of the code it is supposed to be neutral about. Both
-# bind-mount at run time:
-#
-#     docker run --rm -v "$PWD":/work -v /path/to/nmd_deposit_2026:/deposit nmd:1.0 \
-#            python3 tools/run_chain.py --room /work/room --run-id docker-1 --select ""
+#     docker run --rm -v "$PWD":/work -v /path/to/nmd_deposit_2026:/deposit nmd:1.0 <command>
 
 ARG TARGETPLATFORM=linux/amd64
 
@@ -138,26 +101,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # further down. Without it magick fails to CONFIGURE, and the R error names a header rather than a
 # Debian package, which is a long way from "apt-get install libmagick++-dev".
 
-# fonts-liberation IS ABOVE, AND IT IS THE ONE THING THE RECIPE DID NOT BUILD.
-#
-# The image the clean room actually ran -- nmd_1.2.sif, which produced job 9057341 -- was NOT built
-# from this file. `apptainer inspect` reports it as `bootstrap: localimage, from: nmd_1.1.sif`: an
-# Apptainer-side layer over 1.1, with no Docker path to it at all. Its whole 860 KB delta is four
-# Liberation Sans TTFs, extracted from a tar on /scratch by a def file that lived only there. The
-# recipe installed font LIBRARIES (libfontconfig1-dev, libfreetype6-dev) and NO FONT, so a reader
-# following ENVIRONMENT.md's "you build it ... there is no image to download" got a container that
-# renders every figure in whatever matplotlib falls back to.
-#
-# Measured 2026-08-11 on Explorer: nmd_1.1.sif carries 0 Liberation fonts, nmd_1.2.sif carries 4,
-# matplotlib inside 1.2 resolves "Liberation Sans", and Arial is absent from both. The def file is
-# preserved at tools/cleanroom/nmd_1.2_fonts.def because /scratch is not backed up and it was the
-# only record of how the image we ran came to exist.
-#
-# APT RATHER THAN THE TAR, deliberately: the package puts the same four files at the same path
-# (/usr/share/fonts/truetype/liberation/LiberationSans-{Regular,Bold,Italic,BoldItalic}.ttf), and a
-# version resolved from a pinned base image is more reproducible than a tarball on a scratch
-# filesystem. It may not be byte-identical to 1.2's tar -- which is one more reason the pixel gate
-# stays off under D120.
+# fonts-liberation IS LOAD-BEARING, and the recipe originally omitted it. It installed font
+# LIBRARIES (libfontconfig1-dev, libfreetype6-dev) and NO FONT, so anyone who built this image
+# rather than downloading one got a container rendering every figure in whatever matplotlib fell
+# back to. Arial is licensed and cannot be redistributed; Liberation Sans is the metric-compatible
+# substitute. Installed via apt so it resolves from the pinned base image. See BUILD_NOTES.md.
 
 # pandoc at the PINNED version, not the distribution's. Ubuntu ships a much older pandoc;
 # rmarkdown would accept it (it needs >= 1.12.3) and the reports would render, but they would
@@ -195,67 +143,33 @@ COPY renv.lock /tmp/renv.lock
 #
 # A real token would also be baked into image metadata and would ship inside the .tar and the
 # .sif. If one is ever genuinely needed, use a BuildKit secret mount rather than --build-arg.
-# PREBUILT BINARIES FROM A DATE-PINNED POSIT SNAPSHOT, AND WHY THE DATE IS NOT ARBITRARY.
+# PREBUILT BINARIES FROM A DATE-PINNED POSIT SNAPSHOT. Without this every package compiles from
+# source: renv::restore() installs from the repositories recorded in the LOCKFILE, not from
+# whatever the image has configured, and renv.lock's only repository serves SOURCE on Linux.
 #
-# The first build compiled all 182 packages from source because renv uses the lockfile's
-# repositories (CRAN, source-only on Linux) and ignores the image's. Four concurrent C++
-# compiles under qemu on a 7.7 GiB VM exhausted memory and killed stringi, data.table and
-# RcppParallel. Two independent changes below, because they fix two different things:
+# Two independent changes, fixing two different things. P3M serves prebuilt amd64 binaries for
+# Ubuntu noble, this image's platform. Ncpus = 1 serialises whatever still has to compile, so
+# each fallback gets the whole VM rather than a quarter of it -- that is what prevents the OOM;
+# the binaries only make it fast enough to be worth doing.
 #
-#   1. P3M serves prebuilt amd64 binaries for Ubuntu noble, which is exactly this image's
-#      platform. Measured against renv.lock at this snapshot: 153 of 187 packages match the
-#      pinned version exactly and install WITHOUT COMPILING; 30 differ in version; 3 are absent.
-#      The `latest` endpoint was NOT usable -- it had already moved to stringi 1.8.9 against our
-#      1.8.7 pin, which would have sent the worst offender straight back to source.
+# THE SNAPSHOT DATE IS A BUILD-SPEED LEVER ONLY, which is what makes it safe. renv installs the
+# version named in the lockfile: where the snapshot offers it, it is taken as a binary; where it
+# does not, renv falls back to source from the CRAN archive. Changing the date gives a faster or
+# slower build, never a different library.
 #
-#   2. Ncpus = 1 serialises whatever still has to compile, so each of the ~33 fallbacks gets the
-#      whole 7.7 GiB rather than a quarter of it. This is the change that actually prevents the
-#      OOM; the binaries just make it fast enough to be worth doing.
+# P3M GOES IN FRONT OF THE ORIGINAL REPOSITORIES, NEVER INSTEAD OF THEM. A dated snapshot holds
+# nothing newer than its date, so treating it as a replacement leaves every pin outside that
+# window with nowhere to come from and aborts the whole restore on one package.
+# cloud.r-project.org and bioconductor.org stay in the list, last, as the archive fallback.
+# !! KNOWN DEFECT, NOT YET FIXED: THE BINARY REPOSITORY BELOW IS LARGELY UNUSED. renv resolves a
+# package against the repo whose NAME matches the `Repository` field recorded for that package in
+# the lockfile. Most packages record `Repository: CRAN` -- and this list names the P3M snapshot
+# `P3M` while giving the name `CRAN` to cloud.r-project.org, which serves SOURCE on Linux. So renv
+# goes to source for packages whose matching binaries sit unused in the snapshot. It costs build
+# time only; the installed versions are correct either way.
 #
-# THE SNAPSHOT DATE DOES NOT AFFECT WHICH VERSIONS ARE INSTALLED, and that property is the
-# reason this is safe. renv installs the version named in the lockfile: where the snapshot
-# offers that version it is taken as a binary, and where it does not renv falls back to source
-# from the CRAN archive. The date is a build-speed lever ONLY. A reader who changes it gets a
-# faster or slower build, never a different library -- and the verification step that follows
-# would catch it if that were ever untrue.
-#
-# 2026-03-10 was chosen by measurement, not by intuition: it beat 2026-06-01 by 153 exact
-# matches to 130. No date serves all three heavy packages (data.table 1.18.0 needs January,
-# RcppParallel 5.1.11-2 needs March), so data.table remains a source build and is fine alone.
-#
-# P3M GOES IN FRONT OF THE ORIGINAL REPOSITORIES, NEVER INSTEAD OF THEM. Attempt 2 failed here:
-# it set `repos` to P3M alone, and `msigdbr 26.1.0` -- a pin NEWER than the snapshot -- became
-# unreachable, because a dated snapshot has no future packages and P3M's Archive/ does not carry
-# them either. renv tried four P3M archive paths, found nothing, and aborted the whole restore on
-# one package. The snapshot is an ACCELERATOR layered over the real repositories; the moment it
-# is treated as a replacement, every pin outside its date window has nowhere to come from.
-# cloud.r-project.org and bioconductor.org therefore stay in the list, last, as the fallback that
-# actually holds the archive. Order is what makes this both fast and complete: renv takes the
-# first repository that has the exact pinned version, so binaries win where they exist and source
-# is always reachable where they do not.
-# THE BINARY REPOSITORY BELOW IS LARGELY NOT BEING USED, AND THE REASON IS A DEFECT IN THIS
-# FILE. Measured on the 2026-08-05 build: 32 of 182 packages installed as binaries, not the
-# 153/187 the snapshot predicted. renv resolves a package against the repo whose NAME matches
-# the `Repository` field recorded FOR THAT PACKAGE in the lockfile. 147 packages record
-# `Repository: CRAN` -- and the repos list below names the P3M snapshot `P3M` while giving the
-# name `CRAN` to cloud.r-project.org, which serves SOURCE on Linux. So renv went to source for
-# 142 packages with the matching binaries sitting unused in the snapshot.
-#
-# The projection was not wrong about AVAILABILITY -- those exact versions are in the snapshot,
-# which was verified against renv.lock before the build. It was wrong about BEHAVIOUR: nobody
-# checked that renv would look there. Availability is not behaviour, and only the first was
-# tested.
-#
-# THE FIX, DELIBERATELY NOT APPLIED MID-BUILD: name the P3M snapshot `CRAN` so it wins the name
-# match, and demote cloud.r-project.org to a differently-named entry (e.g. `CRANarchive`) that
-# still serves as the archive fallback -- renv searches ALL repos for an exact version when the
-# named one lacks it, which is what attempt 2 demonstrated when it walked four archive URLs
-# before failing on msigdbr. Same for Bioconductor: the P3M mirrors should carry the canonical
-# `BioCsoft` / `BioCann` / `BioCexp` names and bioconductor.org should take the fallback names.
-#
-# It was left alone on 2026-08-05 because the restore layer was already cached at 6.68 GB, and
-# editing this RUN discards it: ~50 minutes of recompilation spent to save ~40. Apply it on the
-# next rebuild that is needed for some other reason.
+# The fix, and why it was deferred rather than applied mid-build, are in BUILD_NOTES.md. Apply it
+# on the next rebuild needed for some other reason.
 ARG P3M_SNAPSHOT=2026-03-10
 ARG BIOC_VERSION=3.22
 
@@ -284,38 +198,16 @@ RUN R -q -e 'pkgs <- names(renv::lockfile_read("/tmp/renv.lock")$Packages); \
              if (length(miss)) stop("restore incomplete: ", paste(miss, collapse = ", ")); \
              cat("all", length(pkgs), "packages load\n")'
 
-# hexbin AND mclust, INSTALLED HERE AND ABSENT FROM renv.lock (W293, revised 2026-08-05).
+# EIGHT PACKAGES INSTALLED HERE AND ABSENT FROM renv.lock. They are loaded by shipped code with
+# library() and appear in no environment file, so renv had no version to record. THE COMPLETENESS
+# GUARD ABOVE CHECKS ONLY WHAT renv.lock NAMES, so the restore passes while this code cannot run.
 #
-# Both are referenced by keep-list code and installed on no machine we can inspect, so renv had
-# no version to record and the lockfile does not mention them. An earlier version of this file
-# left them out on the grounds that installing would "pin whatever version today happens to
-# supply and assert a provenance we do not have."
+#   hexbin     REQUIRED. correlation_analysis.Rmd and two figure scripts. Without it geom_hex()
+#              drops the layer, exits 0, and leaves a plausible empty panel
+#   mclust     optional -- productive_response.Rmd guards it with requireNamespace
 #
-# THAT REASONING WAS IMPORTED FROM A CASE IT DOES NOT FIT. It holds when a known version is
-# being replaced by a guess. Here NO version was ever installed, so there is no original
-# provenance to protect -- the choice is not true-version against false-version, it is some
-# version against a silently broken result. Specifically:
-#
-#   hexbin   REQUIRED, not optional. geom_hex() in analysis/upstream/correlation_analysis.Rmd
-#            (lines 324, 425) and two figure scripts. ENVIRONMENT.md has recorded it missing
-#            since 2026-07-20 together with its failure mode: the layer drops, exit 0,
-#            plausible empty panel. So every run to date has rendered those panels degraded
-#            and nothing said so.
-#   mclust   genuinely optional. productive_response.Rmd:1027 guards it with
-#            eval = requireNamespace(...) and labels the chunk exploratory, so absent it
-#            silently skips by design. Installed anyway so the chunk actually runs rather
-#            than being permanently dark.
-#
-# Their versions are therefore NOT reproducible from renv.lock and must not be described as
-# such. Recorded as: version unknown at publication because the package was never present;
-# current CRAN installed here.
-# SIX MORE, ADDED 2026-08-12, AND THE SAME REASONING APPLIES TO ALL OF THEM. They are loaded by
-# shipped code with library() and appear in no environment file, found on the first publish where
-# the documentation check could actually fail. Three of them -- fgsea, pathview and tidyverse --
-# are recorded in ENVIRONMENT.md's version table AS PART OF THE ENVIRONMENT OF RECORD, which is
-# the sharp end of this: we documented the versions that produced the results and never put them
-# in the lockfile, so the container restored its 187 packages, the completeness guard above
-# passed, and this code still could not run. The guard checks only what renv.lock NAMES.
+# Their versions are NOT reproducible from renv.lock and must not be described as such: the
+# package was never present at publication, so this installs the pinned snapshot's version.
 #
 #   fgsea      Gene-Level_DGE_Summary_mashR.Rmd, interpret_isoform_patterns_mashr   [Bioconductor]
 #   pathview   Figures/make_pathway_allct.R                                          [Bioconductor]
@@ -352,8 +244,8 @@ RUN micromamba --version
 ENV MAMBA_ROOT_PREFIX=/opt/conda
 
 # Both environments, kept separate for the reason environment-figures.yml gives: they ran
-# under different Pythons, and merging them would mean choosing one matplotlib when
-# matplotlib 3.11.0 is the pin the figure byte-comparison depends on.
+# under different Pythons, and merging them would mean choosing one matplotlib when the figure
+# comparison depends on the pinned 3.10.8 — see the version note in environment-figures.yml.
 COPY environment-figures.yml /tmp/environment-figures.yml
 COPY environment-model.yml   /tmp/environment-model.yml
 
@@ -367,7 +259,7 @@ RUN if [ "$WITH_MODEL" = "true" ]; then \
 
 # IMPORT WHAT WAS INSTALLED. A solve can succeed, an install can succeed, and the result can still
 # be unimportable -- so an install check is not an environment check, exactly as renv::restore()'s
-# exit code is not a check that 187 packages load. This exists because on 2026-08-12 the file
+# exit code is not a check that 189 packages load. This exists because the file once
 # pinned shap 0.46 against numpy 2.4: both resolved, both installed, `docker build` exited 0, and
 # `import shap` raised `TypeError: Converting np.inexact or np.floating to a dtype not allowed`.
 # The image built cleanly and could not run the DeepSHAP or KernelSHAP steps -- the two steps the
@@ -388,8 +280,8 @@ RUN /opt/conda/envs/nmd_figures/bin/python -c \
 # the documentation does is the entire point of the check.
 #
 # It exists because on 2026-08-13 a SUCCESSFUL build shipped an image where bare `Rscript` resolved
-# to conda's R, whose only library holds pROC and none of the 187 packages, while the system R held
-# the 187 and not pROC. Neither could render the section 5 report, and a reader following the page
+# to conda's R, whose only library holds pROC and none of the 189 packages, while the system R held
+# the 189 and not pROC. Neither could render the section 5 report, and a reader following the page
 # got "there is no package called 'Isopair'" on a machine where it was plainly installed. Nothing
 # in the build noticed, because the R restore guard ran BEFORE the conda environments existed and
 # therefore before PATH changed under it.

@@ -72,9 +72,9 @@ identifiers:
   - type: doi
     value: "10.5281/zenodo.21897099"
     description: "Concept DOI — always the latest version of this reproduction package"
-license: MIT            # ⚠ placeholder — see LICENSE
-version: "0.1.0-draft"
-date-released: 2026-07-29
+license: MIT
+version: "1.0.12"
+date-released: 2026-08-15
 keywords:
   - nonsense-mediated decay
   - long-read RNA sequencing
