@@ -521,15 +521,22 @@ for f in figure5_panel[B-G]*.py; do python3 "$f"; done
 python3 figure5_composite.py            # assembles the seven panel PNGs
 ```
 
-**Panels C and D will not match the published figure as rendered, and that is deliberate.** The
-exporter writes each of them twice — `panelC_branch_importance.tsv` over **all isoforms, train and
-held-out pooled**, and `panelC_branch_importance_nmd.tsv` over **NMD isoforms only**. The published
-branch percentages (60.7 / 28.8 / 10.5) are the NMD-only population, because
-`11_kernel_shap_branches.py` computes that block over `nmd` and the manuscript does not say so. The
-panel script reads the *unsuffixed*, pooled file. So a reader who renders Panel C and compares it
-to the paper sees a mismatch that is a difference of population, not of result — compare against
-the `_nmd` variant instead. Panel B is held-out test only; pooling train and held-out is legitimate
-for interpretation and never for a performance number.
+**Panel C reproduces the paper exactly, and the file the panel reads is the right one.** The
+exporter writes it twice — `panelC_branch_importance.tsv` over **all isoforms, train and held-out
+pooled**, and `panelC_branch_importance_nmd.tsv` over **NMD isoforms only**. The panel script reads
+the unsuffixed, pooled file, and that is the population the paper reports: **54.6 / 31.4 / 14.0**
+(structural / stop / ATG), which rebuilds from the deposited artifact as 54.64 / 31.41 / 13.95 over
+n = 41,776. Use it as the check that your deposit and environment are wired correctly.
+
+The `_nmd` variant gives 59.0 / 29.4 / 11.6 over n = 9,321. It is a legitimate second view, not the
+paper's number — do not reconcile the two.
+
+**A caution if you find a different set of percentages elsewhere.** 60.7 / 28.8 / 10.5 belongs to
+the **superseded 500 nt model**, NMD-only, n = 2,268; it survives in
+`model.published_superseded_2026-07-28/` and in `results_4ct/`. It is not this paper's Figure 5C.
+
+Panel B is held-out test only. Pooling train and held-out is legitimate for interpretation and
+never for a performance number.
 
 **Three exporters write Panel G inputs and only one can be right for a given panel.**
 `data_export_deposit.py` writes the `_v1` names that `figure5_panelG_uorf_attention.py` actually
