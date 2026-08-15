@@ -541,27 +541,64 @@ apptainer exec --containall --bind "$REPO":/work --bind "$DATA_MASHR":/data_mash
 Bind the **directory**, never a file inside it — Apptainer refuses a bind destination that does not
 exist, where Docker creates one, so a file-level bind that works locally fails in the `.sif`.
 
-**`orf_model_report_v5.Rmd` USED TO BE THE FIRST COMMAND HERE AND HAS BEEN REMOVED. It cannot
-run on this chain, and it could never have run on it.** That report describes the **initial
-window sweep** — a 3×4 grid of twelve trained models — and reads
-`metrics_atg{A}_stop{S}.json`, one per cell, plus about fifty interpretation files named after
-the sweep's winner, `atg500_stop500`.
+**`orf_model_report_v5.Rmd` NOW RENDERS, AND ON 2026-08-15 IT DID SO END TO END FOR THE FIRST
+TIME.** It is an optional step — nothing else in §5 depends on it — but it is no longer a step
+you *cannot* run, which is what this page said for two days. The history is kept because the old
+reason is still quoted in older renders.
 
-This chain trains **one** configuration, the selected `atg1000_stop1000`, and names its outputs
-`metrics_<tag>_seed<N>_<split>.json`. So none of the twelve exist, `metrics_list` comes back
-empty, and the render died on `object 'auprc' not found` — a message that names neither the
-absent files nor the reason. Measured 2026-08-13, job 9162085. The report now stops at that
-point with an error that explains itself.
+```bash
+sbatch slurm_render_dn.sh        # from the MODEL repo, ~10 min, writes render_out/
+```
 
-**The two are different runs over different universes, not a current version and a stale one.**
-The sweep selected 500/500 on the published universe; 1000/1000 was re-selected on the
-deposit-native universe on 2026-08-04. A reader who "corrects" the report's 500 to 1000 will
-point every one of those fifty reads at files that do not exist.
+**IT RENDERS INSIDE `nmd_1.3.sif`, AND THAT IS NOT AN IMPLEMENTATION DETAIL.** Bare `Rscript` is
+not on the Explorer compute-node PATH — a plain `Rscript -e rmarkdown::render(...)` dies with
+`command not found`, exit 127 — and the node's module R would not help either, because this
+report needs `pROC` and `ggseqlogo`, which `nmd_1.2.sif` lacks and `nmd_1.3.sif` carries. The
+wrapper also redirects `TMPDIR` off the 64 MB `--containall` tmpfs, and sets `DEPOSIT` to
+`<deposit>/source_data/**model**` rather than `source_data`, because `make_architecture_figure.R`
+globs that path directly and **refuses to draw rather than guess a window size** if it resolves
+nothing. That last one disagrees with `config/paths.yml`, which defines `DEPOSIT` one level up —
+one name, two meanings.
 
-Rendering it needs the sweep tree, which this chain does not build and the deposit does not
-carry. **If you want that report, you have to run the sweep first**, which is a separate and
-much larger job than §5.7. Nothing else in §5 depends on it: `data_export_refaug.R` above is
-what feeds Figure 5.
+**And the disagreement is masked for us and not for a reader.** The figure script tries three
+roots and the first that resolves wins: `$DEPOSIT`, then `./data_deposit/source_data/model`, then
+a hardcoded home path. Run from the repo root the second root resolves, so the wrong `$DEPOSIT`
+never surfaces here — which is presumably why nobody noticed. It fails only when roots 2 and 3
+also miss: a reader who extracted the deposit elsewhere and set `DEPOSIT` per `paths.yml`, which
+is exactly the scenario the variable exists for.
+
+**SECTION 9.11 NEVER RENDERS, BY CONSTRUCTION.** It needs
+`deepshap_all_orfs_summary_<tag>_seed42.tsv`, which **no code in either repository produces** —
+the only mention is a comment — and which exists in no results tree. The report guards it with
+`file.exists`, so the section reports itself as intentionally not generated. Every other input the
+report needs now exists.
+
+*What was true until 2026-08-14, and is now fixed:* the report read `metrics_atg{A}_stop{S}.json`,
+one per cell of the **published** 2026-04 sweep. This chain names its outputs
+`metrics_<tag>_seed<N>_<split>.json`, so none of the twelve existed, `metrics_list` came back
+empty, and the render died on `object 'auprc' not found` — a message naming neither the absent
+files nor the reason. Measured 2026-08-13, job 9162085.
+
+*What is true now:* on Pete's instruction the report's Section 1 reads the **deposit-native**
+sweep, `results_sweep_dn_2026-08-04` — 12 configurations × 5 paired seeds, scored on `val_clean`.
+It resolves that tree through `NMD_SWEEP_DIR`, separately from `NMD_RESULTS_DIR`, because the
+sweep and the selected model are different runs in different directories.
+
+**THE ONE THING A DEPOSIT-ONLY READER STILL CANNOT DO IS SECTION 1.** The deposit carries two
+metrics files — the superseded `metrics_atg500_stop500.json` and the deposited model's
+`metrics_atg1000_stop1000_seed42_test_clean.json` — and **not** the sweep's 60. Section 1
+describes the window sweep, so on a deposit-only tree it fails its guard while every other
+section renders. Running the sweep to recover it is a far larger job than the whole of §5.7; the
+60 files are small and depositing them would close it.
+
+**The two sweeps are different runs over different universes, not a current version and a stale
+one — and their conclusions differ.** The published one scored all twelve cells on `test_clean`,
+which is the leak D67 records; the deposit-native one scores `val_clean` across five seeds. The
+published sweep reported *"STOP=500 is optimal by AUC"*; in the deposit-native sweep the STOP=500
+configurations rank 7th, 8th and 9th of 12 and the gap between the best two cells is smaller than
+the seed-to-seed spread within one cell. **Do not reconcile the two by editing numbers.**
+
+Nothing else in §5 depends on this report: `data_export_refaug.R` above is what feeds Figure 5.
 
 **Flags whose omission fails silently or late:**
 
