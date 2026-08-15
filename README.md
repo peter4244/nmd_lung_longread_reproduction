@@ -47,10 +47,10 @@ follow **its own `README.md`**, which owns the on-disk layout: what each file co
 arrange-and-verify commands, and the checksum manifests. The record is open access — no token or
 account needed.
 
-One hazard is worth repeating here because it is silent. The code resolves its deposit root to
-`<deposit>/source_data`, and **extracting flat produces no error at all** — every path then points
-into a directory that does not exist, and the wiring check prints resolved paths without testing
-them.
+One hazard is worth repeating here. The code resolves its deposit root to `<deposit>/source_data`,
+so **extracting flat leaves every path pointing into a directory that does not exist.** The wiring
+check in [`REPRODUCTION.md`](REPRODUCTION.md) §3 catches this and warns `DOES NOT RESOLVE`, but it
+warns rather than stops — so read its output instead of assuming a clean run.
 
 [`REPRODUCTION.md`](REPRODUCTION.md) picks up from there, starting with the symlink that points
 this repository at your copy of the data.
