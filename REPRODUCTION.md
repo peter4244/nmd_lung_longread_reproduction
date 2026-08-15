@@ -497,6 +497,21 @@ trace in the outputs.
 with 2,405 NMD susceptible**, `evaluation_class = final_test`, `best_epoch = 5`, window 1000/1000,
 `member_seed = 42`. These are the numbers §5 reports at its own precision, 0.93 and 0.82.
 
+**To recompute every §5 number rather than read them one at a time**, use the producer that exists
+for it. It reads only the deposit, emits each quantity with its population attached, and prints a
+human-readable table with `--print`:
+
+```bash
+python3 analysis/section5/derive_section5_numbers.py --print   # inspect, emit nothing
+python3 analysis/section5/derive_section5_numbers.py           # emit
+```
+
+It reports each branch share over **all three universes** — all isoforms, NMD-only, non-NMD — so a
+value cannot be read without the set it was computed over. The paper's Figure 5C percentages are
+the all-isoform row. One quantity, claim 5.3.3, comes from a second producer in the model
+repository and needs a non-deposit input; absent that, the script skips it and says so rather than
+substituting.
+
 ### 5.8 Figure 5 and the remaining supplemental figures
 
 > **This order is inferred from the scripts, not transcribed from a recorded run.** It was derived
