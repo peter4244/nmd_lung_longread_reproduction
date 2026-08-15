@@ -16,10 +16,9 @@ pointing at the files of the version that minted it.
 The record's own README owns the layout — follow it to arrange the files into
 `<deposit>/source_data`. Two points from it decide whether the rest of this page works:
 
-- **Extracting flat is the one layout that fails silently.** Every path then points into a
-  directory that does not exist, and nothing reports an error — the wiring check in §3 prints the
-  resolved paths but does not test that they exist. Read its output rather than trusting that it
-  ran clean.
+- **Extracting flat leaves every path pointing into a directory that does not exist.** The wiring
+  check in §3 catches this and warns `DOES NOT RESOLVE`. It warns rather than stops, so read its
+  output rather than trusting that the command ran clean.
 - **On a shared cluster, extract inside a batch allocation.** `sqanti.zip` writes 4.2 GB, and a
   login-node process limit can kill `unzip` part-way; the truncated tree then fails the manifest
   in a way that looks like a corrupt download.
@@ -124,11 +123,17 @@ Check the wiring before running anything:
 Rscript -e 'source("R/load_config.R"); str(nmd_paths())'
 ```
 
-**Read the output; it does not check itself.** `nmd_paths()` normalizes each declared path with
-`mustWork = FALSE`, so it prints a plausible absolute path whether or not anything is there — a
-correct deposit and a flat-extracted one produce identical, healthy-looking output. `DEPOSIT`,
-`SQANTI`, `ISOCALL` and `ANNOT` must point *into* your deposit; confirm that by eye before going
-further. `CACHE` and `OUT` are outputs, created on demand. The `LEGACY`/`FIGDATA`/`MASHR_*`/`ISOPAIR` roots point at
+**`nmd_paths()` checks the seven deposit-resident keys and warns if any is missing:**
+
+```
+Warning: nmd_paths(): 7 of 7 deposit paths DOES NOT RESOLVE -- DEPOSIT=…; SQANTI=…
+  The deposit must be arranged as <deposit>/source_data; see REPRODUCTION.md §1.
+```
+
+`DEPOSIT`, `SQANTI`, `ISOCALL`, `ANNOT`, `MODEL_RESULTS`, `FEATURES` and `PHENO` must point into
+your deposit. **It warns rather than stops**, because rebuilding figures from cached intermediates
+is a legitimate run that does not need the deposit mounted — so a warning here is not something to
+scroll past. `CACHE`, `OUT` and `ISOPAIR_OUT` are outputs, created on demand and not checked. The `LEGACY`/`FIGDATA`/`MASHR_*`/`ISOPAIR` roots point at
 intermediates on the authoring machine; they are not needed to reproduce from the deposit and will
 not resolve elsewhere.
 

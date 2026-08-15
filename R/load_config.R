@@ -52,6 +52,36 @@ nmd_paths <- function(root = nmd_repo_root()) {
   # check at the top of a run that claims to be a projection, rather than a silent change to
   # semantics a script deliberately depends on. A guard is the right instrument for "you did not
   # mean this"; redefining resolution is not.
+  # DEPOSIT-RESIDENT KEYS ARE CHECKED FOR EXISTENCE. NOTHING ELSE IS.
+  #
+  # normalizePath(mustWork = FALSE) above returns a plausible absolute path whether or not
+  # anything is there, so a correctly arranged deposit and a flat-extracted one printed IDENTICAL
+  # healthy-looking output. Three documents told readers the wiring check reports
+  # "DOES NOT RESOLVE" on a flat extraction; nothing emitted it. This is that check.
+  #
+  # The set is derived from the DECLARED value rather than hardcoded, so it stays correct when
+  # paths.yml changes: any key declared under data_deposit/ is deposit-resident. That
+  # deliberately excludes the ../nmd roots (LEGACY, FIGDATA, MASHR_*, ISOPAIR, REFERENCE,
+  # MANUSCRIPT), which are authoring-machine intermediates a reader is not expected to have;
+  # the tmp/ roots (OUT, CACHE, ISOPAIR_OUT), which are outputs created on demand; and MODEL,
+  # a sibling clone needed only by section 5. Warning about those would fire on every correct
+  # run, and a guard that cries wolf gets ignored -- which is how the last one came to be
+  # documented but absent.
+  #
+  # WARN RATHER THAN STOP, deliberately. Rebuilding figures from cached intermediates is a
+  # legitimate run that does not need the deposit mounted. The goal is that the failure stops
+  # being SILENT, not that it stops being possible.
+  deposit_keys <- names(raw)[startsWith(unlist(raw), "data_deposit/")]
+  unresolved   <- Filter(function(k) !file.exists(out[[k]]), deposit_keys)
+  if (length(unresolved)) {
+    warning("nmd_paths(): ", length(unresolved), " of ", length(deposit_keys),
+            " deposit paths DOES NOT RESOLVE -- ",
+            paste(sprintf("%s=%s", unresolved, unlist(out[unresolved])), collapse = "; "),
+            "\n  The deposit must be arranged as <deposit>/source_data; see REPRODUCTION.md §1.",
+            "\n  Extracting the Zenodo files flat is the usual cause.",
+            call. = FALSE, immediate. = TRUE)
+  }
+
   out$ROOT <- root
   attr(out, "from_env") <- from_env
   out
