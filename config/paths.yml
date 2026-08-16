@@ -42,13 +42,23 @@ MODEL:     ../NMD_orf_model_v5_4ct         # deep-learning model repo (Fig 5 int
 # The replacement run IS DEPOSITED and needs no sibling repo and no GPU: source_data/model/,
 # 32 files plus its MANIFEST — the checkpoint, predictions, the mode-qualified DeepSHAP
 # summaries, the KernelSHAP branch table and the motif logos. Identify it by the deposited
-# checkpoint sha256 42399a1b..., and by metrics AUC 0.9257 / AUPRC
-# 0.8175 over n_test 10,522 against the published 0.9306 / 0.8330 over 10,131.
+# checkpoint sha256 42399a1b..., and by metrics AUC 0.9257 / AUPRC 0.8175 over n_test 10,522 --
+# which is what the MANUSCRIPT reports at its own precision: "an AUC of 0.93 and AUPRC of 0.82 on
+# the held-out test set (n = 10,522 isoforms, 2,405 NMD susceptible)".
+#
+# TWO CORRECTIONS HERE, 2026-08-15, both found by an outside reader of the published package.
+#
+# This comment used to add "against the published 0.9306 / 0.8330 over 10,131". That is a
+# superseded vintage and it CONTRADICTED the manuscript, which moved to the deposit-native values
+# -- so a reproducer comparing against it would have judged a correct rebuild to be wrong. Checked
+# against the manuscript itself, not against the ledger's record of it.
+#
+# It also claimed "03_train.py and evaluate.py were both renamed on 2026-07-29 ... so the current
+# code does not reproduce these filenames. See W295." Both files exist under those names in the
+# model repository today, so the claim is false; and W295 is a worklog row a reader cannot see.
 #
 # CAVEAT, and it is not small: these are the model's OUTPUTS, deposited 2026-07-28. Running the
-# consumers against them demonstrates the analysis code, NOT the training. And the deposited
-# names are pre-B1/B2 -- 03_train.py and evaluate.py were both renamed on 2026-07-29, the day
-# after -- so the current code does not reproduce these filenames. See W295.
+# consumers against them demonstrates the analysis code, NOT the training.
 MODEL_RESULTS: data_deposit/source_data/model
 
 # WHERE THE STAGE C FEATURE TABLES ARE, which is not always where the MODEL artifacts are.

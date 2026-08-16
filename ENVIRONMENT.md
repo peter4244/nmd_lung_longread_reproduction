@@ -38,9 +38,28 @@ The invocation is part of the environment. Three flags are mandatory, and none o
 itself when omitted — each produces a plausible wrong answer rather than an error.
 
 ```bash
-apptainer exec --containall --nv --bind "$REPO":/work --bind "$DEPOSIT":/deposit --pwd /work \
+export REPO=/path/to/nmd_lung_longread_reproduction   # your clone of this repository
+export DEPOSIT_ROOT=/path/to/nmd_deposit_2026         # the deposit root — the directory holding source_data/
+
+apptainer exec --containall --nv \
+  --bind "$REPO":/work --bind "$DEPOSIT_ROOT":"$DEPOSIT_ROOT" --pwd /work \
   nmd_1.3.sif <command>
 ```
+
+**Bind the deposit at its own host path, not at `/deposit`.** REPRODUCTION.md §3 has you create a
+`data_deposit` symlink inside the repository pointing at the deposit root. That symlink stores an
+absolute host path, so if the deposit is bound anywhere else, `--containall` leaves it dangling
+inside the container and all seven deposit keys fail to resolve — the wiring check reports
+`DOES NOT RESOLVE` and nothing else works. Binding it at the same path it has on the host makes the
+symlink resolve identically inside and out.
+
+**Do not export a variable called `DEPOSIT`.** Two §5 scripts —
+`analysis/section5/derive_section5_numbers.py` and
+`figures/multipanel/figure5_dl_model/data_export_deposit.py` — read `DEPOSIT` as the **model
+subdirectory** (`<deposit>/source_data/model`), while `config/paths.yml` uses the name for
+`<deposit>/source_data`. Exporting it as the record root silently points those two scripts two
+levels too high; they fail by finding nothing rather than by erroring. `DEPOSIT_ROOT` above avoids
+the collision.
 
 | Flag | Omitting it causes |
 |---|---|

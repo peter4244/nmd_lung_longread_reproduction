@@ -42,10 +42,20 @@ is relative to the image the analyses actually ran under, and why three flags ar
 invocation is repeated once here because every command below assumes it:
 
 ```bash
+export REPO=/path/to/nmd_lung_longread_reproduction   # your clone of this repository
+export DEPOSIT_ROOT=/path/to/nmd_deposit_2026         # the deposit root — the directory holding source_data/
+
 apptainer exec --containall --nv \
-  --bind "$REPO":/work --bind "$DEPOSIT":/deposit --pwd /work \
+  --bind "$REPO":/work --bind "$DEPOSIT_ROOT":"$DEPOSIT_ROOT" --pwd /work \
   nmd_1.3.sif <command>
 ```
+
+**The deposit is bound at its own host path deliberately.** §3 has you create a `data_deposit`
+symlink inside the repository, and a symlink stores an absolute path — so binding the deposit
+anywhere else leaves it dangling inside the container and every deposit key unresolved.
+[`ENVIRONMENT.md`](ENVIRONMENT.md) explains this and the `DEPOSIT` naming collision that goes with
+it; **do not export a variable called `DEPOSIT`**, because two §5 scripts read that name as the
+model subdirectory rather than the record root.
 
 **Commands on this page are written for a host shell.** To run one inside the container, wrap it
 in the invocation above **and** prefix every `NMD_*` variable with `APPTAINERENV_`:
@@ -563,7 +573,10 @@ more than one — they overwrite into the same `data/` directory.
 §5.7's optional model report; that one lives in the model repository.
 
 **The fifteen remaining supplemental figures.** SF25–SF32 read isopair outputs, so run them after
-§5.5. SF37–SF43 read model outputs, so run them after §5.7 or from `model.zip`.
+§5.5. SF37–SF43 read model outputs, so run them after §5.7 or from `model.zip` — **with one
+exception: SF40 cannot be built from `model.zip` at all.** It needs `tx_summary.tsv`, which
+`export_rds.R` writes (§5.3) and which is not among the 32 files in the archive. The same is true
+of `data_export_refaug.R` in §5.8's Figure 5 chain.
 
 ```bash
 # after §5.5 — isopair-derived
