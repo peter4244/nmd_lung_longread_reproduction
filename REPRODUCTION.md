@@ -125,7 +125,13 @@ That symlink is deliberately not stored in git: a stored one would carry the ori
 folder layout and then fail on your machine while looking as though it had worked.
 
 Resolution order per key is environment variable `NMD_<KEY>` → `config/paths.yml` → relative to
-the repository root. A one-off override is `NMD_DEPOSIT=/elsewhere/source_data Rscript analysis/…`.
+the repository root.
+
+**The symlink is the only route that moves the whole deposit.** Each key is declared independently
+in `paths.yml`, so `NMD_DEPOSIT=/elsewhere/source_data` relocates **one key of seven** and leaves
+`SQANTI`, `ISOCALL`, `MODEL_RESULTS`, `FEATURES`, `ANNOT` and `PHENO` still pointing inside the
+repository — measured. The wiring check below reports exactly that, so the failure is visible, but
+do not reach for a single `NMD_DEPOSIT` override expecting it to relocate the deposit.
 
 Check the wiring before running anything:
 
@@ -453,6 +459,8 @@ reach it — a sibling directory is outside the bound tree — so bind it explic
 container-side path:
 
 ```bash
+export DATA_MASHR=/path/to/data_mashr    # wherever §3 or §5.2 actually put it
+
 apptainer exec --containall --nv --bind "$REPO":/work --bind "$DATA_MASHR":/data_mashr --pwd /work \
   Rscript figures/multipanel/figure5_dl_model/data_export_refaug.R --data-dir /data_mashr
 ```
@@ -605,9 +613,10 @@ Rscript analysis/predictor_comparison/03_score_nmdep_rule_baseline.R
 Rscript analysis/predictor_comparison/04_compute_metrics.R
 ```
 
-**Mind the datestamp.** `04_compute_metrics.R` names its outputs from a `DATESTAMP` variable, while
-`figure_s_model_comparison.py` and `nmd_predictor_comparison.Rmd` each hardcode a different date.
-If SF43 reports a missing input, that mismatch is the first thing to check.
+**Mind the datestamp.** `04_compute_metrics.R:37` names its outputs from `DATESTAMP <- "2026.8.6"`,
+and `figure_s_model_comparison.py` reads that same stamp — so SF43 works as shipped. The stale
+consumer is `nmd_predictor_comparison.Rmd`, which hardcodes `2026.7.11` and is **not part of this
+run order**. If you run it anyway, that mismatch is why it cannot find its input.
 
 ## Known gaps
 

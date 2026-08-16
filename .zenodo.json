@@ -73,5 +73,27 @@
       "affiliation": "Channing Division of Network Medicine, Mass General Brigham, Harvard Medical School, Boston, MA, USA"
     }
   ],
-  "description": "<p>Analysis code that reproduces the figures and reported numbers of Leshem et al., <em>Long Read RNA Sequencing in Primary Lung Cell Types Reveals Principles of Nonsense-Mediated Decay</em>.</p><p><strong>Code only.</strong> The data this code runs on are archived separately as the source-data record (DOI 10.5281/zenodo.21544336), which also carries the container image <code>nmd_1.2.sif</code> pinning the exact R and Python versions the analyses ran under. Raw sequencing reads are in NCBI GEO under GSE329233 and are not required.</p><p>See <code>REPRODUCTION.md</code> for the run order and <code>docs/VERIFIED.md</code> for the per-claim record of what the rebuild reproduces and where it differs.</p>"
+  "description": "<p>Analysis code that reproduces the figures and reported numbers of Leshem et al., <em>Long Read RNA Sequencing in Primary Lung Cell Types Reveals Principles of Nonsense-Mediated Decay</em>.</p><p><strong>Code only.</strong> The data this code runs on are archived separately as the source-data record (DOI 10.5281/zenodo.21544336), which also carries the container image <code>nmd_1.3.sif</code>. That image is a corrected rebuild from the same pinned lockfile as the image the analyses ran under, rather than a byte-identical copy of it; the source-data record's own README explains the difference. Raw sequencing reads are in NCBI GEO under GSE329233 and are not required.</p><p><strong>Start with <code>README.md</code></strong>, which gives the reading order. <code>ENVIRONMENT.md</code> covers the container and how to run it; <code>REPRODUCTION.md</code> gives the ordered run; <code>RESULTS_INDEX.md</code> maps reported numbers to the scripts that produce them.</p>",
+  "related_identifiers": [
+    {
+      "identifier": "10.5281/zenodo.21544336",
+      "relation": "isSupplementedBy",
+      "resource_type": "dataset"
+    },
+    {
+      "identifier": "10.5281/zenodo.21536494",
+      "relation": "references",
+      "resource_type": "software"
+    },
+    {
+      "identifier": "10.5281/zenodo.21536485",
+      "relation": "references",
+      "resource_type": "software"
+    },
+    {
+      "identifier": "10.5281/zenodo.21536501",
+      "relation": "references",
+      "resource_type": "software"
+    }
+  ]
 }

@@ -92,23 +92,30 @@ mount error that reads like several unrelated defects.
 
 **R 4.5.2 (2025-10-31), Bioconductor 3.22**
 
+**`renv.lock` is authoritative** and pins all 189. This table is a selection of the ones most
+likely to move a number, read straight out of the lockfile — if the two ever disagree, the lockfile
+is right.
+
 | Package | Version | | Package | Version |
 |---|---|---|---|---|
-| data.table | 1.18.0 | | msigdbr | 26.1.0 |
-| dplyr | 1.2.1 | | htmltools | 0.5.9 |
-| ggplot2 | 4.0.1 | | readxl | 1.4.5 |
-| edgeR | 4.8.2 | | knitr | 1.51 |
-| tidyr | 1.3.1 | | jsonlite | 2.0.0 |
-| tibble | 3.3.1 | | fgsea | 1.36.2 |
-| patchwork | 1.3.2 | | Biostrings | 2.78.0 |
-| scales | 1.4.0 | | AnnotationDbi | 1.72.0 |
-| Isopair | 0.99.4 | | pathview | 1.50.0 |
+| data.table | 1.18.0 | | ashr | 2.2-63 |
+| dplyr | 1.2.1 | | topGO | 2.62.0 |
+| ggplot2 | 4.0.1 | | msigdbr | 26.1.0 |
+| edgeR | 4.8.2 | | htmltools | 0.5.9 |
+| tidyr | 1.3.1 | | readxl | 1.4.5 |
+| tibble | 3.3.1 | | knitr | 1.51 |
+| patchwork | 1.3.2 | | jsonlite | 2.0.0 |
+| scales | 1.4.0 | | Biostrings | 2.78.0 |
+| Isopair | 0.99.4 | | AnnotationDbi | 1.72.0 |
 | reshape2 | 1.4.5 | | GenomicRanges | 1.62.1 |
 | org.Hs.eg.db | 3.22.0 | | rtracklayer | 1.70.1 |
 | mashr | 0.2.79 | | matrixStats | 1.5.0 |
-| limma | 3.66.0 | | tidyverse | 2.0.0 |
-| ashr | 2.2.63 | | DT | 0.34.0 |
-| topGO | 2.62.0 | | | |
+| limma | 3.66.0 | | DT | 0.34.0 |
+
+**`fgsea`, `pathview` and `tidyverse` were listed here with versions and are NOT in `renv.lock`.**
+They are among the eight packages the container installs separately, so their versions are not
+reproducible from the lockfile and must not be presented as if they were. They served code that
+does not ship in this package, so they are simply removed rather than moved.
 
 **Python 3.12.12**
 
