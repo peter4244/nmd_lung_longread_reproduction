@@ -603,10 +603,29 @@ more than one — they overwrite into the same `data/` directory.
 §5.7's optional model report; that one lives in the model repository.
 
 **The fifteen remaining supplemental figures.** SF25–SF32 read isopair outputs, so run them after
-§5.5. SF37–SF43 read model outputs, so run them after §5.7 or from `model.zip` — **with one
-exception: SF40 cannot be built from `model.zip` at all.** It needs `tx_summary.tsv`, which
-`export_rds.R` writes (§5.3) and which is not among the 32 files in the archive. The same is true
-of `data_export_refaug.R` in §5.8's Figure 5 chain.
+§5.5. SF37–SF43 read model outputs, so run them after §5.7 or from `model.zip`.
+
+The four notes below are **measured**, from a run of this section on a fresh cluster account on
+2026-08-16 in which 23 of 32 steps succeeded. The rest of §5.8 remains inferred.
+
+**Run `data_export_refaug.R` before SF31, SF32, SF40 and SF41 — and it needs no GPU.** It is listed
+as §5.7 step 8, and §5.7 opens by saying you do not need to run any of it, so a reader who takes
+that at its word cannot build four supplemental figures and gets no hint why. All four trace to one
+missing file, `figures/multipanel/figure5_dl_model/data/subset2_refaug_isoforms.tsv`, which that
+script writes. SF31's own `data_export.R` reads it; SF32 then reads SF31's output, so one absent
+export takes out four figures across two chains. The script does additionally need
+`tx_summary.tsv`, which `export_rds.R` writes in §5.3 and which is **not** among `model.zip`'s 32
+files — so §5.3 is a real prerequisite here even though nothing else in §5.8 needs it.
+
+**SF26 holds two scripts and the order between them matters.** `cascade_counts.R` writes
+`cascade_counts.tsv`; `build_flowchart.R` reads it. Running the directory's scripts alphabetically
+puts the consumer first and it fails with `missing .../data/cascade_counts.tsv`. This is the one
+directory where "run the single figure script" does not apply.
+
+**SF43 cannot be built from any run order in this document.** It reads
+`per_isoform_scores_2026.8.6.tsv` and `metrics_summary_2026.8.6.tsv`, which are written by the
+four-step chain in `analysis/predictor_comparison/`, and no section here invokes that chain. Run
+`01_extract_our_isoforms.R` through `04_compute_metrics.R` in that directory first.
 
 ```bash
 # after §5.5 — isopair-derived
