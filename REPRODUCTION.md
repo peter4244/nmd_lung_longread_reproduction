@@ -172,7 +172,11 @@ Run the steps in the order below. Outputs go to `tmp/out/` and figures to `figur
 writes into the input tree.
 
 Wall times are from one laptop run, so that a twenty-minute step is not mistaken for a hang.
-**Expect 2–3× longer on a shared cluster.**
+**On a shared cluster expect up to 4× longer, and size any time limit from the top of that range,
+not the middle.** One measured run on Explorer put the §5.2 block at 3.65× overall, with its two
+longest steps at 4.2× and 4.0×; a limit set from a 2–3× estimate expires part-way through profile
+building, after hours of good work. Individual steps varied from 0.2× to 4.2×, so per-step
+extrapolation is unreliable — budget the block, not the step.
 
 An `.Rmd` step must be **rendered, not sourced** — `Rscript file.Rmd` will not work.
 
@@ -526,9 +530,16 @@ python3 analysis/section5/derive_section5_numbers.py           # emit
 
 It reports each branch share over **all three universes** — all isoforms, NMD-only, non-NMD — so a
 value cannot be read without the set it was computed over. The paper's Figure 5C percentages are
-the all-isoform row. One quantity, claim 5.3.3, comes from a second producer in the model
-repository and needs a non-deposit input; absent that, the script skips it and says so rather than
-substituting.
+the all-isoform row. One quantity, claim 5.3.3, is deliberately not recomputed here:
+`10_export_stop_codon_freq_sf37.py` in the model repository computes the stop-codon frequencies and
+their Fisher tests, and this script reads that producer's two output tables rather than
+reimplementing them — two implementations of one quantity is the failure this project is named for.
+
+Both tables ship in the deposit under `model/`, so the script resolves them by default and reports
+the quantity like any other. The distinction worth holding: *regenerating* those tables needs
+`selected_orfs.tsv`, which is not a deposit file, but *reading* them needs only the deposit. Set
+`STOP_CODON_DIR` to point at a fresh export instead; if the tables are absent from both, 5.3.3 is
+skipped and says so rather than substituting.
 
 ### 5.8 Figure 5 and the remaining supplemental figures
 
