@@ -74,15 +74,30 @@ same image report identical library paths. Assert isolation directly at the head
 [ -z "$(ls -A "$HOME" 2>/dev/null)" ] || { echo "NOT ISOLATED: \$HOME is not empty" >&2; exit 1; }
 ```
 
-**Set `TMPDIR` and `SQLITE_TMPDIR`.** `--containall` gives `/tmp` a 64 MB tmpfs and leaves
-`TMPDIR` unset. That is not enough for `productive_response.Rmd`'s `AnnotationDbi::select()`,
-which fails with `database or disk is full` on a filesystem with terabytes free. Point both at a
-bound directory with real space; setting the variables is preferable to binding over `/tmp`,
-which leaves Apptainer's own tmpfs handling alone.
+**Set `TMPDIR` and `SQLITE_TMPDIR`, and prefix both with `APPTAINERENV_`.** `--containall` gives
+`/tmp` a 64 MB tmpfs and leaves `TMPDIR` unset. That is not enough for `productive_response.Rmd`'s
+`AnnotationDbi::select()`, which fails with `database or disk is full` on a filesystem with
+terabytes free. Point both at a bound directory with real space; setting the variables is
+preferable to binding over `/tmp`, which leaves Apptainer's own tmpfs handling alone.
+
+**`--containall` also discards the shell environment**, so a plain `export TMPDIR=…` arrives empty
+inside the container and you hit the failure anyway. Apptainer passes a variable through only when
+it is prefixed with `APPTAINERENV_`, and that applies to every variable you need inside — not only
+the `NMD_*` ones REPRODUCTION.md names.
 
 ```bash
---bind <scratch>:<scratch>   TMPDIR=<scratch>/sqlite_tmp   SQLITE_TMPDIR=<scratch>/sqlite_tmp
+export SCRATCH=/path/with/real/space
+mkdir -p "$SCRATCH/sqlite_tmp"
+export APPTAINERENV_TMPDIR="$SCRATCH/sqlite_tmp"
+export APPTAINERENV_SQLITE_TMPDIR="$SCRATCH/sqlite_tmp"
+
+apptainer exec --containall --nv \
+  --bind "$REPO":/work --bind "$DEPOSIT_ROOT":"$DEPOSIT_ROOT" --bind "$SCRATCH":"$SCRATCH" \
+  --pwd /work nmd_1.3.sif <command>
 ```
+
+To confirm it took, run `echo $TMPDIR` inside the container: it should print the path, not an
+empty line.
 
 **Bind a directory, never a file.** Apptainer refuses a bind destination that does not exist,
 where Docker creates one — so `--bind file:/tmp/x` works locally and fails in the image with a
