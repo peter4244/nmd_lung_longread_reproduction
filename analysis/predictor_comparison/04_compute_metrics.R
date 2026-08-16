@@ -7,9 +7,15 @@
 # RMSE against the gold standard (mashr posterior-mean log-FC under SMG1i),
 # stratified by subclass.
 #
-# Outputs:
-#   per_isoform_scores_2026.7.11.tsv  — combined per-isoform score table
-#   metrics_summary_2026.7.11.tsv     — pooled and stratified metrics
+# Outputs, named from DATESTAMP below — currently 2026.8.6:
+#   per_isoform_scores_<DATESTAMP>.tsv  — combined per-isoform score table
+#   metrics_summary_<DATESTAMP>.tsv     — pooled and stratified metrics
+#
+# THE STAMP IS COUPLING, AND IT HAS BITTEN ONCE. Both consumers hardcode the filename:
+# nmd_predictor_comparison.Rmd and SF43's figure_s_model_comparison.py. When DATESTAMP moved to
+# 2026.8.6 the figure script followed and the Rmd did not, so for a while the Rmd read the
+# superseded 2026.7.11 tables and rendered without error -- both vintages are on disk, so nothing
+# failed. Change DATESTAMP and you must change both consumers in the same commit.
 # =============================================================================
 
 suppressPackageStartupMessages({

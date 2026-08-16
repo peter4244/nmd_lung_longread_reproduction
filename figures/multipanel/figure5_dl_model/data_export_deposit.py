@@ -23,11 +23,12 @@ paper's Figure 5C reports 54.6 / 31.4 / 14.0, and the pooled universe gives 54.6
 over n=41,776 -- an exact reproduction. The NMD-only subset gives 59.01 / 29.43 / 11.56 over
 n=9,321 and is NOT the paper's number.
 
-60.7 / 28.8 / 10.5 is real but belongs to the SUPERSEDED 500nt model, NMD-only, n=2,268 --
+60.7 / 28.8 / 10.5 is real but belongs to the SUPERSEDED 500nt model over its NMD-only subset --
 reproduced exactly from results_4ct/kernel_shap_branch_atg500_stop500.tsv and from
 model.published_superseded_2026-07-28/. Calling it "the published percentages" here sent a reader
 to compare the current figure against a retired one. Corrected rather than deleted, because the
-number exists and will be found again.
+number exists and will be found again. The retired cohort size is deliberately not restated here:
+tools/check.py ratchets how far that constant may spread, and this file was the hit that broke it.
 
 WHAT IT DOES NOT COVER, so a gap is not mistaken for completeness:
   SF38     -- needs selected_orfs.tsv, an Explorer file. See task #6.
