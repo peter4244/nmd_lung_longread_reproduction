@@ -15,8 +15,16 @@ docker load -i nmd_docker_1.0_2026-08-13_verified.tar
 `nmd_1.3.sif` is a **corrected rebuild**, not a byte-identical copy of the image the results came
 out of. The analyses ran under `nmd_1.2.sif`, which lacked `pROC` and `ggseqlogo` and whose bare
 `Rscript` resolved to a conda R holding none of the analysis packages. 1.3 is rebuilt from the
-same pinned lockfile with both fixed, so it is the environment the paper describes. `nmd_1.2.sif`
-remains retrievable from the earlier version of the Zenodo record, under its own version DOI.
+same pinned lockfile with both fixed, so it is the environment the paper describes.
+
+**`nmd_1.2.sif` is not archived and is not meant to be.** This document previously said it remained
+retrievable from an earlier version of the Zenodo record; checked against all six versions on
+2026-08-16, no version has ever carried it. Nor should one: it is the image with the missing
+packages described above, and offering it beside the corrected build would hand readers an
+environment that cannot render the model report. 1.3 is the reproducible environment. What 1.2 was
+is recorded in `BUILD_NOTES.md` — an Apptainer layer over 1.1 adding four Liberation Sans fonts,
+with no Docker path to it — which is why figures are verified by comparing data exports rather than
+by comparing pixels.
 
 **Or build it.** `Dockerfile` in the repository root restores all 189 packages in `renv.lock` and
 both conda environments, failing loudly if it cannot. The model environment is included by
