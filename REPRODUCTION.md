@@ -38,17 +38,22 @@ directory rather than a bad download.
 **The container is the validated route.** `nmd_1.3.sif`, in the same record, carries R 4.5.2,
 Isopair 0.99.4, edgeR 4.8.2, ORFik 1.30.2, pandoc 3.8.3 and both Python environments.
 [`ENVIRONMENT.md`](ENVIRONMENT.md) owns the details: how to fetch or build it, what `nmd_1.3.sif`
-is relative to the image the analyses actually ran under, and why three flags are mandatory. The
+is relative to the image the analyses actually ran under, and why two flags are mandatory. The
 invocation is repeated once here because every command below assumes it:
 
 ```bash
 export REPO=/path/to/nmd_lung_longread_reproduction   # your clone of this repository
 export DEPOSIT_ROOT=/path/to/nmd_deposit_2026         # the deposit root — the directory holding source_data/
 
-apptainer exec --containall --nv \
+apptainer exec --containall \
   --bind "$REPO":/work --bind "$DEPOSIT_ROOT":"$DEPOSIT_ROOT" --pwd /work \
   nmd_1.3.sif <command>
 ```
+
+**§5.7's GPU steps need `--nv` added to that invocation; nothing else here does.** It is the only
+section that uses a GPU, and on a CPU node the flag prints
+`WARNING: Could not find any nv files on this host!` on every container call — hundreds of times
+across a full §5.1–§5.5 run, which is how a warning that matters gets lost.
 
 **The deposit is bound at its own host path deliberately.** §3 has you create a `data_deposit`
 symlink inside the repository, and a symlink stores an absolute path — so binding the deposit
@@ -302,6 +307,12 @@ report embeds those. **The remaining fifteen are built in §5.8.**
 **`NMD_orf_model_v5_4ct`** ([10.5281/zenodo.21536501](https://doi.org/10.5281/zenodo.21536501))
 and a GPU. Clone it beside this one; `<model repo>` below is its path.
 
+**Add `--nv` to the container invocation for the GPU steps in this section.** It is not in the
+invocation in §2 because no other section uses a GPU. Without it `torch.cuda.is_available()` returns
+False and training runs on CPU **with no error at all**, by a different numerical path under mixed
+precision — so the run completes, reports success, and produces numbers that are not the paper's.
+The steps marked "no GPU" below do not need it.
+
 **You do not need to run any of this to reproduce §5's reported numbers.** The deposit's
 `model.zip` carries the trained checkpoint, the per-isoform predictions and the full
 interpretability export, and the §5 figure scripts read those. This chain rebuilds them.
@@ -465,7 +476,7 @@ container-side path:
 ```bash
 export DATA_MASHR=/path/to/data_mashr    # wherever §3 or §5.2 actually put it
 
-apptainer exec --containall --nv --bind "$REPO":/work --bind "$DATA_MASHR":/data_mashr --pwd /work \
+apptainer exec --containall --bind "$REPO":/work --bind "$DATA_MASHR":/data_mashr --pwd /work \
   Rscript figures/multipanel/figure5_dl_model/data_export_refaug.R --data-dir /data_mashr
 ```
 

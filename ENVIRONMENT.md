@@ -34,17 +34,23 @@ the same problem.
 
 ## Running the container
 
-The invocation is part of the environment. Three flags are mandatory, and none of them announces
-itself when omitted — each produces a plausible wrong answer rather than an error.
+The invocation is part of the environment. Two flags are mandatory everywhere, and neither announces
+itself when omitted — each produces a plausible wrong answer rather than an error. A third, `--nv`,
+belongs only to §5.7.
 
 ```bash
 export REPO=/path/to/nmd_lung_longread_reproduction   # your clone of this repository
 export DEPOSIT_ROOT=/path/to/nmd_deposit_2026         # the deposit root — the directory holding source_data/
 
-apptainer exec --containall --nv \
+apptainer exec --containall \
   --bind "$REPO":/work --bind "$DEPOSIT_ROOT":"$DEPOSIT_ROOT" --pwd /work \
   nmd_1.3.sif <command>
 ```
+
+**Add `--nv` only for §5.7.** It is the GPU flag and §5.7 is the only section that uses a GPU. On a
+CPU node it is harmless but prints `WARNING: Could not find any nv files on this host!` on *every*
+container call — measured across a full §5.1–§5.5 run, that is hundreds of identical warnings in
+the logs a reader is being told to read, which is how a real warning gets missed.
 
 **Bind the deposit at its own host path, not at `/deposit`.** REPRODUCTION.md §3 has you create a
 `data_deposit` symlink inside the repository pointing at the deposit root. That symlink stores an
@@ -65,7 +71,7 @@ the collision.
 |---|---|
 | `--containall` | The container loads the **host's** R packages and runs clean. Sites that set `mount home = yes` are not overridden by `--no-home` or `--cleanenv`. |
 | `--pwd /work` | The container starts in an empty `$HOME`, and every repo-relative command fails with `does not exist` for a file that is plainly there. |
-| `--nv` | `torch.cuda.is_available()` returns False and §5 training runs on CPU **without an error**, by a different numerical path under mixed precision. |
+| `--nv` | **§5.7 only.** `torch.cuda.is_available()` returns False and §5 training runs on CPU **without an error**, by a different numerical path under mixed precision. Omit it for every other section. |
 
 **`.libPaths()` cannot tell you whether `--containall` took.** Isolated and unisolated runs of the
 same image report identical library paths. Assert isolation directly at the head of every stage:
@@ -91,7 +97,7 @@ mkdir -p "$SCRATCH/sqlite_tmp"
 export APPTAINERENV_TMPDIR="$SCRATCH/sqlite_tmp"
 export APPTAINERENV_SQLITE_TMPDIR="$SCRATCH/sqlite_tmp"
 
-apptainer exec --containall --nv \
+apptainer exec --containall \
   --bind "$REPO":/work --bind "$DEPOSIT_ROOT":"$DEPOSIT_ROOT" --bind "$SCRATCH":"$SCRATCH" \
   --pwd /work nmd_1.3.sif <command>
 ```
