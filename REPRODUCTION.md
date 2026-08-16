@@ -596,11 +596,6 @@ Rscript analysis/predictor_comparison/04_compute_metrics.R
 `figure_s_model_comparison.py` and `nmd_predictor_comparison.Rmd` each hardcode a different date.
 If SF43 reports a missing input, that mismatch is the first thing to check.
 
-## What is verified, and what is not
-
-[`docs/VERIFIED.md`](docs/VERIFIED.md) records, per claim, what the rebuild has been observed to
-do, including which claims carry a value that differs from the published one.
-
 ## Known gaps
 
 - **Set `NMD_CLAIM_VALUES` before you start, or lose the claim table.** Ten of the `.Rmd` steps
@@ -623,8 +618,8 @@ do, including which claims carry a value that differs from the published one.
   images. The font order is set once in `figures/lib/ggplot_style.py`:
   `Arial → Helvetica Neue → Helvetica → Liberation Sans → Nimbus Sans → DejaVu Sans`.
 
-- **Stages beyond Isopair stage 1 are wired but not verified end-to-end.** Which claims that covers
-  is in `docs/VERIFIED.md` under *Not measured*; an unmeasured claim is not an unaffected one.
+- **Stages beyond Isopair stage 1 are wired but not verified end-to-end.** An unmeasured stage is
+  not an unaffected one, so treat a difference there as unexplained rather than expected.
 
 - **The §5 chain needs a GPU and cluster access**, so it is the one part of this document that
   cannot be run from the deposit alone on a laptop.

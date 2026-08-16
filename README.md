@@ -13,9 +13,7 @@ airway epithelial cells (`LAE`), fibroblasts (`FB`), and microvascular endotheli
 and then trained a neural network to predict, from the sequence around a transcript's start and
 stop codons, whether NMD would destroy it.
 
-This repository holds the code; the data it runs on is on Zenodo. Where a rebuilt number differs
-from the one printed in the paper, [`docs/VERIFIED.md`](docs/VERIFIED.md) records the difference
-per claim rather than reconciling it silently.
+This repository holds the code; the data it runs on is on Zenodo.
 
 **Read in this order.** This page → [`ENVIRONMENT.md`](ENVIRONMENT.md) for the container →
 [`REPRODUCTION.md`](REPRODUCTION.md) for the ordered run. Two more documents are worth knowing
@@ -76,7 +74,6 @@ This is the minimal set: the code needed to rebuild the paper's results, and not
 | `R/`, `python/` | Shared helpers: input-file resolution, plot styling, and recording each reported number as it is computed |
 | `config/` | Where the data lives (`paths.yml`) |
 | `RESULTS_INDEX.md` | Every reported number mapped to the script that produces it, its required inputs, and the command to re-run it |
-| `docs/` | [`docs/VERIFIED.md`](docs/VERIFIED.md), the per-claim record of what the rebuild reproduces |
 
 ## Citing
 
