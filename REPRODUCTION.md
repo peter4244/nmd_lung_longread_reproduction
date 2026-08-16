@@ -610,10 +610,11 @@ The four notes below are **measured**, from a run of this section on a fresh clu
 
 **Run `data_export_refaug.R` before SF31, SF32, SF40 and SF41 — and it needs no GPU.** It is listed
 as §5.7 step 8, and §5.7 opens by saying you do not need to run any of it, so a reader who takes
-that at its word cannot build four supplemental figures and gets no hint why. All four trace to one
-missing file, `figures/multipanel/figure5_dl_model/data/subset2_refaug_isoforms.tsv`, which that
-script writes. SF31's own `data_export.R` reads it; SF32 then reads SF31's output, so one absent
-export takes out four figures across two chains. The script does additionally need
+that at its word cannot build four supplemental figures and gets no hint why. All four trace to a
+single export that script writes — a `subset2_refaug_isoforms.tsv` deposited into the Figure 5
+directory's own `data/` subdirectory, which exists only once you have run it. SF31's own
+`data_export.R` reads that file; SF32 then reads SF31's output, so one absent export takes out four
+figures across two chains. The script does additionally need
 `tx_summary.tsv`, which `export_rds.R` writes in §5.3 and which is **not** among `model.zip`'s 32
 files — so §5.3 is a real prerequisite here even though nothing else in §5.8 needs it.
 
