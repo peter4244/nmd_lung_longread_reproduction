@@ -113,22 +113,27 @@ package. `cloud.r-project.org` and `bioconductor.org` therefore stay in the list
 
 ## Packages installed outside renv.lock
 
-Eight packages are installed by a separate `RUN` because they are loaded by shipped code with
-`library()` and appear in no environment file. renv had no version to record, so the lockfile does
-not mention them — and **the completeness guard only checks what `renv.lock` names**, so the
-restore passed while this code still could not run.
+The image installs eight packages by a separate `RUN` because they are loaded at run time and
+appear in no environment file. renv had no version to record, so the lockfile does not mention them
+— and **the completeness guard only checks what `renv.lock` names**, so the restore passed while
+this code could not run.
+
+**Only two of the eight are needed by code in this package:**
 
 | Package | Needed by | Note |
 |---|---|---|
-| `hexbin` | `correlation_analysis.Rmd`, two figure scripts | **Required.** Without it `geom_hex()` drops the layer, exits 0, and leaves a plausible empty panel |
-| `mclust` | `productive_response.Rmd` | Genuinely optional — guarded by `requireNamespace`, so it silently skips when absent |
-| `fgsea`, `pathview` | mashr summaries, pathway figures | Bioconductor |
-| `tidyverse`, `xgboost`, `openxlsx` | DIE summaries, final report, table builder | |
-| `magick` | `Figures/make_panels.R` | Needs `libmagick++-dev`; without it magick fails to *configure* and the R error names a header rather than a Debian package |
+| `hexbin` | `analysis/upstream/correlation_analysis.Rmd` | **Required**, and easy to miss: it is pulled in by `geom_hex()` rather than by a `library()` call, so searching for the package name finds nothing. Without it the layer is dropped, the script exits 0, and you get a plausible empty panel |
+| `mclust` | `analysis/upstream/productive_response.Rmd` | Optional — guarded by `requireNamespace`, so it skips when absent |
 
-Their versions are **not reproducible from `renv.lock`** and must not be described as such:
-the package was never present at publication, so what is installed here is the pinned snapshot's
-current version.
+The other six — `fgsea`, `pathview`, `tidyverse`, `xgboost`, `openxlsx`, `magick` — are needed by
+analysis code that is **not part of this package**, so a reader building the image does not need
+them for anything here. They are installed because the image also serves the authoring repository.
+`magick` is why `libmagick++-dev` is in the apt layer; without that header, magick fails to
+*configure* and the R error names a C++ header rather than a Debian package.
+
+**These versions are not reproducible from `renv.lock`** and must not be described as if they were:
+the packages were never present at publication, so what the image installs is whatever the pinned
+snapshot currently offers.
 
 ## Why each guard exists
 

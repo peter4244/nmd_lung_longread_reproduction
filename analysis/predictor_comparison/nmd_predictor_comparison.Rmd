@@ -24,8 +24,8 @@ library(DT)
 source(file.path(.nmd_root, "R", "load_config.R")); .P <- nmd_paths(.nmd_root)
 HERE     <- file.path(.P$OUT, "predictor_comparison")
 # 2026-07-26: the chain writes to .P$OUT/predictor_comparison, not the source dir.
-SCORES   <- file.path(.P$OUT, "predictor_comparison", "per_isoform_scores_2026.7.11.tsv")
-METRICS  <- file.path(.P$OUT, "predictor_comparison", "metrics_summary_2026.7.11.tsv")
+SCORES   <- file.path(.P$OUT, "predictor_comparison", "per_isoform_scores_2026.8.6.tsv")
+METRICS  <- file.path(.P$OUT, "predictor_comparison", "metrics_summary_2026.8.6.tsv")
 FIG_PNG  <- "../../figures/SupplementalFigures/SF43_ModelComparison/figure_s_model_comparison.png"
 
 scores  <- fread(SCORES)
@@ -294,11 +294,11 @@ All files live under `code/nmd_predictor_comparison/`:
 | `METHODS.md`                               | manual (pre-registration)            |
 | `README.md`                                | manual                               |
 | `predictions_atg1000_stop1000_seed42_all.tsv` | deposited; see `explorer_run/` for how it was produced |
-| `isoforms_2026.7.11.tsv`                   | `01_extract_our_isoforms.R`          |
-| `nmdetective_b_scores_2026.7.11.tsv`       | `02_score_nmdetective_b.R`           |
-| `nmdep_rule_baseline_scores_2026.7.11.tsv` | `03_score_nmdep_rule_baseline.R`     |
-| `per_isoform_scores_2026.7.11.tsv`         | `04_compute_metrics.R`               |
-| `metrics_summary_2026.7.11.tsv`            | `04_compute_metrics.R`               |
+| `isoforms_2026.8.6.tsv`                   | `01_extract_our_isoforms.R`          |
+| `nmdetective_b_scores_2026.8.6.tsv`       | `02_score_nmdetective_b.R`           |
+| `nmdep_rule_baseline_scores_2026.8.6.tsv` | `03_score_nmdep_rule_baseline.R`     |
+| `per_isoform_scores_2026.8.6.tsv`         | `04_compute_metrics.R`               |
+| `metrics_summary_2026.8.6.tsv`            | `04_compute_metrics.R`               |
 | this report (`.Rmd` and rendered `.html`)  | `Rscript -e 'rmarkdown::render(...)'` |
 
 Figure + legend:
