@@ -172,7 +172,11 @@ Run the steps in the order below. Outputs go to `tmp/out/` and figures to `figur
 writes into the input tree.
 
 Wall times are from one laptop run, so that a twenty-minute step is not mistaken for a hang.
-**Expect 2–3× longer on a shared cluster.**
+**On a shared cluster expect up to 4× longer, and size any time limit from the top of that range,
+not the middle.** One measured run on Explorer put the §5.2 block at 3.65× overall, with its two
+longest steps at 4.2× and 4.0×; a limit set from a 2–3× estimate expires part-way through profile
+building, after hours of good work. Individual steps varied from 0.2× to 4.2×, so per-step
+extrapolation is unreliable — budget the block, not the step.
 
 An `.Rmd` step must be **rendered, not sourced** — `Rscript file.Rmd` will not work.
 
