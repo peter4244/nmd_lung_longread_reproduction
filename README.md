@@ -19,8 +19,9 @@ This repository holds the code; the data it runs on is on Zenodo.
 [`REPRODUCTION.md`](REPRODUCTION.md) for the ordered run. Two more documents are worth knowing
 about: the Zenodo record ships its **own `README.md`**, which describes the data and owns the
 on-disk layout — it downloads with the record and is also shown on the record page — and
-[`RESULTS_INDEX.md`](RESULTS_INDEX.md) maps every number the paper reports to the script that
-produces it, its inputs, and the command to re-run it.
+[`RESULTS_INDEX.md`](RESULTS_INDEX.md) maps reported numbers to the script that produces them,
+their inputs, and the command to re-run them. It covers **59 of the manuscript's 149 sentences**
+and states its own coverage — the rest carry no reported number or were excluded during triage.
 
 ---
 
@@ -32,8 +33,8 @@ produces it, its inputs, and the command to re-run it.
 | **The Zenodo archive** ([10.5281/zenodo.21544336](https://doi.org/10.5281/zenodo.21544336)) | The starting data — 12 objects, 695 MB compressed, 4.65 GB extracted. |
 | **The container** *(same archive)* | `nmd_1.3.sif` (8.1 GB), or the same environment as a Docker archive (8.8 GB). Optional — the `Dockerfile` here builds an equivalent image. See [`ENVIRONMENT.md`](ENVIRONMENT.md). |
 | **`Isopair`** ([10.5281/zenodo.21536494](https://doi.org/10.5281/zenodo.21536494)) | An R package the analysis calls. `renv::restore()` fetches it; no separate step. |
-| **`Isocall`** ([10.5281/zenodo.21536485](https://doi.org/10.5281/zenodo.21536485)) | The pipeline that produced the deposited count matrices. Provenance only — no shipped code calls it. |
-| **`NMD_orf_model_v5_4ct`** ([10.5281/zenodo.21536501](https://doi.org/10.5281/zenodo.21536501)) | Only if you are **retraining** §5, which needs a GPU. Not needed to reproduce §5's reported numbers: `model.zip` in the archive carries the trained weights, per-isoform predictions, and the full interpretability export. |
+| **`Isocall_v1`** ([10.5281/zenodo.21536485](https://doi.org/10.5281/zenodo.21536485)) | The pipeline that produced the deposited count matrices. Provenance only — no shipped code calls it, and you do not need it to reproduce anything. |
+| **`NMD_orf_model_v5_4ct`** ([10.5281/zenodo.21536501](https://doi.org/10.5281/zenodo.21536501)) | **Required, and not only for §5.** `export_rds.R` lives there and is the last step of §5.3, which runs *before* the §4 report — and it needs a batch allocation of roughly 96 GB, not a laptop. Retraining §5 additionally needs a GPU; §5's *reported numbers* rebuild from `model.zip` without one. |
 
 > **Use `NMD_orf_model_v5_4ct`, not `NMD_orf_model_v5`.** The latter is an earlier, superseded
 > model and is not the one the paper reports.
@@ -58,8 +59,9 @@ this repository at your copy of the data.
 [`REPRODUCTION.md`](REPRODUCTION.md) gives the steps in order with the command for each. Two
 things to know first:
 
-- **Some steps take hours, and training the network needs a GPU.** The trained network ships in
-  `model.zip` for that reason — everything after it runs on an ordinary laptop.
+- **Some steps take hours, and two need a cluster.** Training the network needs a GPU — the trained
+  network ships in `model.zip` so you do not have to. But `export_rds.R` in §5.3 needs a batch
+  allocation of roughly 96 GB and is killed on a login node, so the chain is not laptop-only.
 - **No script hard-codes a folder path.** They all read `config/paths.yml`. If a script cannot
   find its input, check that file.
 
@@ -73,7 +75,7 @@ This is the minimal set: the code needed to rebuild the paper's results, and not
 | `figures/` | One folder per figure — the script for each panel and the script that assembles them |
 | `R/`, `python/` | Shared helpers: input-file resolution, plot styling, and recording each reported number as it is computed |
 | `config/` | Where the data lives (`paths.yml`) |
-| `RESULTS_INDEX.md` | Every reported number mapped to the script that produces it, its required inputs, and the command to re-run it |
+| `RESULTS_INDEX.md` | Reported numbers mapped to their producing script, required inputs, and re-run command — 59 of the manuscript's 149 sentences, coverage stated in the file |
 
 ## Citing
 
@@ -88,6 +90,6 @@ DOI, which keeps pointing at the files of the release that minted it.
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE). `Isopair` and `Isocall` are released separately under their own
+MIT — see [`LICENSE`](LICENSE). `Isopair` and `Isocall_v1` are released separately under their own
 DOIs, and the archived data and container images are on Zenodo under that record's terms
 (CC-BY-4.0).

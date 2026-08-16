@@ -2,8 +2,8 @@
 
 Each row is one statement in the paper: what it says, the number it reports, the script
 that produced that number, and the starting data files that script needs. Each data file
-names the download it arrives in — the archive ships eight files, five of them loose and
-three zipped. Everything else is built by the code in this repository.
+names the download it arrives in — the archive ships twelve data objects, seven of them
+loose and five zipped. Everything else is built by the code in this repository.
 
 **What "how to re-run it" does and does not cover.** The command re-makes the reported
 NUMBER from the deposited starting data. It does **not** re-run the upstream tools that
