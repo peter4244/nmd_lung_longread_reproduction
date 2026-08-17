@@ -50,10 +50,19 @@ belongs only to §5.7.
 export REPO=/path/to/nmd_lung_longread_reproduction   # your clone of this repository
 export DEPOSIT_ROOT=/path/to/nmd_deposit_2026         # the deposit root — the directory holding source_data/
 
+export MODEL_REPO=/path/to/NMD_orf_model_v5_4ct   # only if you are running §5.3 or §5.7
+
 apptainer exec --containall \
-  --bind "$REPO":/work --bind "$DEPOSIT_ROOT":"$DEPOSIT_ROOT" --pwd /work \
+  --bind "$REPO":/work --bind "$DEPOSIT_ROOT":"$DEPOSIT_ROOT" \
+  --bind "$MODEL_REPO":"$MODEL_REPO" --pwd /work \
   nmd_1.3.sif <command>
 ```
+
+**Bind the model repository too, and bind it at its own host path.** §5.7 tells you to clone it
+*beside* this repository — so it is outside `/work` and `--containall` cannot see it. §5.3's last
+step runs `Rscript <model repo>/export_rds.R` and is where this bites first, several sections before
+§5.7 introduces the repo. Same rule as the deposit: bind it where it already lives, so paths resolve
+identically inside and out.
 
 **Add `--nv` only for §5.7.** It is the GPU flag and §5.7 is the only section that uses a GPU. On a
 CPU node it is harmless but prints `WARNING: Could not find any nv files on this host!` on *every*

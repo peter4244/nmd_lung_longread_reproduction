@@ -462,10 +462,19 @@ numbers.
 # Both variables are required. MODEL_RESULTS is the model's own results; FEATURES is what
 # export_rds.R wrote with --results-dir. --data-dir is needed only if data_mashr is NOT in-tree:
 # nmd_data_dir() defaults to ISOPAIR_OUT, which config/paths.yml declares as tmp/out/data_mashr.
-NMD_MODEL_RESULTS=<model repo>/results_deposit_h5_2026-08-04 \
+# THE TWO VARIABLES POINT AT DIFFERENT PLACES, and this is the common case rather than the
+# exception. NMD_MODEL_RESULTS needs the TRAINED artifacts -- uorf_attention_metrics.tsv and its
+# siblings, which are §5.7 step 6 OUTPUTS. If you skipped §5.7, as its own opening paragraph invites
+# you to, you do not have them in the model repo: they ship in the deposit. NMD_FEATURES needs the
+# FEATURE tables, which §5.3's export_rds.R wrote into the model repo. Pointing both at the model
+# repo dies with `uorf_attention_metrics.tsv does not exist`, and that failure blocks SF31, SF32,
+# SF40 and SF41.
+NMD_MODEL_RESULTS=<deposit>/source_data/model \
 NMD_FEATURES=<model repo>/results_deposit_h5_2026-08-04 \
   Rscript figures/multipanel/figure5_dl_model/data_export_refaug.R \
     --data-dir <path to data_mashr>
+
+# If you DID run §5.7 in full, both may point at <model repo>/results_deposit_h5_2026-08-04.
 ```
 
 **`<path to data_mashr>` depends on your layout.** If §3 built it in-tree it is
@@ -565,15 +574,22 @@ each directory rather than assuming a naming pattern.
 
 **Figure 5** (after §5.7, or from the deposit's `model.zip` alone):
 
+**Run these from the repository root. Do not `cd` into the figure directory.** Panel A's window-size
+resolver looks for the deposit at `getwd()/data_deposit/source_data/model`, so changing directory
+breaks it and it refuses to draw rather than guessing — `cannot resolve the window size … (found 0)`,
+a message that never mentions the working directory. Its other two fallback roots are `$DEPOSIT`, a
+variable ENVIRONMENT.md tells you not to export, and an author's home path. Panel A failing takes the
+composite with it.
+
 ```bash
-cd figures/multipanel/figure5_dl_model
+D=figures/multipanel/figure5_dl_model
 
-python3 data_export_deposit.py          # writes data/panel{B,C,D,E,F,G}_*.tsv
+python3 $D/data_export_deposit.py          # writes data/panel{B,C,D,E,F,G}_*.tsv
 
-Rscript figure5_panelA_architecture.R   # the architecture diagram; reads no exports
-for f in figure5_panel[B-G]*.py; do python3 "$f"; done
+Rscript $D/figure5_panelA_architecture.R   # the architecture diagram; reads no exports
+for f in $D/figure5_panel[B-G]*.py; do python3 "$f"; done
 
-python3 figure5_composite.py            # assembles the seven panel PNGs
+python3 $D/figure5_composite.py            # assembles the seven panel PNGs
 ```
 
 **Panel C reproduces the paper exactly, and the file the panel reads is the right one.** The
@@ -604,6 +620,22 @@ more than one — they overwrite into the same `data/` directory.
 
 **The fifteen remaining supplemental figures.** SF25–SF32 read isopair outputs, so run them after
 §5.5. SF37–SF43 read model outputs, so run them after §5.7 or from `model.zip`.
+
+**Two of the nineteen need something the container's default `python3` does not give you.**
+
+`SF41` imports `sklearn.metrics`. `scikit-learn` is in `environment-model.yml` only, and the
+container's `python3` resolves to the *figures* environment, so it fails with
+`ModuleNotFoundError: sklearn`. Run it with the model environment's interpreter:
+
+```bash
+/opt/conda/envs/nmd_model/bin/python figures/supplemental/SF41_PTCSubclassPerformance/figure_s_performance_by_subclass.py
+```
+
+`SF26` cannot be rasterized in the shipped image. `build_flowchart.R` writes a `.dot` and an `.html`,
+then **exits 0** printing `'dot' not found — open the HTML in a browser and print`. Graphviz is in no
+environment file and the documented setting is a cluster login node with no browser, so this is the
+one supplemental figure that produces no image. Render the `.dot` wherever you have Graphviz, or open
+the HTML on a desktop.
 
 The four notes below are **measured**, from a run of this section on a fresh cluster account on
 2026-08-16 in which 23 of 32 steps succeeded. The rest of §5.8 remains inferred.
@@ -655,10 +687,11 @@ Rscript analysis/predictor_comparison/03_score_nmdep_rule_baseline.R
 Rscript analysis/predictor_comparison/04_compute_metrics.R
 ```
 
-**Mind the datestamp.** `04_compute_metrics.R:37` names its outputs from `DATESTAMP <- "2026.8.6"`,
-and `figure_s_model_comparison.py` reads that same stamp — so SF43 works as shipped. The stale
-consumer is `nmd_predictor_comparison.Rmd`, which hardcodes `2026.7.11` and is **not part of this
-run order**. If you run it anyway, that mismatch is why it cannot find its input.
+**Mind the datestamp.** `04_compute_metrics.R:43` names its outputs from `DATESTAMP <- "2026.8.6"`,
+and both consumers — `figure_s_model_comparison.py` and `nmd_predictor_comparison.Rmd` — read that
+same stamp, so both work as shipped. Change `DATESTAMP` and you must change both in the same commit;
+the two vintages coexist on disk, so a consumer left behind reads superseded tables and renders
+without error.
 
 ## Known gaps
 
