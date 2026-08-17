@@ -497,6 +497,30 @@ print(ovr_gene_mash_dt[, .(
   n_marker_down = sum(is_depleted_mash),
   n_tested      = .N
 ), by = ct])
+
+# ── Claim 1.3.2 — the GENE-LEVEL testable set ─────────────────────────────────────────
+# ADDED 2026-08-17, AND THE REASON IT WAS MISSING IS THE POINT. One supplement sentence states
+# two numbers from one filter -- "retaining 105,938 isoforms and 21,547 genes for testing" --
+# and only the isoform half had an emitter. So 105,938 was verified to the digit, run after run,
+# while the gene half was computed here, printed here, and never compared to anything. A
+# clean-room reproduction found it at 23,550 against the published 21,547, a gap of 2,003 that
+# no check could have raised because no check was looking.
+#
+# The isoform side of the same sentence reproduces exactly, and both come from one
+# filterByExpr on one DMSO subset, so there is no mechanism by which one half drifts 9% and the
+# other lands perfectly. The published 21,547 is most likely an earlier vintage.
+#
+# Emitted with published = NULL rather than "21,547": asserting a published value we believe is
+# stale would file a permanent mismatch, and the claim ledger is not the place to argue with the
+# manuscript. Set it once the sentence is corrected.
+GENE_TESTED_POP <- paste("short-read genes retained by filterByExpr (min.count = 5,",
+                         "min.total.count = 10) on the DMSO-only subset under the cell type",
+                         "design; the denominator every gene-level one-vs-rest contrast is",
+                         "tested over. Companion to the isoform figure emitted above -- one",
+                         "supplement sentence, one filter, two numbers")
+.gk <- ovr_gene_mash_dt[, .(tested = .N), by = ct]
+claim_emit("1.3.2", "genes expressed at testable levels under DMSO",
+           .gk$tested[1], n = .gk$tested[1], population = GENE_TESTED_POP)
 ```
 
 ## Unshrunken vs Shrunken Comparison

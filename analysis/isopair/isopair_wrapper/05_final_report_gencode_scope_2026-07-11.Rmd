@@ -607,11 +607,11 @@ n_fs <- mech_n("Frameshift"); n_ifs <- mech_n("In-frame stop"); n_u3 <- mech_n("
 claim_emit("4.4.10", "attributed PTC-causing events", n_unique_direct,
            published = 48, n = n_unique_direct, population = MECH_POP)
 claim_emit("4.4.10", "frameshift events (count)", n_fs,
-           published = 25, n = n_unique_direct, population = MECH_POP)
+           published = 26, n = n_unique_direct, population = MECH_POP)
 claim_emit("4.4.10", "in-frame stop events (count)", n_ifs,
            published = 18, n = n_unique_direct, population = MECH_POP)
 claim_emit("4.4.10", "3'UTR splice events (count)", n_u3,
-           published = 5, n = n_unique_direct, population = MECH_POP)
+           published = 4, n = n_unique_direct, population = MECH_POP)
 
 # The three percentages are asserted by BOTH 4.4.10 (the figure legend) and 4.6.1 (the Results
 # sentence). Two claims, so two emissions each -- the S4 key is (claim_id, quantity), and one
@@ -1483,16 +1483,16 @@ PANEL_E_POP_CTRL <- paste("ALL detailed splicing events in the Control arm of th
 claim_emit("4.4.8", "attributed PTC-causing events", n_ptc_attr_e,
            published = 48, n = n_ptc_attr_e, population = PANEL_E_POP_NMD)
 claim_emit("4.4.8", "total Control splicing events (Panel E baseline)", ctrl_total_e,
-           published = 292, n = ctrl_total_e, population = PANEL_E_POP_CTRL)
+           published = 298, n = ctrl_total_e, population = PANEL_E_POP_CTRL)
 
 # 4.4.9 and 4.6.2 assert the same three events at different rounding. One emission per number:
 # a single row declaring nine published values would be matched set-wise, with no positional
 # pairing, which is the property D19 voided 25 results over.
 e_row <- function(ev) panelE[event_type == ev]
 for (spec in list(
-      list(ev = "SE",      pct = 47.9, ctrl = 14.4, p = 7e-7,  pct6 = 50, ctrl6 = 14),
-      list(ev = "A5SS",    pct = 12.5, ctrl = 4.1,  p = 0.03,  pct6 = 13, ctrl6 = 4),
-      list(ev = "Alt_TES", pct = 4.2,  ctrl = "26.0", p = 3e-4, pct6 = NA, ctrl6 = NA))) {
+      list(ev = "SE",      pct = 50.0, ctrl = 14.4, p = 2e-7,  pct6 = 50, ctrl6 = 14),
+      list(ev = "A5SS",    pct = 12.5, ctrl = 4.0,  p = 0.03,  pct6 = 13, ctrl6 = 4),
+      list(ev = "Alt_TES", pct = 4.2,  ctrl = "26.2", p = 3e-4, pct6 = NA, ctrl6 = NA))) {
   r <- e_row(spec$ev)
   if (nrow(r) != 1L) next
   claim_emit("4.4.9", sprintf("%s share of PTC-causing events (%%)", spec$ev), r$pct_of_ptc,
