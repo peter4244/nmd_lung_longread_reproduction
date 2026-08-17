@@ -2080,11 +2080,24 @@ kit_nmd_table() %>% dplyr::count(dir, driver) %>%
 DOWN_POP <- paste("NMD-category genes whose productive output significantly DECREASED, classified",
                   "level- or composition-driven; AT2/LAE/MV only (FB excluded); denominator is the",
                   "down arm alone, not all significant genes")
+# THE TARGETS WERE SET TO THIS SCRIPT'S OWN OUTPUT, NOT TO THE PAPER. Corrected 2026-08-17.
+# published was "32.1" / "67.9" -- the computed 32.075 / 67.864 rounded to one decimal. So the
+# check compared the computation against itself and passed on every run since. Neither 32.1 nor
+# 67.9 appears anywhere in the manuscript or the supplement.
+#
+# The supplement says: "Among significant productive-down NMD genes, 31.9% were
+# composition-dominated ... a reduction in overall transcription (68.1%) remained the predominant
+# driver." Those are the published values and they are what this claim must be checked against.
+#
+# THIS CHANGE IS EXPECTED TO FAIL THE CHECK, and that is the point. 32.08 against 31.9 is a real
+# 0.2-point disagreement that has been invisible because the target pointed at the answer. A
+# stale target fails loudly and gets fixed; a self-referential one reports success forever. It
+# was found only because two hand-built lists of open claims disagreed with each other.
 claim_emit("3.3.6", "composition-driven share of productive-DOWN NMD genes (%)",
-           .kdget("down","composition-dominated"), published = "32.1",
+           .kdget("down","composition-dominated"), published = "31.9",
            n = sum(.kd$n[.kd$dir == "down"]), population = DOWN_POP)
 claim_emit("3.3.6", "level-driven share of productive-DOWN NMD genes (%)",
-           .kdget("down","level-dominated"), published = "67.9",
+           .kdget("down","level-dominated"), published = "68.1",
            n = sum(.kd$n[.kd$dir == "down"]), population = DOWN_POP)
 ```
 
