@@ -1383,6 +1383,11 @@ up_fig <- base %>%
   dplyr::left_join(sr_long %>% dplyr::select(ct, gene_id, sr_logFC), by=c("ct","gene_id")) %>%
   dplyr::transmute(hgnc_symbol, ct,
     prod_DMSO=round(prodCPM_DMSO,1), prod_SMG=round(prodCPM_SMG_raw,1),
+    # THE ADJUSTED COLUMN IS CARRIED SO THE CLAIM CAN COMPARE LIKE WITH LIKE (2026-08-19).
+    # The manuscript's SHMT2 sentence pairs its SMG1i CPM with the ADJUSTED logFC, so the CPM
+    # it quotes is the adjusted one. up_fig previously carried only prodCPM_SMG_raw, so the
+    # claim compared 54.8 against the published 58.1 and filed a defect that was ours.
+    prod_SMG_adj=round(prodCPM_SMG_adj,1),
     unprod_DMSO=round(unprodCPM_DMSO,1), unprod_SMG=round(unprodCPM_SMG,1),
     nmd_frac_DMSO, nmd_frac_SMG, custom=round(custom,2), sr_logFC=round(sr_logFC,2)) %>%
   dplyr::arrange(dplyr::desc(nmd_frac_SMG))
@@ -1399,7 +1404,8 @@ print(head(as.data.frame(up_fig), 20), row.names=FALSE)
 # AND "SIGNIFICANTLY INCREASED" IS UNSUPPORTED IN EVERY CELL TYPE. SHMT2's lfsr is 0.058 in AT2
 # and does not reach the 0.05 threshold in any of the four, so the significance claim fails
 # regardless of which cell type the values belong to. The lfsr is emitted so that is checkable.
-SHMT2_POP <- paste("SHMT2 in the ISR/UPR gene panel: productive CPM under DMSO and raw SMG1i, the",
+SHMT2_POP <- paste("SHMT2 in the ISR/UPR gene panel: productive CPM under DMSO, under SMG1i",
+                   "ADJUSTED by the NMD-anchored normalization, and under raw SMG1i; the",
                    "adjusted productive log2 fold change, and the short-read gene-level log2 fold",
                    "change, one row per cell type; values are pre-rounded to the precision the",
                    "manuscript quotes")
@@ -1414,8 +1420,18 @@ for (.c in c("AT2", "MV")) {
   # was made for weeks should stay visible next to the one that replaces it.
   claim_emit("3.5.2", sprintf("SHMT2 productive CPM under DMSO, %s", .c), .sh("prod_DMSO", .c),
              published = if (.c == "MV") "44.1" else NULL, population = SHMT2_POP)
-  claim_emit("3.5.2", sprintf("SHMT2 productive CPM under SMG1i, %s", .c), .sh("prod_SMG", .c),
+  # ADJUSTED, not raw. The sentence reads "44.1 to 58.1 CPM; adjusted logFC +0.39", and those
+  # three numbers are not independent: 44.1 x 2^0.39 = 57.8. The adjusted CPM satisfies that
+  # (58.19, implying +0.391); the raw one does not (54.80, implying +0.306) while the emitted
+  # logFC stays +0.39. Comparing raw against the published value made our own three numbers
+  # contradict each other and filed a manuscript defect that was ours.
+  claim_emit("3.5.2", sprintf("SHMT2 productive CPM under SMG1i (adjusted), %s", .c),
+             .sh("prod_SMG_adj", .c),
              published = if (.c == "MV") "58.1" else NULL, population = SHMT2_POP)
+  # Raw stays emitted without a published counterpart: the gap between raw and adjusted IS
+  # the custom normalization's effect, and it is worth being able to see.
+  claim_emit("3.5.2", sprintf("SHMT2 productive CPM under SMG1i (raw), %s", .c),
+             .sh("prod_SMG", .c), population = SHMT2_POP)
   claim_emit("3.5.2", sprintf("SHMT2 adjusted productive log2FC, %s", .c), .sh("custom", .c),
              published = if (.c == "MV") "0.39" else NULL, population = SHMT2_POP)
   claim_emit("3.5.2", sprintf("SHMT2 short-read gene log2FC, %s", .c), .sh("sr_logFC", .c),
