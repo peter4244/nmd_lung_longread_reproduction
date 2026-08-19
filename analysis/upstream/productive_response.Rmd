@@ -62,8 +62,6 @@ that cell type's donors:
 - "**change in productive**" always means the **adjusted** measure (`custom` in log space, or
   `prod_shift_adj` / `dprod_adj` in CPM space) — i.e. the unproductive surge is removed.
 - Main figures show **NMD vs non-NMD**. The **uncertain ("unsure")** group is set aside to the supplement.
-- FB is treated as **provisional** (smaller effect sizes; fails part of the reproducibility battery) and
-  is excluded from the mechanism / Kitagawa summaries, which use AT2 / LAE / MV.
 - Every data-shaping step prints a `cat()` summary so the numbers are auditable inline.
 
 ```{r params}
@@ -206,11 +204,10 @@ kitagawa_decomp <- function(df){
     driver = ifelse(abs(composition) > abs(level), "composition-dominated", "level-dominated"))
 }
 
-# Kitagawa decomposition on significant NMD genes, built once (FB excluded: provisional CT).
+# Kitagawa decomposition on significant NMD genes, built once. FB INCLUDED since 2026-08-19.
 # References prod_dir_mashr and base, which are created in later steps (resolved at call time).
-kit_nmd_table <- function(exclude_fb = TRUE){
+kit_nmd_table <- function(){
   d <- prod_dir_mashr %>% dplyr::filter(dir %in% c("up","down"), gene_category=="NMD")
-  if (exclude_fb) d <- d %>% dplyr::filter(ct != "FB")
   d %>% dplyr::left_join(base %>% dplyr::select(ct, gene_id, prodCPM_DMSO, prodCPM_SMG_raw,
                           unprodCPM_DMSO, unprodCPM_SMG), by=c("ct","gene_id")) %>%
     kitagawa_decomp()
@@ -1076,7 +1073,7 @@ p_batt <- ggplot(long, aes(ct, test, fill=pass)) +
                     labels=c(`TRUE`="meets criterion", `FALSE`="fails criterion"), name=NULL) +
   scale_x_discrete(position="top") +
   labs(title="Reproducibility of the productive (non-NMD) output response",
-       subtitle="Four retained tests; pass criterion in each row label. FB is the provisional cell type.",
+       subtitle="Four retained tests; pass criterion in each row label.",
        x=NULL, y=NULL) +
   theme_minimal(base_size=12) +
   theme(panel.grid=element_blank(), axis.text.x.top=element_text(face="bold",size=12),
@@ -1912,36 +1909,52 @@ print(ggplot(pd_sum, aes(gene_category, median_custom, colour=gene_category)) +
   theme_bw(base_size=11) + theme(strip.background=element_rect(fill="grey92")))
 ```
 
-## S5 — Kitagawa on all significant NMD genes (FB excluded)
+## S5 — Kitagawa on all significant NMD genes
 
 ```{r kitagawa-on-all}
-# General Kitagawa result: all significant NMD genes (up or down), mashr-called (AT2/LAE/MV)
+# General Kitagawa result: all significant NMD genes (up or down), mashr-called
 kit_nmd_table() %>% dplyr::count(driver) %>% dplyr::mutate(pct = round(100*n/sum(n),1))
 
 # ── Claim 3.3.2 — level vs composition across all significant NMD genes ─────────────────
-# FB IS EXCLUDED from every Kitagawa number in this report (kit_nmd_table's exclude_fb default),
-# and the manuscript's "across all NMD susceptible genes" does not say so. The shares are pooled
-# over gene x cell-type rows, not averaged over cell types -- a distinction that matters here
-# because 3.2.4 in the same section uses the average instead.
+# FB IS NOW INCLUDED, tracking Yul's 6a9a439 (YLeshem18/nmd_lungcells_2026, 2026-08-19), which
+# removed the exclusion from the mechanism and Kitagawa summaries. It had been excluded as a
+# "provisional" cell type -- smaller effect sizes, and it fails part of the reproducibility
+# battery -- and the manuscript's "across all NMD susceptible genes" never said so.
+#
+# THIS IS WHAT RECONCILES THE CLAIM. With FB out, this emitted 86.17 against a published 87.4 and
+# the gap had no explanation. With FB in and undefined drivers out of the denominator (below),
+# all three Kitagawa claims land on the published values: 3.3.2 -> 87.41 / 12.59, 3.3.4 ->
+# 99.73 / 0.27, 3.3.6 -> 68.06 / 31.94. The paper was right; the exclusion was the discrepancy.
+#
+# The shares are pooled over gene x cell-type rows, not averaged over cell types -- a distinction
+# that matters here because 3.2.4 in the same section uses the average instead. Averaging gives
+# 92.2 and reproduces nothing.
 KIT_POP <- paste("NMD-category genes with a significant productive change, classified by the",
-                 "Kitagawa decomposition into level-driven or composition-driven; AT2/LAE/MV only",
-                 "-- FB is EXCLUDED by kit_nmd_table(exclude_fb = TRUE), so no share here is over",
-                 "all four cell types, and the shares are POOLED over gene x cell-type rows rather",
-                 "than averaged across cell types")
+                 "Kitagawa decomposition into level-driven or composition-driven; ALL FOUR cell",
+                 "types including FB, and the shares are POOLED over gene x cell-type rows rather",
+                 "than averaged across cell types. Rows whose driver is undefined are excluded",
+                 "from the denominator, so the two shares sum to 100 as the paper's do")
 # THE LEVEL NAMES ARE "level-dominated" / "composition-dominated", set at :206 by
 # ifelse(abs(composition) > abs(level), ...). My first version matched the bare words "level" and
 # "composition" and every one of these six emissions returned NA -- which the checker reported as
 # six disagreements with the paper rather than as six broken call sites. A string match against a
 # factor level is exactly the kind of thing only a run can settle.
 #
-# That ifelse also yields NA when either input is missing, so NA IS A THIRD CATEGORY and the two
-# named shares need not sum to 100 -- which is why the published 99.2 + 0.3 falls short.
-.k <- kit_nmd_table() %>% dplyr::count(driver) %>% dplyr::mutate(pct = 100*n/sum(n))
+# That ifelse yields NA when either input is missing, so NA IS A THIRD CATEGORY. Those rows are
+# DROPPED FROM THE DENOMINATOR here, which is the paper's convention: its pairs sum to exactly
+# 100.0 (87.4 + 12.6, 99.7 + 0.3, 68.1 + 31.9). Counting them in gave 87.06 instead of 87.41 and
+# made the two emitted shares sum to 99.7 with nothing saying why. The count of undefined rows is
+# emitted separately below rather than silently absorbed -- 17 of 4,266 with FB included.
+.k <- kit_nmd_table() %>% dplyr::filter(!is.na(driver)) %>%
+      dplyr::count(driver) %>% dplyr::mutate(pct = 100*n/sum(n))
+.k_undef <- sum(is.na(kit_nmd_table()$driver))
 .kget <- function(d) { .i <- which(.k$driver == d); if (length(.i)) .k$pct[.i] else NA_real_ }
 claim_emit("3.3.2", "level-driven share of significant NMD genes (%)", .kget("level-dominated"),
            published = "87.4", n = sum(.k$n), population = KIT_POP)
 claim_emit("3.3.2", "composition-driven share of significant NMD genes (%)", .kget("composition-dominated"),
            published = "12.6", n = sum(.k$n), population = KIT_POP)
+claim_emit("3.3.2", "rows with an undefined Kitagawa driver (excluded from the denominator)",
+           .k_undef, n = sum(.k$n) + .k_undef, population = KIT_POP)
 ```
 
 ## S6 — Productive-DOWN: does it co-occur with a down-isoform, and which mechanism?
@@ -1984,11 +1997,11 @@ mech <- cmp_di %>% dplyr::filter(prod_down) %>%
 print(mech, row.names=FALSE)
 ```
 
-## S6b — Down-arm mechanism split (transcriptional vs composition; AT2/LAE/MV)
+## S6b — Down-arm mechanism split (transcriptional vs composition)
 
 ```{r down-arm-mechanism}
-# classify productive-down genes once (FB excluded: provisional CT)
-pd_mech <- prod_dir_mashr %>% dplyr::filter(dir=="down", ct != "FB") %>%
+# classify productive-down genes once
+pd_mech <- prod_dir_mashr %>% dplyr::filter(dir=="down", ct %in% CELL_TYPES) %>%
   dplyr::left_join(base %>% dplyr::select(ct,gene_id,prodfrac_DMSO,prodfrac_SMG), by=c("ct","gene_id")) %>%
   dplyr::left_join(sr_long %>% dplyr::select(ct,gene_id,sr_logFC), by=c("ct","gene_id")) %>%
   classify_mech("down")
@@ -1997,7 +2010,7 @@ print(pd_mech %>% dplyr::count(mechanism) %>% dplyr::mutate(pct = round(100*n/su
 
 trans_g    <- pd_mech %>% dplyr::filter(mechanism=="transcriptional") %>% dplyr::pull(gene_id) %>% unique()
 comp_g     <- pd_mech %>% dplyr::filter(mechanism=="composition")     %>% dplyr::pull(gene_id) %>% unique()
-universe_g <- unique(prod_dir_mashr$gene_id[prod_dir_mashr$ct != "FB"])
+universe_g <- unique(prod_dir_mashr$gene_id[prod_dir_mashr$ct %in% CELL_TYPES])
 cat(sprintf("transcriptional=%d | composition=%d | universe=%d\n", length(trans_g), length(comp_g), length(universe_g)))
 cat("\nTheme enrichment: transcriptional vs composition productive-down genes\n")
 print(theme_enrichment(trans_g, comp_g, universe_g), row.names=FALSE)
@@ -2060,12 +2073,20 @@ claim_emit("3.4.5", "odds ratio, COMPOSITION genes x DNA replication (tests 'ins
            .teget("comp_OR","DNA replication"), n = length(universe_g), population = THEME_POP)
 claim_emit("3.4.5", "odds ratio, COMPOSITION genes x DNA repair (tests 'instead')",
            .teget("comp_OR","DNA repair"), n = length(universe_g), population = THEME_POP)
-if (exists("run_bp")) { run_bp(universe_g, trans_g, "TRANSCRIPTIONAL productive-down (GO BP)")
-                        run_bp(universe_g, comp_g,  "COMPOSITION productive-down (GO BP)") }
+# The two GO BP tables are WRITTEN OUT, not just printed -- Yul's 6a9a439. They back the
+# supplement's "snRNA-, rRNA- and mRNA-processing terms" for the composition arm and the DNA
+# replication / repair terms for the transcriptional arm, and until now existed only in the
+# rendered HTML.
+if (exists("run_bp")) {
+  tb_trans <- run_bp(universe_g, trans_g, "TRANSCRIPTIONAL productive-down (GO BP)")
+  tb_comp  <- run_bp(universe_g, comp_g,  "COMPOSITION productive-down (GO BP)")
+  fwrite(tb_trans, file.path(OUT_DIR, paste0("down_pathways_transcriptional_", DATE_STAMP, ".csv")))
+  fwrite(tb_comp,  file.path(OUT_DIR, paste0("down_pathways_composition_",     DATE_STAMP, ".csv")))
+}
 ```
 
 ```{r kitagawa-proof}
-# Kitagawa driver split by direction (AT2/LAE/MV)
+# Kitagawa driver split by direction
 kit_nmd_table() %>% dplyr::count(dir, driver) %>%
   dplyr::group_by(dir) %>% dplyr::mutate(pct=round(100*n/sum(n),1)) %>% dplyr::ungroup()
 
@@ -2073,12 +2094,13 @@ kit_nmd_table() %>% dplyr::count(dir, driver) %>%
 # DENOMINATOR IS THE DOWN ARM ONLY, not all significant genes: the group_by(dir) above makes each
 # direction sum to 100% separately. So 32.1% composition and 67.9% level are shares OF THE DOWN
 # ARM, and pairing either with 3.3.2's whole-arm figures would compare different denominators.
-.kd <- kit_nmd_table() %>% dplyr::count(dir, driver) %>% dplyr::group_by(dir) %>%
+.kd <- kit_nmd_table() %>% dplyr::filter(!is.na(driver)) %>%
+  dplyr::count(dir, driver) %>% dplyr::group_by(dir) %>%
   dplyr::mutate(pct = 100*n/sum(n)) %>% dplyr::ungroup()
 .kdget <- function(d, dr) { .i <- which(.kd$dir == d & .kd$driver == dr)
                             if (length(.i)) .kd$pct[.i] else NA_real_ }
 DOWN_POP <- paste("NMD-category genes whose productive output significantly DECREASED, classified",
-                  "level- or composition-driven; AT2/LAE/MV only (FB excluded); denominator is the",
+                  "level- or composition-driven; ALL FOUR cell types including FB; denominator is the",
                   "down arm alone, not all significant genes")
 # THE TARGETS WERE SET TO THIS SCRIPT'S OWN OUTPUT, NOT TO THE PAPER. Corrected 2026-08-17.
 # published was "32.1" / "67.9" -- the computed 32.075 / 67.864 rounded to one decimal. So the
@@ -2089,10 +2111,13 @@ DOWN_POP <- paste("NMD-category genes whose productive output significantly DECR
 # composition-dominated ... a reduction in overall transcription (68.1%) remained the predominant
 # driver." Those are the published values and they are what this claim must be checked against.
 #
-# THIS CHANGE IS EXPECTED TO FAIL THE CHECK, and that is the point. 32.08 against 31.9 is a real
-# 0.2-point disagreement that has been invisible because the target pointed at the answer. A
-# stale target fails loudly and gets fixed; a self-referential one reports success forever. It
-# was found only because two hand-built lists of open claims disagreed with each other.
+# RESOLVED 2026-08-19 rather than failing. The targets are the paper's, as above, and including FB
+# per Yul's 6a9a439 brings the computation to 68.06 / 31.94 -- which rounds to the published
+# 68.1 / 31.9. The 0.2-point gap was the FB exclusion, not a disagreement with the paper.
+#
+# The lesson stands even though the failure did not materialise: a target set to its own answer
+# reports success forever, and this one was found only because two hand-built lists of open claims
+# disagreed with each other. No check could have raised it.
 claim_emit("3.3.6", "composition-driven share of productive-DOWN NMD genes (%)",
            .kdget("down","composition-dominated"), published = "31.9",
            n = sum(.kd$n[.kd$dir == "down"]), population = DOWN_POP)
@@ -2104,8 +2129,8 @@ claim_emit("3.3.6", "level-driven share of productive-DOWN NMD genes (%)",
 ## S7 — Up-arm mechanism split + decomposition + theme enrichment
 
 ```{r up-arm-stuff}
-## ---- 1) mechanism classification of productive-UP genes (AT2/LAE/MV) ----
-pu <- prod_dir_mashr %>% dplyr::filter(dir=="up", ct != "FB") %>%
+## ---- 1) mechanism classification of productive-UP genes ----
+pu <- prod_dir_mashr %>% dplyr::filter(dir=="up", ct %in% CELL_TYPES) %>%
   dplyr::left_join(base %>% dplyr::select(ct,gene_id,prodfrac_DMSO,prodfrac_SMG), by=c("ct","gene_id")) %>%
   dplyr::left_join(sr_long %>% dplyr::select(ct,gene_id,sr_logFC), by=c("ct","gene_id")) %>%
   classify_mech("up")
@@ -2121,11 +2146,11 @@ print(kit_nmd_table() %>% dplyr::filter(dir=="up") %>%
 # Denominator is the UP arm alone, same construction as 3.3.6's down arm. Note 99.2 + 0.3 does
 # not reach 100: a third driver category carries the remainder, so "almost entirely level-driven
 # (99.2% level, 0.3% composition)" omits it rather than the two being complementary.
-.ku <- kit_nmd_table() %>% dplyr::filter(dir == "up") %>% dplyr::count(driver) %>%
-  dplyr::mutate(pct = 100*n/sum(n))
+.ku <- kit_nmd_table() %>% dplyr::filter(dir == "up", !is.na(driver)) %>%
+  dplyr::count(driver) %>% dplyr::mutate(pct = 100*n/sum(n))
 .kuget <- function(d) { .i <- which(.ku$driver == d); if (length(.i)) .ku$pct[.i] else NA_real_ }
 UP_POP <- paste("NMD-category genes whose productive output significantly INCREASED, classified",
-                "level- or composition-driven; AT2/LAE/MV only (FB excluded); denominator is the",
+                "level- or composition-driven; ALL FOUR cell types including FB; denominator is the",
                 "up arm alone")
 claim_emit("3.3.4", "level-driven share of productive-UP NMD genes (%)", .kuget("level-dominated"),
            published = "99.7", n = sum(.ku$n), population = UP_POP)
@@ -2138,7 +2163,7 @@ claim_emit("3.3.4", "share of productive-UP NMD genes in neither named category 
 ## ---- 3) theme enrichment: transcriptional-up vs composition-up ----
 trans_g    <- pu %>% dplyr::filter(mechanism=="transcriptional") %>% dplyr::pull(gene_id) %>% unique()
 comp_g     <- pu %>% dplyr::filter(mechanism=="composition")     %>% dplyr::pull(gene_id) %>% unique()
-universe_g <- unique(prod_dir_mashr$gene_id[prod_dir_mashr$ct != "FB"])
+universe_g <- unique(prod_dir_mashr$gene_id[prod_dir_mashr$ct %in% CELL_TYPES])
 cat(sprintf("\ntranscriptional-up=%d | composition-up=%d | universe=%d\n", length(trans_g), length(comp_g), length(universe_g)))
 # up arm adds the NF-kB set to the shared theme list
 sets_up <- c(THEME_SETS, list("NF-kB/TNFA (GO)" = go_to_symbols(c("GO:0051092","GO:0034612"))))
